@@ -1,0 +1,40 @@
+[project]
+name = "code-agent"
+version = "0.1.0"
+description = "Deep Agents SDK 기반 터미널 코딩 에이전트"
+readme = "README.md"
+authors = [
+    { name = "Woong", email = "59645041+WoongDream@users.noreply.github.com" }
+]
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "deepagents==0.7.32",
+    "langgraph-checkpoint-sqlite",
+    "prompt-toolkit",
+    "python-dotenv>=1.2.3",
+    "rich",
+]
+
+[project.optional-dependencies]
+openrouter = ["langchain-openrouter==0.2.8"]
+
+[project.scripts]
+code-agent = "code_agent:main"
+
+[dependency-groups]
+dev = ["pytest>=9,<10", "ruff>=0.16,<0.17"]
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+# pjt 와 같은 기준일로 고정해 같은 버전(langchain 1.4.7, langgraph 1.2.19 등)으로 해석되게 한다.
+exclude-newer = "2026-10-31T00:00:00Z"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"

@@ -1,6 +1,6 @@
 # Deep Agents 기반 터미널 코드 에이전트 구축 계획
 
-> 상태: 계획 단계이고 아직 코드 변경은 없다. 작성일은 2026-11-04.
+> 상태: 0단계 완료(2026-11-05). 다음은 1단계 MVP다. 작성일은 2026-11-04.
 > 근거 표기: **[V]**는 `deepagents==0.7.32` 태그 소스로 확인한 사실, **[D]**는 공식 문서(버전 고정 아님)에 근거한 사실, **[I]**는 추론이라 0단계에서 확인해야 하는 사실이다.
 
 ## 1. Context
@@ -71,6 +71,22 @@ code-agent/
    - `CODE_AGENT_SHELL`(`bash`|`powershell`)
    - `OPENROUTER_API_KEY`(선택)
 
+#### 0단계 확인 결과 (2026-11-05)
+- **설치**: uv 0.13.7, CPython 3.13.18. `exclude-newer = 2026-10-31`로 해석한 결과 deepagents 0.7.32, langchain 1.4.7, langgraph 1.2.19, langchain-anthropic 1.7.7이 설치되어 계획과 같다. `.env.example`, `.gitattributes`(LF 고정)를 추가했다.
+- **(a) 오프로드 경로** [V]: 고정 경로가 아니라 `{artifacts_root}/large_tool_results/`, `{artifacts_root}/conversation_history/`, `{artifacts_root}/blobs/`다. `artifacts_root`는 `CompositeBackend(..., artifacts_root="/")` 인자에서 온다(`backends/composite.py:260`, `middleware/filesystem.py:1993`, `middleware/summarization.py:738`).
+  - 그래서 `artifacts_root="/.code-agent-artifacts"`로 두고 `/.code-agent-artifacts/` 라우트 하나만 `FilesystemBackend(~/.code-agent/artifacts)`로 보내면 세 경로가 모두 작업 폴더 밖으로 나간다.
+- **(b) permissions + 셸 백엔드** [V]: 충돌한다. 실행 가능한 백엔드에 `permissions`를 주면 `NotImplementedError`가 난다(`middleware/filesystem.py:2055`). 예외는 모든 규칙 경로가 라우트 접두사 아래에 있을 때뿐인데, `/.env`는 default 백엔드 경로라 해당하지 않는다.
+  - 그래서 `.env` 차단은 계획대로 `wrap_tool_call` 미들웨어로 구현한다.
+- **(c) stream 반환 형태** [V]: `version` 기본값이 `"v1"`이라(`langgraph/pregel/main.py:2759`) `stream_mode=[...]`와 `subgraphs=True`를 함께 주면 `(ns, mode, data)` 튜플이 온다. `mode == "messages"`일 때 `data`는 `(chunk, metadata)` 튜플이다. `version="v2"`를 주면 `StreamPart` dict로 바뀌지만 쓰지 않는다.
+- **(d) 서브에이전트의 `interrupt_on`** [V]: 상속한다. `spec.get("interrupt_on", interrupt_on)`이다(`graph.py:797`). 대본 모델로 실측했을 때 서브에이전트의 `execute`도 승인을 요구했다.
+  - **주의**: 서브에이전트에서 난 interrupt는 스트림에 **두 번** 온다. 한 번은 `ns=("tools:<id>",)`, 한 번은 `ns=()`이고, `Interrupt.id`가 같다. 클라이언트는 **id로 중복을 제거**해야 한다. 그렇지 않으면 승인을 두 번 묻는다. resume은 결정 하나(`Command(resume={"decisions": [...]})`)로 끝까지 진행됐다.
+- **그 외 확인**
+  - `TodoListMiddleware`는 `langchain.agents.middleware`에서 import한다. 아래 agent.py 스니펫의 [I]는 해소됐다.
+  - 기본 도구 목록을 실측했다: `ls`, `read_file`, `write_file`, `edit_file`, `delete`, `glob`, `grep`, `execute`, `task`. `write_todos`는 없다. `task`는 GP 서브에이전트가 기본으로 켜져 있어서 생긴다.
+  - interrupt의 `review_configs` 기본 `allowed_decisions`는 `approve`, `edit`, `reject`, `respond`다. 계획대로 approve와 reject만 쓰려면 `interrupt_on={"execute": {"allowed_decisions": ["approve", "reject"]}, ...}`로 제한한다.
+  - 파이프로 출력을 받으면 콘솔 코드페이지(cp949) 때문에 한글이 깨졌다. CLI 진입점에서 `sys.stdout.reconfigure(encoding="utf-8")`을 호출하거나 `PYTHONUTF8=1`을 준다.
+  - `git config core.autocrlf=true`가 시스템 전역 설정이라 `.gitattributes`의 `* text=auto eol=lf`로 LF를 고정했다.
+
 ### 1단계 — MVP: 파일 편집 + 셸 + 승인 + 세션
 
 **settings.py / models.py**
@@ -94,8 +110,8 @@ code-agent/
     - `inherit_env=False, env=None`이면 **빈 환경**이라 PATH도 없다 [V]. 그래서 `os.environ` 복사본을 넘긴다.
     - 복사본에서 `*_API_KEY`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`는 제거한다.
     - `SYSTEMROOT`, `COMSPEC`, `PATHEXT`, `TEMP`, `PATH`는 유지한다. PATH 구분자는 `os.pathsep`을 쓴다.
-- `CompositeBackend(default=shell, routes={...})`
-  - 큰 도구 결과와 대화 기록 오프로드 경로(0단계 3-a에서 확인)를 `~/.code-agent/artifacts/`의 `FilesystemBackend`로 라우팅한다. 이렇게 해야 **작업 폴더가 오염되지 않는다**(dcode와 같은 방식).
+- `CompositeBackend(default=shell, routes={"/.code-agent-artifacts/": FilesystemBackend(~/.code-agent/artifacts)}, artifacts_root="/.code-agent-artifacts")`
+  - 큰 도구 결과, 대화 기록, blob 오프로드가 모두 `artifacts_root` 아래로 가므로(0단계 a) 라우트 하나로 `~/.code-agent/artifacts/`에 모인다. 이렇게 해야 **작업 폴더가 오염되지 않는다**(dcode와 같은 방식).
   - `execute`는 경로와 상관없이 항상 default 백엔드로 간다 [V].
 
 **prompts.py** — dcode `system_prompt.md`에서 가져올 주제
@@ -112,23 +128,23 @@ code-agent/
 
 **agent.py — `build_agent(settings, workspace, checkpointer)`**
 ```python
-from langchain.agents.middleware import TodoListMiddleware  # [I] 0단계에서 import 경로 확인
+from langchain.agents.middleware import TodoListMiddleware  # [V] 0단계에서 확인
 
 register_harness_profile("anthropic", HarnessProfile(          # MVP: GP 서브에이전트 끔
     general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False)))
 
+APPROVE_OR_REJECT = {"allowed_decisions": ["approve", "reject"]}
 create_deep_agent(
     name="code-agent", model=model, backend=backend, system_prompt=CODING_PROMPT,
     middleware=[TodoListMiddleware(),          # 0.7.0부터 write_todos가 기본 아님 [V]
+                DotenvGuardMiddleware(),       # .env 차단. permissions=는 셸 백엔드와 충돌한다 [V] 0단계 b
                 *budget_middleware()],         # Model/ToolCallLimitMiddleware (pjt Day08 guardlab/budget.py)
-    permissions=[FilesystemPermission(operations=["read", "write"],
-                                      paths=["/.env", "/**/.env*"], mode="deny")],  # 0단계 3-b 결과에 따라
-    interrupt_on={"execute": True, "write_file": True, "edit_file": True, "delete": True},
+    interrupt_on={t: APPROVE_OR_REJECT for t in ("execute", "write_file", "edit_file", "delete")},
     checkpointer=checkpointer,
 )
 ```
-- 기본 도구는 `ls`, `read_file`, `write_file`, `edit_file`, `delete`, `glob`, `grep`, `execute`, `write_todos`다.
-- 0단계 3-b에서 `permissions`가 셸 백엔드와 충돌하면, 같은 규칙을 `wrap_tool_call` 미들웨어로 구현한다.
+- 최종 도구는 `ls`, `read_file`, `write_file`, `edit_file`, `delete`, `glob`, `grep`, `execute`, `write_todos`다. GP 서브에이전트를 끄면 `task`는 빠진다.
+- `DotenvGuardMiddleware`는 `wrap_tool_call`에서 파일 도구의 경로 인자가 `.env*`와 맞으면 실행하지 않고 거부 ToolMessage를 돌려준다. `glob`과 `grep` 결과에서도 `.env*`를 걸러 낸다.
 - 커스텀 도구는 예외를 문자열로 바꿔 반환한다. 도구 예외는 루프를 끊는다.
 
 **approval.py** (순수 로직이라 테스트하기 쉽다)
@@ -154,6 +170,7 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
 - AI 텍스트는 토큰 단위로 스트리밍한다.
 - 도구 호출은 이름과 핵심 인자만, 도구 결과는 앞 N줄만 보여 준다. 서브에이전트 출력에는 접두사를 붙인다.
 - 승인 처리:
+  - 서브에이전트 interrupt는 ns가 다른 두 이벤트로 중복해서 오므로 `Interrupt.id`로 중복을 제거한다(0단계 d).
   - 한 interrupt에 `action_requests`가 **여러 개** 올 수 있다(병렬 도구 호출).
   - 각 요청에 대해 같은 순서로 결정을 만든다. `execute`는 명령을, `edit_file`은 old→new diff를, `write_file`은 경로와 크기를 보여 준다.
   - 그다음 `Command(resume={"decisions": [...]})`로 같은 스트림 루프를 다시 돈다.
@@ -240,7 +257,7 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
 | 셸이 샌드박스가 아니다(`virtual_mode`는 파일 도구만 가둔다) | 기본 `manual` 모드, 좁은 allow-list, 셸 env에서 비밀값 제거, `yolo` 경고 |
 | Windows: 기본 셸이 cmd.exe이고, 빈 env이고, 타임아웃 때 고아 프로세스가 남고, cp949 디코딩 | `WindowsShellBackend` 오버라이드(1단계)와 그 테스트 |
 | Windows: `edit_file`이 CRLF를 LF로 바꾼다(#7488), grep 결과가 cp1252로 디코드된다(#6964), BOM 있는 스킬이 무시된다(#6811) | fixture는 LF로 만들고, 3단계에서 CRLF 보존, 한글 grep 테스트, 스킬은 BOM 없이 저장 |
-| `permissions`가 셸 백엔드와 충돌할 수 있다 | 0단계에서 실측하고, 충돌하면 `wrap_tool_call` 미들웨어로 대체 |
+| `permissions`가 셸 백엔드와 충돌한다(0단계에서 확인) | `.env` 차단을 `wrap_tool_call` 미들웨어(`DotenvGuardMiddleware`)로 구현 |
 | Opus 5.5 preserved thinking: 요약 미들웨어가 이력을 바꾸면 thinking 블록 검증에서 400이 날 수 있다 | 긴 세션 테스트로 확인하고, 문제가 생기면 요약 트리거와 모델 설정을 조정 |
 | 0.7.14 분석 문서와 0.7.32의 차이 | 0단계 3에서 설치된 소스 기준으로 확인 |
 

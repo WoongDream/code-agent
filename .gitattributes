@@ -1,0 +1,2 @@
+# 체크아웃 줄바꿈을 LF 로 고정한다 (core.autocrlf=true 환경에서도 fixture·SKILL.md 가 CRLF 로 바뀌지 않게).
+* text=auto eol=lf

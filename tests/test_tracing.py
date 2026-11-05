@@ -54,9 +54,10 @@ class FakeTracer:
         self.shut = False
 
     @contextmanager
-    def turn(self, text: str, *, session_id: str, tags: list[str], workspace: Path | None = None):
+    def turn(self, text: str, *, session_id: str, tags: list[str], workspace: Path | None = None,
+             context: str = ""):
         self.turns.append(FakeTurn(text, session_id, tags))
-        self.turns[-1].workspace = workspace
+        self.turns[-1].workspace, self.turns[-1].context = workspace, context
         yield self.turns[-1]
 
     def shutdown(self) -> None:
@@ -86,6 +87,19 @@ def test_turn_records_input_output_decisions_and_usage(tmp_path: Path) -> None:
     assert turn.parts > 0  # 스트림 조각이 작업 기록으로도 간다
     assert tracer.shut
     assert "Langfuse 트레이스 켜짐" in out.getvalue()
+
+
+def test_second_turn_context_has_workspace_and_previous_turn(tmp_path: Path) -> None:
+    """평가기는 이전 턴을 못 보므로, 두 번째 턴의 맥락에 첫 턴의 요청과 바꾼 파일이 들어가야 한다."""
+    tracer = FakeTracer()
+    steps = [tool_call("write_file", {"file_path": "/game.js", "content": "x"}), ai("만들었다", inp=10, out=1),
+             ai("index.html 을 여세요", inp=20, out=2)]
+    app, _, _, _ = make_app(tmp_path, steps, "게임 만들어", "y", "실행법 알려줘", "/exit", tracer=tracer)
+    app.run()
+    first, second = tracer.turns
+    assert first.context == f"- 작업 폴더(시스템 프롬프트로 알고 있다): {app.workspace}"
+    assert second.context.splitlines()[1:] == ["- 같은 세션의 이전 턴 1개:",
+                                               "  1. 요청: 게임 만들어 · 도구 1개 · 바꾼 파일: /game.js"]
 
 
 def test_interrupted_turn_is_marked(tmp_path: Path) -> None:
@@ -176,6 +190,7 @@ def test_root_output_has_changed_files_and_diff(tmp_path: Path) -> None:
     assert "+const mines = 10;" in output
     assert "write_file /game.js → 승인(사용자)" in output
     assert "SECRET" not in output
+    assert f"## 맥락 (이 턴 전에 에이전트가 알고 있던 것)\n- 작업 폴더(시스템 프롬프트로 알고 있다): {app.workspace}" in output
 
 
 def test_unreachable_server_does_not_break_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

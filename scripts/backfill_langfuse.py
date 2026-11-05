@@ -4,9 +4,11 @@
 - 자동/사람 승인 구분은 기록에 없어 '승인(소급)' 으로 남긴다.
 - 바뀐 파일과 diff 는 기준 폴더(기본: 빈 폴더)와 지금 작업 폴더를 비교해, 파일을 바꾼 마지막 턴에 몰아 넣는다.
   세션 뒤에 사람이 폴더를 고쳤다면 그 변경도 섞인다.
-- 같은 세션을 이미 올렸으면 건너뛴다(tag backfill). 기존 트레이스는 지우지 않는다.
+- 같은 세션을 이미 올렸으면 건너뛴다(tag backfill). --replace 면 이 스크립트가 올린 backfill 트레이스만 지우고 다시 올린다.
+  실시간으로 남은 기존 트레이스는 지우지 않는다.
+- 턴마다 맥락(작업 폴더, 같은 세션의 이전 턴 요약)을 함께 남긴다. 평가기는 시스템 프롬프트와 이전 턴을 보지 못한다.
 
-사용: uv run --extra langfuse python scripts/backfill_langfuse.py [--dry-run] [--baseline THREAD=DIR ...] [THREAD ...]
+사용: uv run --extra langfuse python scripts/backfill_langfuse.py [--dry-run] [--replace] [--baseline THREAD=DIR ...] [THREAD ...]
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ from code_agent.render import describe_call
 from code_agent.settings import load_settings
 from code_agent.tracing import make_tracer
 from code_agent.usage import Usage
-from code_agent.worklog import WorkLog, diff_snapshots, one_line, snapshot
+from code_agent.worklog import WorkLog, diff_snapshots, one_line, session_context, snapshot
 
 FILE_TOOLS = {"write_file", "edit_file", "delete"}
 TAG = "backfill"
@@ -45,7 +47,7 @@ def load_turns(conn: sqlite3.Connection, thread_id: str, workspace: Path) -> lis
     return turns
 
 
-def build_record(turn: list, *, diff: tuple[list[str], str] | None) -> dict:
+def build_record(turn: list, *, diff: tuple[list[str], str] | None, context: str = "") -> dict:
     log, usage, models, answer = WorkLog(), Usage(), set(), ""
     tool_calls: dict[str, dict] = {}
     for message in turn[1:]:
@@ -65,7 +67,8 @@ def build_record(turn: list, *, diff: tuple[list[str], str] | None) -> dict:
                 verdict = f"거부(사용자){': ' + reason if reason else ''}" if rejected else "승인(소급)"
                 log.approvals.append(one_line(f"{describe_call(call)} → {verdict}"))
     changes, diff_text = diff if diff is not None else ([], "")
-    return {"input": turn[0].text, "output": log.render(answer=answer, changes=changes, diff=diff_text),
+    return {"input": turn[0].text,
+            "output": log.render(answer=answer, changes=changes, diff=diff_text, context=context),
             "usage": usage, "models": sorted(m for m in models if m)}
 
 
@@ -75,6 +78,8 @@ def main() -> None:
     parser.add_argument("--baseline", action="append", default=[], metavar="THREAD=DIR",
                         help="세션 시작 때 작업 폴더 내용과 같은 폴더 (기본: 빈 폴더)")
     parser.add_argument("--dry-run", action="store_true", help="보내지 않고 작업 기록만 출력한다")
+    parser.add_argument("--replace", action="store_true",
+                        help="이미 올린 backfill 트레이스를 지우고 다시 올린다 (평가기를 바꾼 뒤 다시 채점할 때)")
     args = parser.parse_args()
     baselines = dict(item.split("=", 1) for item in args.baseline)
 
@@ -92,10 +97,14 @@ def main() -> None:
         if args.threads and thread_id not in args.threads:
             continue
         workspace = Path(ws)
-        if api is not None and any(TAG in (o.tags or []) for o in api.observations.get_many(
-                session_id=thread_id, name="turn", fields="core,basic", limit=50).data):
-            print(f"{thread_id}: 이미 올렸다. 건너뛴다")
-            continue
+        if api is not None:
+            uploaded = {o.trace_id for o in api.observations.get_many(
+                session_id=thread_id, name="turn", fields="core,basic", limit=50).data if TAG in (o.tags or [])}
+            if uploaded and not args.replace:
+                print(f"{thread_id}: 이미 올렸다. 건너뛴다 (--replace 로 다시 올린다)")
+                continue
+            for trace_id in uploaded:  # 이 스크립트가 올린 backfill 트레이스만 지운다
+                api.trace.delete(trace_id)
         turns = load_turns(conn, thread_id, workspace)
         file_turns = [i for i, turn in enumerate(turns) if any(
             isinstance(m, AIMessage) and any(c["name"] in FILE_TOOLS for c in m.tool_calls) for m in turn)]
@@ -104,7 +113,9 @@ def main() -> None:
         diff = diff_snapshots(before, after) if after is not None and before is not None else None
         print(f"== {thread_id} ({workspace.name}, {created[:16]}) 턴 {len(turns)}개, 파일 변경 턴 {file_turns}")
         for index, turn in enumerate(turns):
-            record = build_record(turn, diff=diff if file_turns and index == file_turns[-1] else ([], ""))
+            context = session_context([m for previous in turns[:index] for m in previous], workspace)
+            record = build_record(turn, diff=diff if file_turns and index == file_turns[-1] else ([], ""),
+                                  context=context)
             if args.dry_run:
                 print(f"\n--- 턴 {index + 1}: {record['input'][:60]!r}\n{record['output'][:2500]}")
                 continue

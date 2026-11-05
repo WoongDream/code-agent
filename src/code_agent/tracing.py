@@ -41,7 +41,7 @@ class TurnTrace(Protocol):
 
 class Tracer(Protocol):
     def turn(self, text: str, *, session_id: str, tags: list[str],
-             workspace: Path | None = None) -> Any: ...  # ContextManager[TurnTrace]
+             workspace: Path | None = None, context: str = "") -> Any: ...  # ContextManager[TurnTrace]
 
     def shutdown(self) -> None: ...
 
@@ -68,7 +68,7 @@ class LangfuseTracer:
 
     @contextmanager
     def turn(self, text: str, *, session_id: str, tags: list[str],
-             workspace: Path | None = None) -> Iterator[LangfuseTurn]:
+             workspace: Path | None = None, context: str = "") -> Iterator[LangfuseTurn]:
         from langfuse import propagate_attributes
         from langfuse.langchain import CallbackHandler
 
@@ -77,7 +77,8 @@ class LangfuseTracer:
         with (self.client.start_as_current_observation(name="turn", as_type="agent", input=text) as root,
               propagate_attributes(session_id=session_id, trace_name="code-agent turn",
                                    tags=[tag[:200] for tag in tags])):
-            yield LangfuseTurn(root, CallbackHandler(public_key=self.public_key), workspace=workspace)
+            yield LangfuseTurn(root, CallbackHandler(public_key=self.public_key), workspace=workspace,
+                               context=context)
 
     def shutdown(self) -> None:
         """남은 span 을 보내고 백그라운드 스레드를 끝낸다. REPL 이 끝날 때 부른다."""
@@ -85,11 +86,12 @@ class LangfuseTracer:
 
 
 class LangfuseTurn:
-    def __init__(self, root: Any, handler: Any, *, workspace: Path | None = None) -> None:
+    def __init__(self, root: Any, handler: Any, *, workspace: Path | None = None, context: str = "") -> None:
         self.root = root
         self.callbacks = [handler]  # 턴 안의 모든 stream 호출(재개 포함)에 같은 인스턴스를 쓴다
         self.workspace = workspace
         self.before = snapshot(workspace) if workspace is not None else None
+        self.context = context  # 작업 폴더와 이전 턴 요약. 평가기는 시스템 프롬프트와 이전 턴을 보지 못한다
         self.worklog = WorkLog()
 
     def on_part(self, part: tuple) -> None:
@@ -115,7 +117,8 @@ class LangfuseTurn:
             changes, diff = None, ""  # 파일이 너무 많아 스냅샷을 건너뛰었다
         else:
             changes, diff = diff_snapshots(self.before, after)
-        fields: dict[str, Any] = {"output": self.worklog.render(answer=output, changes=changes, diff=diff),
+        fields: dict[str, Any] = {"output": self.worklog.render(answer=output, changes=changes, diff=diff,
+                                                             context=self.context),
                                   "metadata": {"usage": asdict(usage)}}
         if error:
             fields.update(level="ERROR", status_message=error)

@@ -2,6 +2,9 @@
 
 Langfuse 의 observation 평가기는 같은 트레이스의 다른 observation(도구 실행 등)을 읽지 못한다. 그래서 실행한 도구와
 결과 요약, 승인 결정, 바뀐 파일과 diff 를 최종 답변과 함께 turn 출력에 남긴다. 길이는 평가 비용을 위해 자른다.
+
+평가기는 시스템 프롬프트와 이전 턴도 보지 못한다. 그래서 에이전트가 턴 전에 이미 알고 있던 것(작업 폴더, 같은 세션의
+이전 턴 요약)을 맥락 절로 함께 남긴다. 없으면 맞는 말도 '근거 없는 주장'으로 감점된다.
 """
 
 from __future__ import annotations
@@ -12,13 +15,17 @@ import re
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 
 from code_agent.approval import reject_reason
 from code_agent.guards import is_env_path
 from code_agent.render import describe_call
 
 MAX_STEPS = 80
+MAX_CONTEXT_TURNS = 10
+MAX_CONTEXT_REQUEST = 80
+MAX_CONTEXT_FILES = 10
+FILE_TOOLS = frozenset({"write_file", "edit_file", "delete"})
 MAX_LINE = 240
 MAX_DIFF_CHARS = 30_000
 MAX_FILES = 5_000  # 이보다 큰 작업 폴더는 스냅샷을 건너뛴다
@@ -111,6 +118,30 @@ def one_line(text: str) -> str:
     return _clip(" ".join(text.split()))
 
 
+def session_context(previous: list[BaseMessage], workspace: Path | None) -> str:
+    """턴 전에 에이전트가 알고 있던 것: 시스템 프롬프트의 작업 폴더와 같은 세션의 이전 턴 요약(요청, 도구 수, 바꾼 파일)."""
+    turns: list[list[BaseMessage]] = []
+    for message in previous:
+        if isinstance(message, HumanMessage):
+            turns.append([message])
+        elif turns:
+            turns[-1].append(message)
+    lines = [f"- 작업 폴더(시스템 프롬프트로 알고 있다): {workspace}"] if workspace is not None else []
+    if turns:
+        start = max(0, len(turns) - MAX_CONTEXT_TURNS)
+        lines.append(f"- 같은 세션의 이전 턴 {len(turns)}개" + (f" (최근 {MAX_CONTEXT_TURNS}개만)" if start else "") + ":")
+        for number, turn in enumerate(turns[start:], start + 1):
+            calls = [call for m in turn if isinstance(m, AIMessage) for call in m.tool_calls]
+            files = sorted({str(c["args"].get("file_path", "")) for c in calls if c["name"] in FILE_TOOLS})
+            shown = ", ".join(files[:MAX_CONTEXT_FILES]) + (f" 외 {len(files) - MAX_CONTEXT_FILES}개"
+                                                           if len(files) > MAX_CONTEXT_FILES else "")
+            # 요청 원문이 길어도 바꾼 파일 목록이 잘리지 않게 요청만 따로 줄인다
+            request = " ".join(turn[0].text.split())
+            request = request if len(request) <= MAX_CONTEXT_REQUEST else request[: MAX_CONTEXT_REQUEST - 1] + "…"
+            lines.append(f"  {number}. 요청: {request} · 도구 {len(calls)}개" + (f" · 바꾼 파일: {shown}" if files else ""))
+    return "\n".join(lines)
+
+
 class WorkLog:
     """스트림 조각과 승인 결정을 받아 턴의 작업 기록을 만든다."""
 
@@ -142,17 +173,20 @@ class WorkLog:
         self.approvals.append(one_line(f"{describe_call(action)} → {verdict}({'자동' if auto else '사용자'})"
                                        + (f": {reason}" if reason else "")))
 
-    def render(self, *, answer: str, changes: list[str] | None, diff: str) -> str:
+    def render(self, *, answer: str, changes: list[str] | None, diff: str, context: str = "") -> str:
         shown = self.steps[:MAX_STEPS]
         steps = [f"{i}. {call} → {result}" for i, (call, result) in enumerate(shown, 1)]
         if len(self.steps) > MAX_STEPS:
             steps.append(f"... (도구 호출 {len(self.steps)}개 중 {MAX_STEPS}개까지)")
         files = ("(작업 폴더가 커서 확인하지 않았다)" if changes is None
                  else "\n".join(f"- {c}" for c in changes) or "(없음)")
-        return "\n\n".join([
+        sections = [
             f"## 최종 답변\n{answer.strip() or '(없음)'}",
             f"## 실행한 도구 ({len(self.steps)}개)\n" + ("\n".join(steps) or "(없음)"),
             "## 승인 결정\n" + ("\n".join(f"- {a}" for a in self.approvals) or "(없음)"),
             f"## 바뀐 파일\n{files}",
             f"## diff\n```diff\n{diff}\n```" if diff else "## diff\n(없음)",
-        ])
+        ]
+        if context:
+            sections.append(f"## 맥락 (이 턴 전에 에이전트가 알고 있던 것)\n{context}")
+        return "\n\n".join(sections)

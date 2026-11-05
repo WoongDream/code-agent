@@ -4,11 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from code_agent import worklog
 from code_agent.approval import APPROVE, reject
-from code_agent.worklog import WorkLog, diff_snapshots, snapshot, summarize_result
+from code_agent.worklog import WorkLog, diff_snapshots, session_context, snapshot, summarize_result
 
 
 def tool_message(name: str, text: str, *, status: str = "success", call_id: str = "c1") -> ToolMessage:
@@ -55,6 +55,50 @@ def test_worklog_pairs_calls_with_results_and_approvals() -> None:
     assert "- $ uv run pytest → 거부(사용자): 느림" in text
     assert "- $ git status → 승인(자동)" in text
     assert "- M x.py (+1 -1)" in text and "```diff\n-a\n+b\n```" in text
+
+
+def test_multiline_commands_stay_on_one_line() -> None:
+    log = WorkLog()
+    call = {"name": "execute", "args": {"command": "node -e '\nconst a = 1;\n  console.log(a)'"}, "id": "m",
+            "type": "tool_call"}
+    log.on_part(updates("model", AIMessage(content="", tool_calls=[call])))
+    log.decision(call, APPROVE, auto=False)
+    text = log.render(answer="끝", changes=[], diff="")
+    assert "1. $ node -e ' const a = 1; console.log(a)' → (결과 없음)" in text
+    assert "- $ node -e ' const a = 1; console.log(a)' → 승인(사용자)" in text
+
+
+def test_session_context_summarizes_previous_turns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worklog, "MAX_CONTEXT_TURNS", 2)
+    write = {"name": "write_file", "args": {"file_path": "/a.js", "content": "x"}, "id": "w", "type": "tool_call"}
+    ls = {"name": "ls", "args": {"path": "/"}, "id": "l", "type": "tool_call"}
+    previous = [HumanMessage("하이"), AIMessage(content="안녕"),
+                HumanMessage("게임\n만들어"), AIMessage(content="", tool_calls=[ls, write]),
+                tool_message("write_file", "ok", call_id="w"), AIMessage(content="됐다"),
+                HumanMessage("실행법?"), AIMessage(content="열어라")]
+    assert session_context(previous, tmp_path).splitlines() == [
+        f"- 작업 폴더(시스템 프롬프트로 알고 있다): {tmp_path}",
+        "- 같은 세션의 이전 턴 3개 (최근 2개만):",
+        "  2. 요청: 게임 만들어 · 도구 2개 · 바꾼 파일: /a.js",
+        "  3. 요청: 실행법? · 도구 0개",
+    ]
+    assert session_context([], None) == ""
+
+
+def test_session_context_keeps_file_list_when_request_is_long(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(worklog, "MAX_CONTEXT_FILES", 3)
+    writes = [{"name": "write_file", "args": {"file_path": f"/f{i}.js", "content": "x"}, "id": str(i),
+               "type": "tool_call"} for i in range(5)]
+    line = session_context([HumanMessage("아주 긴 요청 " * 50), AIMessage(content="", tool_calls=writes)],
+                           None).splitlines()[1]
+    assert line.endswith("· 도구 5개 · 바꾼 파일: /f0.js, /f1.js, /f2.js 외 2개")
+    assert "요청: 아주 긴 요청" in line and "…" in line
+
+
+def test_render_appends_context_only_when_given() -> None:
+    assert "## 맥락" not in WorkLog().render(answer="a", changes=[], diff="")
+    text = WorkLog().render(answer="a", changes=[], diff="", context="- 작업 폴더: X")
+    assert text.endswith("## 맥락 (이 턴 전에 에이전트가 알고 있던 것)\n- 작업 폴더: X")
 
 
 def test_render_marks_skipped_snapshot_and_empty_sections() -> None:

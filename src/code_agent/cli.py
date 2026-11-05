@@ -12,6 +12,7 @@ from contextlib import nullcontext
 from dataclasses import fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from rich.console import Console
@@ -24,6 +25,7 @@ from code_agent.render import Renderer, describe_action, todos_markup
 from code_agent.settings import Settings, load_settings
 from code_agent.tracing import Tracer, langfuse_installed, make_tracer
 from code_agent.usage import Usage, UsageCallback
+from code_agent.worklog import session_context
 
 HELP = """\
 [bold]슬래시 커맨드[/]
@@ -161,8 +163,11 @@ class App:
         renderer = Renderer(self.console)
         meter = UsageCallback()
         tags = [self.workspace.name, f"mode:{self.mode}", f"model:{self.settings.model}"]
-        trace_context = (self.tracer.turn(text, session_id=self.thread_id, tags=tags, workspace=self.workspace)
-                         if self.tracer is not None else nullcontext())
+        trace_context: Any = nullcontext()
+        if self.tracer is not None:
+            previous = self.agent.get_state(self.config).values.get("messages", [])
+            trace_context = self.tracer.turn(text, session_id=self.thread_id, tags=tags, workspace=self.workspace,
+                                             context=session_context(previous, self.workspace))
         with trace_context as trace:
             def decide(action_requests: list[dict]) -> list[dict]:
                 renderer.end_turn()

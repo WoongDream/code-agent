@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from deepagents import (
     GeneralPurposeSubagentProfile,
@@ -17,6 +17,7 @@ from deepagents import (
 from deepagents._models import get_model_provider
 from deepagents.backends import CompositeBackend
 from langchain.agents.middleware import (
+    AgentMiddleware,
     ModelCallLimitMiddleware,
     TodoListMiddleware,
     ToolCallLimitMiddleware,
@@ -25,7 +26,7 @@ from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
-from code_agent.backend import make_backend
+from code_agent.backend import WindowsShellBackend, make_backend
 from code_agent.caching import OpenRouterCacheMiddleware
 from code_agent.guards import DotenvGuardMiddleware
 from code_agent.models import make_model
@@ -38,9 +39,11 @@ TOOL_CALLS = 300
 RECURSION_LIMIT = 1000  # 그래프 단계 수. 예산 미들웨어가 먼저 끊도록 넉넉히 둔다
 
 StreamPart = tuple[tuple[str, ...], str, Any]
+# 미들웨어마다 state 타입이 다르다(PlanningState 등). AgentMiddleware 는 state 에 불변이라 한 목록에 담으려면 Any 로 묶는다.
+Middleware = AgentMiddleware[Any, Any, Any]
 
 
-def budget_middleware(model_calls: int = MODEL_CALLS, tool_calls: int = TOOL_CALLS) -> list:
+def budget_middleware(model_calls: int = MODEL_CALLS, tool_calls: int = TOOL_CALLS) -> list[Middleware]:
     """exit_behavior="end" 라 초과하면 오류 대신 안내 메시지로 턴을 끝낸다(pjt Day08 guardlab/budget.py)."""
     return [
         ModelCallLimitMiddleware(run_limit=model_calls, exit_behavior="end"),
@@ -62,11 +65,13 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
     _disable_general_purpose_subagent(model)
     if backend is None:
         backend = make_backend(workspace, artifacts_dir=settings.data_dir / "artifacts", shell=settings.shell)
+    middleware: list[Middleware] = [TodoListMiddleware(), DotenvGuardMiddleware(), OpenRouterCacheMiddleware(),
+                                    *budget_middleware()]
+    shell = cast(WindowsShellBackend, backend.default).shell  # default 는 make_backend 의 셸 백엔드다
     return create_deep_agent(
         name="code-agent", model=model, backend=backend,
-        system_prompt=coding_prompt(workspace=workspace, shell=backend.default.shell),
-        middleware=[TodoListMiddleware(), DotenvGuardMiddleware(), OpenRouterCacheMiddleware(),
-                    *budget_middleware()],
+        system_prompt=coding_prompt(workspace=workspace, shell=shell),
+        middleware=middleware,
         # 결정은 approve/reject 만 받는다. edit 은 고친 인자가 재검증 없이 실행된다.
         interrupt_on={tool: {"allowed_decisions": ["approve", "reject"]} for tool in INTERRUPT_TOOLS},
         checkpointer=checkpointer,

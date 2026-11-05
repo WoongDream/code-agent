@@ -35,6 +35,7 @@ uv sync --extra openrouter --extra langfuse
 - 사용자 메시지 하나가 트레이스 하나(`turn`)다. 세션 ID 는 code-agent 세션 ID 이고, 태그는 작업 폴더 이름·승인 모드·모델이다.
 - 그 아래에 그래프 노드, 모델 호출(입력 전체·출력·도구 선택·reasoning 텍스트·토큰), 도구 실행(인자·결과)이 남는다. 승인 대기 후 재개도 같은 트레이스로 이어진다.
 - 승인 결정은 `approval:<도구>` event 로 남는다(호출 요약, approve/reject, 자동인지 사람이 정했는지, 거부 사유). 거부는 WARNING 이다.
+- `turn` 출력에는 최종 답변과 함께 작업 기록(실행한 도구와 결과 요약, 승인 결정, 바뀐 파일, diff)이 남는다. Langfuse LLM-as-a-Judge 평가기는 같은 트레이스의 다른 observation 을 읽지 못하므로, `turn` 하나만 보고 채점할 수 있게 하려는 것이다. `.env` 는 diff 에 넣지 않는다.
 - 중단(Ctrl+C)과 오류는 `turn` 을 ERROR 로 표시한다.
 - 에이전트가 읽은 코드와 명령 출력이 Langfuse 로 전송된다. `.env` 내용은 가드가 막는다.
 - **비용**: Langfuse 는 모델 정의로 비용을 계산한다. `anthropic/claude-opus-5.5` 같은 OpenRouter 이름은 기본 정의에 없어 Project Settings > Models 에 가격을 등록해야 한다(사용량 키: `input`, `output`, `output_reasoning`, `input_cache_read`, `input_cache_creation`). OpenRouter 가 알려 준 실제 비용은 `turn` 의 metadata `usage` 와 `/cost` 에 있다.

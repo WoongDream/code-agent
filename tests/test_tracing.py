@@ -35,7 +35,11 @@ class FakeTurn:
         self.handler = RootCounter()
         self.callbacks = [self.handler]
         self.decisions: list[tuple[str, str, bool, str]] = []
+        self.parts = 0
         self.ended: dict | None = None
+
+    def on_part(self, part: tuple) -> None:
+        self.parts += 1
 
     def decision(self, action: dict, decision: dict, auto: bool) -> None:
         self.decisions.append((action["args"].get("command", ""), decision["type"], auto, reject_reason(decision)))
@@ -50,8 +54,9 @@ class FakeTracer:
         self.shut = False
 
     @contextmanager
-    def turn(self, text: str, *, session_id: str, tags: list[str]):
+    def turn(self, text: str, *, session_id: str, tags: list[str], workspace: Path | None = None):
         self.turns.append(FakeTurn(text, session_id, tags))
+        self.turns[-1].workspace = workspace
         yield self.turns[-1]
 
     def shutdown(self) -> None:
@@ -77,6 +82,8 @@ def test_turn_records_input_output_decisions_and_usage(tmp_path: Path) -> None:
     assert turn.ended["error"] is None
     assert (turn.ended["usage"].calls, round(turn.ended["usage"].cost, 6)) == (3, 0.004)
     assert turn.handler.root_starts == 3  # 처음 + 재개 두 번이 같은 핸들러를 썼다
+    assert turn.workspace == app.workspace
+    assert turn.parts > 0  # 스트림 조각이 작업 기록으로도 간다
     assert tracer.shut
     assert "Langfuse 트레이스 켜짐" in out.getvalue()
 
@@ -140,6 +147,35 @@ def test_real_sdk_builds_one_trace_per_turn(tmp_path: Path) -> None:
     generations = [s for s in spans if s.attributes.get(A.OBSERVATION_TYPE) == "generation"]
     assert len(generations) == 3  # 모델 호출 세 번
     assert any(s.name == "read_file" for s in spans)  # 도구 실행도 남는다
+    # 평가기가 turn 하나만 보고도 판단하도록 작업 기록이 루트 출력에 있다
+    output = attrs[A.OBSERVATION_OUTPUT]
+    assert "## 최종 답변" in output and "1. $ ls → exit 0 · a.txt" in output
+    assert "2. read_file /a.txt → 1-1줄 읽음 (전체 1줄)" in output
+    assert "$ ls → 승인(자동)" in output
+
+
+def test_root_output_has_changed_files_and_diff(tmp_path: Path) -> None:
+    """write_file 로 만든 파일이 '바뀐 파일'과 diff 에 남고, .env 는 diff 에 들어가지 않는다."""
+    pytest.importorskip("langfuse")
+    from langfuse import Langfuse
+    from langfuse import LangfuseOtelSpanAttributes as A
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    client = Langfuse(public_key="pk-lf-test-diff", secret_key="sk-lf-test", base_url="http://127.0.0.1:9",
+                      span_exporter=exporter)
+    tracer = LangfuseTracer(client, public_key="pk-lf-test-diff")
+    steps = [tool_call("write_file", {"file_path": "/game.js", "content": "const mines = 10;\n"}),
+             ai("만들었다", inp=50, out=2)]
+    app, _, _, _ = make_app(tmp_path, steps, "만들어", "y", "/exit", tracer=tracer)
+    (app.workspace / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    app.run()
+    [root] = [s for s in exporter.get_finished_spans() if s.name == "turn"]
+    output = root.attributes[A.OBSERVATION_OUTPUT]
+    assert "- A game.js (+1 -0)" in output
+    assert "+const mines = 10;" in output
+    assert "write_file /game.js → 승인(사용자)" in output
+    assert "SECRET" not in output
 
 
 def test_unreachable_server_does_not_break_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

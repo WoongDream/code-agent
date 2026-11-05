@@ -301,6 +301,29 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
     - 패턴: `(?i)^anthropic/claude-opus-5\.5$`
     - 100만 토큰당 가격: input $4, output·output_reasoning $20, input_cache_read $0.40, input_cache_creation $5
     - 시험 generation으로 계산값이 맞는 것을 확인했다. 등록 전에 수집된 generation에는 소급되지 않는다.
+- **LLM-as-a-Judge 준비 (`worklog.py`)**
+  - **배경**: Langfuse의 observation 평가기는 같은 트레이스의 다른 observation(도구 실행 등)을 읽지 못한다. 그래서 `turn` 출력을 최종 답변만이 아니라 판단 근거가 되는 작업 기록 전체로 바꿨다.
+  - **작업 기록 내용**
+    - 최종 답변
+    - 실행한 도구와 결과 요약: execute는 종료 코드와 마지막 줄, read_file은 읽은 범위
+    - 승인 결정: 자동/사용자, 거부 사유
+    - 바뀐 파일(A/M/D와 +/- 줄 수)과 diff
+  - **바뀐 파일과 diff 구하는 법**: 턴 시작과 끝에 작업 폴더 스냅샷을 비교한다.
+    - `.env`는 넣지 않는다.
+    - `.git`, `node_modules`, `.venv` 등은 건너뛴다.
+    - 파일이 5,000개를 넘으면 생략한다.
+  - **길이 제한**: 평가 비용 때문에 도구 호출 80개, 줄당 240자, diff 3만 자까지만 남긴다.
+  - **평가 설정**: evaluator 하나(`code-agent turn quality`, 0~1 NUMERIC)가 기준 네 가지를 한 번에 채점하고 이유를 남긴다. 기준은 요청 완수, 검증, 범위, 보고 정확성이다.
+    - 평가 모델: OpenRouter `anthropic/claude-sonnet-5.5`. Langfuse LLM Connection으로 연결한다(adapter openai, provider `openrouter`, base URL `https://openrouter.ai/api/v1`).
+    - rule: `isRootObservation = true`이고 `traceName = code-agent turn`인 것, 샘플링 100%.
+      - observation `name`으로는 필터할 수 없다. 허용 컬럼은 traceName, tags, type, metadata 등이다.
+    - 설정은 `scripts/setup_langfuse_judge.py`에 코드로 둔다. 다시 돌려도 중복 생성하지 않는다.
+  - **실측**
+    - 실제 턴(`hello.py` 만들고 실행해 확인): 1.0점. 기준별 "통과"와 근거가 comment에 남았다.
+    - 가짜 turn(실행 기록 없이 "테스트 4개 통과, README 정리"라고 주장): 0.5점.
+      - 검증: 실패(pytest 실행 기록 없음)
+      - 보고 정확성: 실패(작업 기록에 없는 일을 했다고 주장)
+    - 점수 조회는 `api.scores.get_many(trace_id=..., fields="details")`로 한다. comment는 `details`에 있다.
 
 ### 4단계 — 평가·확장 (선택)
 - `evals/`: 수정 과제 5~10개(fixture 저장소와 숨김 검증 테스트)를 헤드리스로 돌려 통과율, 비용, 시간을 집계한다. `pjt\Day04\coding_skills\verify_agent.py` 패턴을 참고한다.

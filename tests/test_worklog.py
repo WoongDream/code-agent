@@ -57,6 +57,17 @@ def test_worklog_pairs_calls_with_results_and_approvals() -> None:
     assert "- M x.py (+1 -1)" in text and "```diff\n-a\n+b\n```" in text
 
 
+def test_multiline_commands_stay_on_one_line() -> None:
+    log = WorkLog()
+    call = {"name": "execute", "args": {"command": "node -e '\nconst a = 1;\n  console.log(a)'"}, "id": "m",
+            "type": "tool_call"}
+    log.on_part(updates("model", AIMessage(content="", tool_calls=[call])))
+    log.decision(call, APPROVE, auto=False)
+    text = log.render(answer="끝", changes=[], diff="")
+    assert "1. $ node -e ' const a = 1; console.log(a)' → (결과 없음)" in text
+    assert "- $ node -e ' const a = 1; console.log(a)' → 승인(사용자)" in text
+
+
 def test_render_marks_skipped_snapshot_and_empty_sections() -> None:
     text = WorkLog().render(answer="", changes=None, diff="")
     assert "## 최종 답변\n(없음)" in text

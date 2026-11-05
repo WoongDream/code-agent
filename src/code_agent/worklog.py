@@ -90,7 +90,7 @@ def summarize_result(message: ToolMessage) -> str:
     """도구 결과 한 줄 요약. execute 는 종료 코드와 마지막 출력 줄, read_file 은 읽은 범위만 남긴다."""
     lines = [line.strip() for line in message.text.strip().splitlines() if line.strip()]
     if message.status == "error":
-        return _clip("오류: " + (lines[0] if lines else ""))
+        return one_line("오류: " + (lines[0] if lines else ""))
     if message.name == "execute":
         match = _EXIT_CODE.search(message.text)
         code = next((g for g in match.groups() if g), "?") if match else "?"
@@ -104,6 +104,11 @@ def summarize_result(message: ToolMessage) -> str:
 
 def _clip(text: str) -> str:
     return text if len(text) <= MAX_LINE else text[: MAX_LINE - 1] + "…"
+
+
+def one_line(text: str) -> str:
+    """여러 줄 명령(node -e '...' 등)도 목록 한 줄에 들어가게 공백을 합치고 자른다."""
+    return _clip(" ".join(text.split()))
 
 
 class WorkLog:
@@ -125,7 +130,7 @@ class WorkLog:
                 if node == "model" and isinstance(message, AIMessage):
                     for call in message.tool_calls:
                         self._by_call_id[call["id"]] = len(self.steps)
-                        self.steps.append([_clip(prefix + describe_call(call)), "(결과 없음)"])
+                        self.steps.append([one_line(prefix + describe_call(call)), "(결과 없음)"])
                 elif isinstance(message, ToolMessage):
                     index = self._by_call_id.get(message.tool_call_id)
                     if index is not None:
@@ -134,8 +139,8 @@ class WorkLog:
     def decision(self, action: dict, decision: dict, auto: bool) -> None:
         verdict = "승인" if decision.get("type") == "approve" else "거부"
         reason = reject_reason(decision)
-        self.approvals.append(_clip(f"{describe_call(action)} → {verdict}({'자동' if auto else '사용자'})"
-                                    + (f": {reason}" if reason else "")))
+        self.approvals.append(one_line(f"{describe_call(action)} → {verdict}({'자동' if auto else '사용자'})"
+                                       + (f": {reason}" if reason else "")))
 
     def render(self, *, answer: str, changes: list[str] | None, diff: str) -> str:
         shown = self.steps[:MAX_STEPS]

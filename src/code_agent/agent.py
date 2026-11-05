@@ -26,6 +26,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
 from code_agent.backend import make_backend
+from code_agent.caching import OpenRouterCacheMiddleware
 from code_agent.guards import DotenvGuardMiddleware
 from code_agent.models import make_model
 from code_agent.prompts import coding_prompt
@@ -64,7 +65,8 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
     return create_deep_agent(
         name="code-agent", model=model, backend=backend,
         system_prompt=coding_prompt(workspace=workspace, shell=backend.default.shell),
-        middleware=[TodoListMiddleware(), DotenvGuardMiddleware(), *budget_middleware()],
+        middleware=[TodoListMiddleware(), DotenvGuardMiddleware(), OpenRouterCacheMiddleware(),
+                    *budget_middleware()],
         # 결정은 approve/reject 만 받는다. edit 은 고친 인자가 재검증 없이 실행된다.
         interrupt_on={tool: {"allowed_decisions": ["approve", "reject"]} for tool in INTERRUPT_TOOLS},
         checkpointer=checkpointer,

@@ -8,7 +8,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -21,6 +21,7 @@ from code_agent.agent import build_agent, run_turn
 from code_agent.approval import APPROVE, MODES, decide_all, reject
 from code_agent.render import Renderer, describe_action, todos_markup
 from code_agent.settings import Settings, load_settings
+from code_agent.usage import Usage, UsageCallback
 
 HELP = """\
 [bold]슬래시 커맨드[/]
@@ -29,11 +30,13 @@ HELP = """\
   /mode <모드>   승인 모드 변경: manual(전부 묻기) | auto-edit(파일 쓰기 자동, 셸은 묻기) | yolo(전부 자동)
   /diff          작업 폴더의 git diff
   /todos         현재 할 일 목록
+  /cost          이 세션의 모델 호출·토큰·비용 합계
   /exit          종료
 Ctrl+C 는 실행 중인 턴만 취소한다. 읽기 전용 셸 명령(git status, ls, cat 등)은 모드와 관계없이 자동 승인된다."""
 YOLO_WARNING = "[bold red]yolo 모드: 파일 쓰기와 셸 명령을 묻지 않고 실행한다. 셸은 샌드박스가 아니다.[/]"
 
 ReadLine = Callable[[str], str]
+_USAGE_COLUMNS = [(f.name, "REAL" if f.type == "float" else "INTEGER") for f in fields(Usage)]
 
 
 class Sessions:
@@ -43,6 +46,8 @@ class Sessions:
         self.conn = conn
         conn.execute("CREATE TABLE IF NOT EXISTS code_agent_threads "
                      "(thread_id TEXT PRIMARY KEY, workspace TEXT NOT NULL, created_at TEXT NOT NULL)")
+        conn.execute(f"CREATE TABLE IF NOT EXISTS code_agent_usage (thread_id TEXT NOT NULL, at TEXT NOT NULL, "
+                     f"{', '.join(f'{name} {kind} NOT NULL' for name, kind in _USAGE_COLUMNS)})")
         conn.commit()
 
     def create(self, workspace: Path) -> str:
@@ -56,6 +61,21 @@ class Sessions:
         row = self.conn.execute("SELECT workspace FROM code_agent_threads WHERE thread_id = ?",
                                 (thread_id,)).fetchone()
         return Path(row[0]) if row else None
+
+    def add_usage(self, thread_id: str, usage: Usage) -> None:
+        values = [getattr(usage, name) for name, _ in _USAGE_COLUMNS]
+        self.conn.execute(f"INSERT INTO code_agent_usage VALUES (?, ?, {', '.join('?' * len(values))})",
+                          (thread_id, datetime.now(UTC).isoformat(), *values))
+        self.conn.commit()
+
+    def usage_of(self, thread_id: str) -> tuple[Usage, int]:
+        """(세션 합계, 기록된 턴 수)."""
+        rows = self.conn.execute(f"SELECT {', '.join(name for name, _ in _USAGE_COLUMNS)} FROM code_agent_usage "
+                                 "WHERE thread_id = ?", (thread_id,)).fetchall()
+        total = Usage()
+        for row in rows:
+            total += Usage(**dict(zip((name for name, _ in _USAGE_COLUMNS), row, strict=True)))
+        return total, len(rows)
 
 
 class App:
@@ -117,20 +137,25 @@ class App:
         elif name == "/todos":
             todos = self.agent.get_state(self.config).values.get("todos") or []
             self.console.print(todos_markup(todos))
+        elif name == "/cost":
+            total, turns = self.sessions.usage_of(self.thread_id)
+            self.console.print(f"세션 {self.thread_id} · 턴 {turns}개 · {escape(total.summary())}" if turns
+                               else "[dim]이 세션에 기록된 사용량이 아직 없다.[/]")
         else:
             self.console.print(f"[red]알 수 없는 커맨드: {escape(name)}[/] (/help)")
         return True
 
     def turn(self, text: str) -> None:
         renderer = Renderer(self.console)
+        meter = UsageCallback()
 
         def decide(action_requests: list[dict]) -> list[dict]:
             renderer.end_turn()
             return decide_all(action_requests, self.mode, self.ask)
 
         try:
-            run_turn(self.agent, {"messages": [{"role": "user", "content": text}]}, self.config,
-                     decide=decide, on_part=renderer.on_part)
+            run_turn(self.agent, {"messages": [{"role": "user", "content": text}]},
+                     {**self.config, "callbacks": [meter]}, decide=decide, on_part=renderer.on_part)
         except KeyboardInterrupt:
             renderer.end_turn()
             self.console.print("[yellow]중단했다.[/]")
@@ -139,6 +164,9 @@ class App:
             self.console.print(f"[red]오류: {type(e).__name__}: {escape(str(e))}[/]")
         else:
             renderer.end_turn()
+        if meter.usage.calls:  # 중단·오류로 끝난 턴도 쓴 만큼은 남긴다
+            self.sessions.add_usage(self.thread_id, meter.usage)
+            self.console.print(f"[dim]{escape(meter.usage.summary())}[/]")
 
     def ask(self, action: dict) -> dict:
         self.console.print(describe_action(action))

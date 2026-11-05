@@ -37,6 +37,8 @@ code-agent/
 │   ├── prompts.py          # 코딩 시스템 프롬프트, 서브에이전트 프롬프트
 │   ├── agent.py            # build_agent(): create_deep_agent 조립, run_turn(): 스트림·interrupt·재개 루프
 │   ├── guards.py           # DotenvGuardMiddleware (.env 차단, grep 결과 필터)
+│   ├── usage.py            # Usage, UsageCallback (모델 호출별 토큰·비용 집계)
+│   ├── caching.py          # OpenRouterCacheMiddleware (session_id, cache_control)
 │   ├── approval.py         # 승인 모드, 셸 allow-list, HITL 결정 생성 (순수 함수)
 │   ├── render.py           # 스트림 → rich 터미널 출력
 │   ├── cli.py              # argparse, REPL, 슬래시 커맨드, interrupt/resume 루프
@@ -229,6 +231,20 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - `max_tokens=64000`, `streaming=True`로 둔다. 예산은 사용자 메시지 하나당 모델 100회, 도구 300회다.
   - 세션 표 `code_agent_threads`(thread → 작업 폴더)는 `sessions.db`에 둔다. 시작에 성공한 뒤에만 기록한다.
   - mintty(Git Bash 창)에서는 prompt_toolkit이 `NoConsoleScreenBufferError`를 내서 `input()`으로 대체한다.
+- **1단계 이후 추가 (2026-11-05)**: 3단계의 사용량 표시를 앞당겼고, OpenRouter 프롬프트 캐시를 붙였다.
+  - **사용량** (`usage.py`)
+    - `UsageCallback.on_llm_end`로 모든 모델 호출을 센다. 서브에이전트와 요약 미들웨어의 호출도 포함한다.
+    - 턴이 끝나면 한 줄(`모델 N회 · 입력 · 캐시 · 출력 · $비용`)을 보이고, `sessions.db`의 `code_agent_usage` 표에 기록한다. 중단된 턴도 기록한다.
+    - `/cost`는 세션 합계를 보인다. 비용은 OpenRouter가 알려 준 값이다. Anthropic 직접 호출은 토큰만 보인다.
+    - 세션 상태로 세지 않는 이유가 있다. 이 버전의 체크포인트는 `messages` 채널 값을 통째로 저장하지 않고 `writes`를 재생해 복원한다. 그래서 읽으려면 `agent.get_state()`가 필요하다. 게다가 요약이 기록을 바꾸면 합계가 줄어든다.
+  - **캐시** (`caching.py`)
+    - `OpenRouterCacheMiddleware`가 OpenRouter 호출에 `session_id=code-agent-<thread>`를 더한다. 공급자 sticky routing을 위해서다.
+    - Anthropic 모델이면 최상위 `cache_control: {"type": "ephemeral"}`도 더한다. 자동 캐시이고 TTL은 5분이다.
+    - deepagents의 캐시 미들웨어는 `ChatAnthropic`에만 붙는다.
+    - **실측**: Opus 5.5, effort low로 모델 호출 2번을 돌렸다.
+      - 2번째 호출이 7,693토큰을 캐시에서 읽어 $0.0020이었다. 캐시가 없으면 약 $0.031이다.
+      - 1번째 호출은 캐시 쓰기라 1.25배 가격이다.
+      - 비교로, 캐시 전 tetris 세션은 17회 호출에 입력 33.9만 토큰, 캐시 읽기 0, 비용 $1.77이었다.
 - **남은 것**
   - 실제 API 수동 E2E(6장 2).
   - 확인 필요: Opus 5.5의 refusal `fallbacks`. langchain-anthropic 1.7.7이 응답의 `fallback` 블록을 다루지 못할 수 있어 켜지 않았다. E2E에서 확인한 뒤 켤지 정한다.

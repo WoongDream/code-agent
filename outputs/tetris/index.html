@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tetris</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="game">
+    <div class="board-wrap">
+      <canvas id="board" width="300" height="600"></canvas>
+      <div id="overlay" class="overlay hidden">
+        <h2>GAME OVER</h2>
+        <p>점수: <span id="final-score">0</span></p>
+        <button id="restart" type="button">다시 시작 (Enter)</button>
+      </div>
+    </div>
+
+    <aside class="side">
+      <section>
+        <h3>NEXT</h3>
+        <canvas id="next" width="120" height="120"></canvas>
+      </section>
+      <section>
+        <h3>SCORE</h3>
+        <p id="score" class="value">0</p>
+      </section>
+      <section>
+        <h3>LINES</h3>
+        <p id="lines" class="value">0</p>
+      </section>
+      <section>
+        <h3>LEVEL</h3>
+        <p id="level" class="value">1</p>
+      </section>
+      <section class="help">
+        <h3>조작</h3>
+        <ul>
+          <li><kbd>←</kbd> <kbd>→</kbd> 이동</li>
+          <li><kbd>↑</kbd> 회전</li>
+          <li><kbd>↓</kbd> 소프트 드롭</li>
+          <li><kbd>Space</kbd> 하드 드롭</li>
+          <li><kbd>Enter</kbd> 재시작 (게임 오버 시)</li>
+        </ul>
+      </section>
+    </aside>
+  </div>
+
+  <script src="tetris.js"></script>
+</body>
+</html>

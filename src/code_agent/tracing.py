@@ -3,8 +3,10 @@
 - 루트 아래에 LangChain CallbackHandler 가 그래프 노드·미들웨어·모델 호출·도구 실행을 기록한다.
   승인 대기 후 재개(Command(resume=...))도 같은 핸들러를 쓰므로 같은 턴 아래에 이어진다.
 - 승인 결정은 이 모듈이 event 로 남긴다(도구, 호출 요약, approve/reject, 사람이 정했는지, 거부 사유).
-- 턴이 끝나면 UsageCallback 합계(OpenRouter 실제 비용 포함)를 루트 metadata 에 남긴다. 핸들러는 토큰만 넘기고
-  비용은 Langfuse 가 모델 정의로 계산하므로, OpenRouter 모델 이름에는 비용이 비어 있을 수 있다.
+- 턴이 끝나면 루트 출력에 작업 기록(최종 답변, 도구 실행과 결과 요약, 승인, 바뀐 파일, diff)을 남긴다(worklog.py).
+  LLM-as-a-Judge 평가기는 turn 하나만 읽으므로 판단 근거가 여기 있어야 한다.
+- UsageCallback 합계(OpenRouter 실제 비용 포함)는 루트 metadata 에 남긴다. 핸들러는 토큰만 넘기고
+  비용은 Langfuse 가 모델 정의로 계산하므로, OpenRouter 모델 이름에는 가격 정의를 등록해야 한다.
 
 LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY 가 둘 다 있고 langfuse extra 가 설치돼 있을 때만 켜진다.
 """
@@ -15,12 +17,14 @@ import importlib.util
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Protocol
 
 from code_agent.approval import reject_reason
 from code_agent.render import describe_call
 from code_agent.settings import Settings
 from code_agent.usage import Usage
+from code_agent.worklog import WorkLog, diff_snapshots, snapshot
 
 TIMEOUT_S = 5  # 내보내기 요청 제한 시간. 종료 시 flush 가 이보다 오래 붙잡지 않게 한다
 
@@ -28,13 +32,16 @@ TIMEOUT_S = 5  # 내보내기 요청 제한 시간. 종료 시 flush 가 이보�
 class TurnTrace(Protocol):
     callbacks: list
 
+    def on_part(self, part: tuple) -> None: ...
+
     def decision(self, action: dict, decision: dict, auto: bool) -> None: ...
 
     def end(self, *, output: str, usage: Usage, error: str | None = None) -> None: ...
 
 
 class Tracer(Protocol):
-    def turn(self, text: str, *, session_id: str, tags: list[str]) -> Any: ...  # ContextManager[TurnTrace]
+    def turn(self, text: str, *, session_id: str, tags: list[str],
+             workspace: Path | None = None) -> Any: ...  # ContextManager[TurnTrace]
 
     def shutdown(self) -> None: ...
 
@@ -60,7 +67,8 @@ class LangfuseTracer:
         self.public_key = public_key
 
     @contextmanager
-    def turn(self, text: str, *, session_id: str, tags: list[str]) -> Iterator[LangfuseTurn]:
+    def turn(self, text: str, *, session_id: str, tags: list[str],
+             workspace: Path | None = None) -> Iterator[LangfuseTurn]:
         from langfuse import propagate_attributes
         from langfuse.langchain import CallbackHandler
 
@@ -69,7 +77,7 @@ class LangfuseTracer:
         with (self.client.start_as_current_observation(name="turn", as_type="agent", input=text) as root,
               propagate_attributes(session_id=session_id, trace_name="code-agent turn",
                                    tags=[tag[:200] for tag in tags])):
-            yield LangfuseTurn(root, CallbackHandler(public_key=self.public_key))
+            yield LangfuseTurn(root, CallbackHandler(public_key=self.public_key), workspace=workspace)
 
     def shutdown(self) -> None:
         """남은 span 을 보내고 백그라운드 스레드를 끝낸다. REPL 이 끝날 때 부른다."""
@@ -77,11 +85,18 @@ class LangfuseTracer:
 
 
 class LangfuseTurn:
-    def __init__(self, root: Any, handler: Any) -> None:
+    def __init__(self, root: Any, handler: Any, *, workspace: Path | None = None) -> None:
         self.root = root
         self.callbacks = [handler]  # 턴 안의 모든 stream 호출(재개 포함)에 같은 인스턴스를 쓴다
+        self.workspace = workspace
+        self.before = snapshot(workspace) if workspace is not None else None
+        self.worklog = WorkLog()
+
+    def on_part(self, part: tuple) -> None:
+        self.worklog.on_part(part)
 
     def decision(self, action: dict, decision: dict, auto: bool) -> None:
+        self.worklog.decision(action, decision, auto)
         approved = decision.get("type") == "approve"
         self.root.create_event(
             name=f"approval:{action['name']}",
@@ -92,7 +107,16 @@ class LangfuseTurn:
         )
 
     def end(self, *, output: str, usage: Usage, error: str | None = None) -> None:
-        fields: dict[str, Any] = {"output": output, "metadata": {"usage": asdict(usage)}}
+        """output 은 최종 답변이다. 루트 출력에는 판단 근거가 되는 작업 기록 전체를 남긴다."""
+        changes: list[str] | None
+        if self.workspace is None:
+            changes, diff = [], ""
+        elif self.before is None or (after := snapshot(self.workspace)) is None:
+            changes, diff = None, ""  # 파일이 너무 많아 스냅샷을 건너뛰었다
+        else:
+            changes, diff = diff_snapshots(self.before, after)
+        fields: dict[str, Any] = {"output": self.worklog.render(answer=output, changes=changes, diff=diff),
+                                  "metadata": {"usage": asdict(usage)}}
         if error:
             fields.update(level="ERROR", status_message=error)
         self.root.update(**fields)

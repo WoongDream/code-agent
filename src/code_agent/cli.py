@@ -161,19 +161,24 @@ class App:
         renderer = Renderer(self.console)
         meter = UsageCallback()
         tags = [self.workspace.name, f"mode:{self.mode}", f"model:{self.settings.model}"]
-        trace_context = (self.tracer.turn(text, session_id=self.thread_id, tags=tags) if self.tracer is not None
-                         else nullcontext())
+        trace_context = (self.tracer.turn(text, session_id=self.thread_id, tags=tags, workspace=self.workspace)
+                         if self.tracer is not None else nullcontext())
         with trace_context as trace:
             def decide(action_requests: list[dict]) -> list[dict]:
                 renderer.end_turn()
                 return decide_all(action_requests, self.mode, self.ask,
                                   on_decision=trace.decision if trace is not None else None)
 
+            def on_part(part: tuple) -> None:
+                renderer.on_part(part)
+                if trace is not None:
+                    trace.on_part(part)  # 작업 기록(도구 실행과 결과 요약)
+
             callbacks = [meter, *(trace.callbacks if trace is not None else [])]
             error = None
             try:
                 run_turn(self.agent, {"messages": [{"role": "user", "content": text}]},
-                         {**self.config, "callbacks": callbacks}, decide=decide, on_part=renderer.on_part)
+                         {**self.config, "callbacks": callbacks}, decide=decide, on_part=on_part)
             except KeyboardInterrupt:
                 renderer.end_turn()
                 self.console.print("[yellow]중단했다.[/]")

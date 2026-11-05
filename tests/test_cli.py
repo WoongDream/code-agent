@@ -38,7 +38,7 @@ class Script:
 
 
 def make_app(tmp_path: Path, steps: list, *answers: str, workspace: Path | None = None,
-             mode: str = "manual") -> tuple[App, ScriptedChatModel, io.StringIO, Script]:
+             mode: str = "manual", tracer=None) -> tuple[App, ScriptedChatModel, io.StringIO, Script]:
     if workspace is None:
         workspace = tmp_path / "ws"
         workspace.mkdir()
@@ -48,7 +48,7 @@ def make_app(tmp_path: Path, steps: list, *answers: str, workspace: Path | None 
     agent = build_agent(settings, workspace, SqliteSaver(sessions.conn), model=model)
     out, script = io.StringIO(), Script(*answers)
     app = App(settings, workspace, mode, sessions, sessions.create(workspace),
-              Console(file=out, width=120, highlight=False), script, agent=agent)
+              Console(file=out, width=120, highlight=False), script, agent=agent, tracer=tracer)
     return app, model, out, script
 
 

@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 openrouter = ["langchain-openrouter==0.2.8"]
+langfuse = ["langfuse>=5.1,<6"]
 
 [project.scripts]
 code-agent = "code_agent.cli:main"

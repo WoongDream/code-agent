@@ -43,7 +43,7 @@ code-agent/
 │   ├── render.py           # 스트림 → rich 터미널 출력
 │   ├── cli.py              # argparse, REPL, 슬래시 커맨드, interrupt/resume 루프
 │   ├── subagents.py        # (2단계)
-│   ├── tracing.py          # (3단계)
+│   ├── tracing.py          # Langfuse 트레이스 (turn 루트, CallbackHandler, 승인 event)
 │   └── skills/             # (2단계) 내장 SKILL.md (UTF-8, BOM 없음)
 └── tests/
     ├── fakes.py            # ScriptedChatModel (pjt에서 복사)
@@ -275,6 +275,32 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
 - `/cost`와 `/trace` 커맨드를 둔다.
 - 선택: 환경변수 `LANGSMITH_TRACING=true`만 켜면 LangSmith 추적이 된다.
 - CRLF 보존 미들웨어: `edit_file`이 파일 전체의 줄바꿈을 LF로 바꾸는 문제(#7488)를 막는다. 원본이 CRLF였으면 수정 후 복원한다.
+
+#### 3단계 진행 결과 (2026-11-05)
+- **`/cost`**: 1단계 이후 추가에서 구현했다(`usage.py`).
+- **`tracing.py`**: 로컬 `trace.jsonl` 대신 Langfuse Cloud로 구현했다. 선택 extra로 `langfuse>=5.1,<6`을 쓴다.
+  - **켜지는 조건**: `LANGFUSE_PUBLIC_KEY`와 `LANGFUSE_SECRET_KEY`가 둘 다 있을 때만 켜진다. 키는 `Langfuse(...)` 인자로만 넘겨 `os.environ`을 바꾸지 않는다.
+  - **호스트 환경변수**: v5는 `LANGFUSE_BASE_URL`을 쓴다. pjt(v4)의 `LANGFUSE_HOST`도 받는다.
+  - **트레이스 구조**
+    - 사용자 메시지 하나가 루트 observation `turn`(agent 타입) 하나다.
+    - `propagate_attributes`로 `session_id`(thread)와 태그를 붙인다.
+    - 그 아래에 `langfuse.langchain.CallbackHandler`가 그래프·모델·도구를 남긴다.
+    - 한 턴 안의 stream 호출(재개 포함)은 같은 핸들러 인스턴스를 쓴다.
+  - **승인 결정**: `decide_all(on_decision=...)`으로 받아 `approval:<도구>` event로 남긴다. `approval.py`는 여전히 Langfuse를 모른다.
+  - **턴 끝**: `UsageCallback` 합계를 `turn`의 metadata에 남긴다. 핸들러는 비용을 넘기지 않아서 OpenRouter 실제 비용은 여기 있다.
+  - **시험**: 가짜 tracer로 기록 내용을 확인했다. 실제 SDK는 `span_exporter=InMemorySpanExporter()`로 네트워크 없이 확인했다(트레이스 하나, 모델 호출이 generation 3개). 닿지 않는 서버로도 턴이 끝나고 종료가 오래 걸리지 않는 것을 확인했다.
+- 셸 env에서 `_KEY$`로 끝나는 변수도 뺀다. 전에는 `LANGFUSE_PUBLIC_KEY`가 남았다.
+- **실측 (jp.cloud.langfuse.com)**: 승인이 한 번 끼는 턴(`echo hello`)을 돌렸다.
+  - 트레이스 1개에 observation 23개가 남았다.
+    - 루트 `turn`에 입력·출력과 usage metadata가 있다.
+    - `approval:execute` event가 있다.
+    - 재개 후 단계도 같은 트레이스에 있다.
+    - generation 2개에 모델 `anthropic/claude-opus-5.5`와 캐시 쓰기·읽기 토큰이 있다.
+  - 조회 API에 주의한다. SDK v5에서 `api.trace.*`와 `GET /api/public/traces`로는 보이지 않았다. `api.observations.get_many(session_id=..., fields="core,basic,model,usage")`로 조회한다.
+  - **가격 정의 등록**: `anthropic/claude-opus-5.5`는 Langfuse 기본 정의에 없어 비용이 비었다. 그래서 프로젝트에 직접 등록했다.
+    - 패턴: `(?i)^anthropic/claude-opus-5\.5$`
+    - 100만 토큰당 가격: input $4, output·output_reasoning $20, input_cache_read $0.40, input_cache_creation $5
+    - 시험 generation으로 계산값이 맞는 것을 확인했다. 등록 전에 수집된 generation에는 소급되지 않는다.
 
 ### 4단계 — 평가·확장 (선택)
 - `evals/`: 수정 과제 5~10개(fixture 저장소와 숨김 검증 테스트)를 헤드리스로 돌려 통과율, 비용, 시간을 집계한다. `pjt\Day04\coding_skills\verify_agent.py` 패턴을 참고한다.

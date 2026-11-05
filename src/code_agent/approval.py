@@ -75,13 +75,35 @@ def auto_decision(action: dict, mode: str) -> dict | None:
     return None
 
 
-def decide_all(action_requests: Iterable[dict], mode: str, ask: Callable[[dict], dict]) -> list[dict]:
-    """요청 순서 그대로 결정을 만든다. HITL 미들웨어는 결정을 순서로 도구 호출과 짝짓는다."""
+def decide_all(action_requests: Iterable[dict], mode: str, ask: Callable[[dict], dict],
+               on_decision: Callable[[dict, dict, bool], None] | None = None) -> list[dict]:
+    """요청 순서 그대로 결정을 만든다. HITL 미들웨어는 결정을 순서로 도구 호출과 짝짓는다.
+
+    on_decision(action, decision, auto) 는 결정마다 불린다. auto 는 사람에게 묻지 않고 정했는지다(트레이스 기록용).
+    """
     if mode not in MODES:
         raise ValueError(f"승인 모드는 {', '.join(MODES)} 중 하나여야 합니다: {mode!r}")
-    return [auto_decision(action, mode) or ask(action) for action in action_requests]
+    decisions = []
+    for action in action_requests:
+        decision = auto_decision(action, mode)
+        auto = decision is not None
+        if decision is None:
+            decision = ask(action)
+        if on_decision is not None:
+            on_decision(action, decision, auto)
+        decisions.append(decision)
+    return decisions
+
+
+_REASON_PREFIX = " 사용자 의견: "
 
 
 def reject(reason: str = "") -> dict:
-    message = f"{REJECT_MESSAGE} 사용자 의견: {reason}" if reason else REJECT_MESSAGE
+    message = f"{REJECT_MESSAGE}{_REASON_PREFIX}{reason}" if reason else REJECT_MESSAGE
     return {"type": "reject", "message": message}
+
+
+def reject_reason(decision: dict) -> str:
+    """reject() 가 메시지에 붙인 사용자 의견. 없으면 빈 문자열."""
+    _, _, reason = str(decision.get("message", "")).partition(_REASON_PREFIX)
+    return reason

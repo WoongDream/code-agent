@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from code-agent!")
+"""Deep Agents SDK 기반 터미널 코딩 에이전트."""

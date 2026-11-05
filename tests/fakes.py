@@ -1,0 +1,53 @@
+"""단위 시험 전용 가짜 모델. 비용 없이 에이전트 배선을 시험한다. pjt Day02_new/tests/fakes.py 에서 가져왔다."""
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from uuid import uuid4
+
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import BaseTool
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from pydantic import BaseModel, Field, SkipValidation
+
+
+class ScriptExhausted(RuntimeError):
+    """대본을 다 썼는데 모델이 또 불렸다."""
+
+
+class ScriptedChatModel(BaseChatModel):
+    """steps를 차례로 돌려준다. callable 단계는 그때까지의 메시지를 받아 응답을 만든다."""
+    steps: SkipValidation[list[AIMessage | Callable[[list[BaseMessage]], AIMessage]]]
+    calls: list[list[BaseMessage]] = Field(default_factory=list)
+    bound_tool_names: list[str] = Field(default_factory=list)
+
+    @property
+    def _llm_type(self) -> str:
+        return "scripted"
+
+    def bind_tools(self, tools: Sequence[dict | type[BaseModel] | Callable | BaseTool],
+                   **kwargs: object) -> ScriptedChatModel:
+        self.bound_tool_names = [convert_to_openai_tool(t)["function"]["name"] for t in tools]
+        return self
+
+    def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None,
+                  run_manager: object = None, **kwargs: object) -> ChatResult:
+        index = len(self.calls)
+        self.calls.append(list(messages))
+        if index >= len(self.steps):
+            raise ScriptExhausted(f"대본은 {len(self.steps)}단계인데 {index + 1}번째 호출이 왔습니다.")
+        step = self.steps[index]
+        message = step if isinstance(step, AIMessage) else step(messages)
+        return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+def tool_call(name: str, args: dict, call_id: str | None = None) -> AIMessage:
+    return AIMessage(content="", tool_calls=[
+        {"name": name, "args": args, "id": call_id or f"call-{uuid4().hex[:8]}", "type": "tool_call"}])
+
+
+def tool_calls(*calls: tuple[str, dict]) -> AIMessage:
+    """병렬 도구 호출 하나의 응답."""
+    return AIMessage(content="", tool_calls=[
+        {"name": name, "args": args, "id": f"call-{uuid4().hex[:8]}", "type": "tool_call"} for name, args in calls])

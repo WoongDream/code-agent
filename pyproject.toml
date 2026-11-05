@@ -19,7 +19,7 @@ dependencies = [
 openrouter = ["langchain-openrouter==0.2.8"]
 
 [project.scripts]
-code-agent = "code_agent:main"
+code-agent = "code_agent.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=9,<10", "ruff>=0.16,<0.17"]
@@ -34,6 +34,7 @@ exclude-newer = "2026-10-31T00:00:00Z"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+norecursedirs = ["fixtures"]  # buggy_repo 는 일부러 실패하는 시험을 가진다
 
 [tool.ruff]
 line-length = 100

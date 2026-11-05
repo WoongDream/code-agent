@@ -1,0 +1,136 @@
+"""셸 백엔드: 셸 선택, 종료 코드, 한글, 타임아웃, 비밀값 제거, 경로 탈출, 오프로드 위치."""
+from __future__ import annotations
+
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+from deepagents.middleware.filesystem import FilesystemMiddleware
+
+from code_agent.backend import (
+    ARTIFACTS_ROUTE,
+    WindowsShellBackend,
+    find_git_bash,
+    make_backend,
+    shell_env,
+)
+
+SHELLS = ["bash", "powershell"] if sys.platform == "win32" else ["bash"]
+needs_bash = pytest.mark.skipif(sys.platform == "win32" and find_git_bash() is None, reason="Git Bash 없음")
+
+
+def run_python(shell: str, script: str) -> str:
+    """셸마다 다른 따옴표 규칙으로 현재 인터프리터를 실행하는 명령."""
+    exe = Path(sys.executable).as_posix()
+    return f"'{exe}' {script}" if shell == "bash" else f"& '{exe}' {script}"
+
+
+def alive(pid: int) -> bool:
+    if sys.platform == "win32":  # tasklist 출력은 OEM 코드페이지라 바이트로 비교한다
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, check=False).stdout
+        return str(pid).encode() in out
+    try:
+        import os
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@pytest.fixture(params=SHELLS)
+def shell_backend(request, tmp_path: Path) -> WindowsShellBackend:
+    if request.param == "bash" and sys.platform == "win32" and find_git_bash() is None:
+        pytest.skip("Git Bash 없음")
+    return WindowsShellBackend(tmp_path, shell=request.param, timeout=30)
+
+
+def test_echo_and_exit_code(shell_backend: WindowsShellBackend) -> None:
+    ok = shell_backend.execute("echo hello")
+    assert (ok.output.strip(), ok.exit_code) == ("hello", 0)
+    failed = shell_backend.execute("echo oops; exit 3")
+    assert failed.exit_code == 3
+    assert failed.output.endswith("Exit code: 3")
+
+
+def test_stderr_is_prefixed(shell_backend: WindowsShellBackend) -> None:
+    result = shell_backend.execute(run_python(shell_backend.shell, '-c "import sys; sys.stderr.write(\'bad\\n\')"'))
+    assert "[stderr] bad" in result.output
+
+
+def test_korean_output_is_not_garbled(shell_backend: WindowsShellBackend) -> None:
+    assert "한글 출력" in shell_backend.execute("echo '한글 출력'").output
+    script = Path(shell_backend.cwd, "ko.py")
+    script.write_text("print('파이썬 한글')\n", encoding="utf-8")
+    assert "파이썬 한글" in shell_backend.execute(run_python(shell_backend.shell, "ko.py")).output
+
+
+def test_runs_in_workspace(shell_backend: WindowsShellBackend) -> None:
+    Path(shell_backend.cwd, "marker.txt").write_text("x", encoding="utf-8")
+    assert "marker.txt" in shell_backend.execute("ls").output
+
+
+def test_timeout_kills_process_tree(shell_backend: WindowsShellBackend) -> None:
+    """손자 프로세스까지 끝나야 한다. 기본 구현은 손자가 쥔 파이프가 닫힐 때까지(여기선 60초) 돌아오지 않는다."""
+    Path(shell_backend.cwd, "spawn.py").write_text(
+        "import subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "open('child.pid', 'w').write(str(child.pid))\n"
+        "time.sleep(60)\n", encoding="utf-8")
+    started = time.perf_counter()
+    result = shell_backend.execute(run_python(shell_backend.shell, "spawn.py"), timeout=5)
+    assert time.perf_counter() - started < 20
+    assert result.exit_code == 124
+    assert "timed out" in result.output
+    pid = int(Path(shell_backend.cwd, "child.pid").read_text())
+    assert not alive(pid)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="OEM 코드페이지는 Windows 전용")
+def test_oem_codepage_output_is_decoded(shell_backend: WindowsShellBackend) -> None:
+    import ctypes
+    encoding = f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+    text = "한글" if encoding == "cp949" else "café"
+    Path(shell_backend.cwd, "oem.py").write_text(
+        f"import sys; sys.stdout.buffer.write({text!r}.encode({encoding!r}))\n", encoding="utf-8")
+    assert text in shell_backend.execute(run_python(shell_backend.shell, "oem.py")).output
+
+
+def test_shell_env_drops_secrets() -> None:
+    env = shell_env({"PATH": "p", "SYSTEMROOT": "s", "ANTHROPIC_API_KEY": "k", "GITHUB_TOKEN": "t",
+                     "DB_PASSWORD": "pw", "AWS_SECRET_ACCESS_KEY": "a", "OPENROUTER_API_KEY": "o"})
+    assert {"PATH", "SYSTEMROOT"} <= env.keys()
+    assert not {"ANTHROPIC_API_KEY", "GITHUB_TOKEN", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY",
+                "OPENROUTER_API_KEY"} & env.keys()
+
+
+@needs_bash
+def test_shell_cannot_see_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-leak")
+    backend = WindowsShellBackend(tmp_path, shell="bash")
+    result = backend.execute("printenv ANTHROPIC_API_KEY || echo missing")
+    assert "sk-should-not-leak" not in result.output
+    assert "missing" in result.output
+
+
+@pytest.mark.parametrize("path", ["/../outside.txt", "../outside.txt", "C:/Windows/win.ini", "/C:/Windows/win.ini"])
+def test_file_tools_stay_in_workspace(tmp_path: Path, path: str) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (tmp_path / "outside.txt").write_text("SECRET", encoding="utf-8")
+    backend = make_backend(workspace, artifacts_dir=tmp_path / "artifacts")
+    with pytest.raises(ValueError):
+        backend.read(path)
+
+
+def test_offload_goes_to_artifacts_not_workspace(tmp_path: Path) -> None:
+    workspace, artifacts = tmp_path / "ws", tmp_path / "artifacts"
+    workspace.mkdir()
+    backend = make_backend(workspace, artifacts_dir=artifacts)
+    middleware = FilesystemMiddleware(backend=backend)
+    for prefix in (middleware._large_tool_results_prefix, middleware._conversation_history_prefix):
+        assert prefix.startswith(ARTIFACTS_ROUTE)
+    assert backend.write(f"{middleware._large_tool_results_prefix}/call-1", "big").error is None
+    assert (artifacts / "large_tool_results" / "call-1").read_text(encoding="utf-8") == "big"
+    assert list(workspace.iterdir()) == []

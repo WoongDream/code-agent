@@ -1,6 +1,6 @@
 # Deep Agents 기반 터미널 코드 에이전트 구축 계획
 
-> 상태: 0단계 완료(2026-11-05). 다음은 1단계 MVP다. 작성일은 2026-11-04.
+> 상태: 1단계 MVP 구현과 무과금 시험 완료(2026-11-05). 남은 것은 실제 API 수동 E2E(6장 2)다. 작성일은 2026-11-04.
 > 근거 표기: **[V]**는 `deepagents==0.7.32` 태그 소스로 확인한 사실, **[D]**는 공식 문서(버전 고정 아님)에 근거한 사실, **[I]**는 추론이라 0단계에서 확인해야 하는 사실이다.
 
 ## 1. Context
@@ -35,7 +35,8 @@ code-agent/
 │   ├── models.py           # make_model(): "anthropic:" / "openrouter:" 분기
 │   ├── backend.py          # WindowsShellBackend + CompositeBackend 조립
 │   ├── prompts.py          # 코딩 시스템 프롬프트, 서브에이전트 프롬프트
-│   ├── agent.py            # build_agent(): create_deep_agent 조립 (SDK와 결합되는 유일한 곳)
+│   ├── agent.py            # build_agent(): create_deep_agent 조립, run_turn(): 스트림·interrupt·재개 루프
+│   ├── guards.py           # DotenvGuardMiddleware (.env 차단, grep 결과 필터)
 │   ├── approval.py         # 승인 모드, 셸 allow-list, HITL 결정 생성 (순수 함수)
 │   ├── render.py           # 스트림 → rich 터미널 출력
 │   ├── cli.py              # argparse, REPL, 슬래시 커맨드, interrupt/resume 루프
@@ -202,6 +203,35 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - approve 후 resume이 끝까지 완료되는지 확인한다.
   - `.env` 읽기가 거부되는지 확인한다.
 - **MVP 완료 조건**: `tests\fixtures\buggy_repo`(테스트 1개 실패)의 복사본에서 "실패하는 테스트를 고쳐줘"를 실행하면, 승인을 거쳐 수정하고 pytest가 통과해야 한다.
+
+#### 1단계 진행 결과 (2026-11-05)
+- **시험**: `ruff check` 통과, `pytest` 117개 통과(모델 호출 없음). 파일은 `test_backend.py`(19), `test_approval.py`(75), `test_agent.py`(16), `test_cli.py`(7)다.
+  - `test_cli.py::test_fixes_buggy_repo_with_approvals`는 대본 모델로 완료 조건의 배선을 확인한다: 실패 확인 → 읽기 → 수정 승인 → pytest 승인 → 4개 통과.
+  - 가드 시험은 가드를 꺼서 실제로 실패하는지 확인했다.
+- **계획과 달라진 점**
+  - 셸은 `bash.exe -c`로 실행한다. `-lc`(로그인 셸)는 필요 없었다. Windows PATH만 있어도 Git Bash가 `/usr/bin`을 잡는다.
+    - Git 루트는 `git.exe`의 상위 폴더에서 `bin/bash.exe`를 찾는다. git이 `Git\ucrt64\bin`에 있는 경우도 있다.
+  - 출력이 UTF-8로 디코드되지 않으면 OEM 코드페이지(cp949)로 다시 디코드한다. `tasklist` 같은 Windows 기본 도구는 파이프에 cp949로 쓴다.
+  - 기본 `LocalShellBackend`의 타임아웃 문제를 실측했다. 고아 프로세스가 남을 뿐 아니라, 손자 프로세스가 쥔 파이프가 닫힐 때까지 **돌아오지 않는다**(타임아웃 3초에 31초 걸림). 새 백엔드는 3.4초에 끝난다.
+  - allow-list를 강화했다. 계획대로라면 아래가 승인 없이 실행될 수 있었다.
+    - `cat .env`, `cat ~/.ssh/id_rsa`
+    - `git -c core.fsmonitor=... status`
+    - auto-edit 모드에서 `.git/config`를 고친 뒤 자동 승인되는 `git status`로 그 설정을 실행하는 경로
+    - 대응:
+      - 작업 폴더 밖, `.env`, 와일드카드를 가리키는 인자는 묻는다.
+      - `git` 바로 뒤에는 하위 명령만 허용하고 `--output`은 막는다.
+      - `$`, `(`, `)`, `{`, `}`, `&`는 무조건 묻는다.
+      - auto-edit 모드에서도 `.git/` 아래 쓰기는 묻는다.
+  - `.env` 차단은 `guards.py`의 `DotenvGuardMiddleware`로 했다.
+    - `.env.example`, `.env.sample`, `.env.template`은 허용한다.
+    - grep은 세 출력 형식 모두에서 `.env` 줄을 지운다. 가드가 오프로드보다 안쪽에서 돌아 오프로드 파일에도 비밀값이 남지 않는다(시험으로 확인).
+  - thinking은 langchain-anthropic 1.7.7이 모델 프로필에 따라 `{"type": "adaptive", "display": "summarized"}`로 채운다. Opus 5.5에서 허용되는 값이다. 그래서 thinking 요약을 흐리게 스트리밍한다.
+  - `max_tokens=64000`, `streaming=True`로 둔다. 예산은 사용자 메시지 하나당 모델 100회, 도구 300회다.
+  - 세션 표 `code_agent_threads`(thread → 작업 폴더)는 `sessions.db`에 둔다. 시작에 성공한 뒤에만 기록한다.
+  - mintty(Git Bash 창)에서는 prompt_toolkit이 `NoConsoleScreenBufferError`를 내서 `input()`으로 대체한다.
+- **남은 것**
+  - 실제 API 수동 E2E(6장 2).
+  - 확인 필요: Opus 5.5의 refusal `fallbacks`. langchain-anthropic 1.7.7이 응답의 `fallback` 블록을 다루지 못할 수 있어 켜지 않았다. E2E에서 확인한 뒤 켤지 정한다.
 
 ### 2단계 — 컨텍스트: 메모리·스킬·서브에이전트·헤드리스
 - **메모리** [V]

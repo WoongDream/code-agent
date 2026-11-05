@@ -11,6 +11,7 @@ from fakes import ScriptedChatModel, tool_call
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from rich.console import Console
+from test_usage import ai
 
 from code_agent.agent import build_agent
 from code_agent.cli import App, Sessions, parse_args
@@ -30,7 +31,10 @@ class Script:
         self.prompts.append(prompt)
         if not self.answers:
             raise EOFError
-        return self.answers.pop(0)
+        answer = self.answers.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
 
 
 def make_app(tmp_path: Path, steps: list, *answers: str, workspace: Path | None = None,
@@ -107,6 +111,31 @@ def test_session_persists_across_apps(tmp_path: Path) -> None:
     resumed.run()
     humans = [m.text for m in model.calls[0] if isinstance(m, HumanMessage)]
     assert humans == ["기억해: 파랑", "뭐라고 했지?"]
+
+
+def test_usage_line_and_cost_command(tmp_path: Path) -> None:
+    """턴마다 사용량 한 줄을 보이고, /cost 는 sessions.db 에 쌓인 턴 합계를 보인다."""
+    steps = [ai("하나", inp=1000, out=10, cost=0.01), ai("둘", inp=2000, out=20, cache_read=900, cost=0.002)]
+    app, _, out, _ = make_app(tmp_path, steps, "/cost", "첫 질문", "두 번째 질문", "/cost", "/exit")
+    app.run()
+    text = out.getvalue()
+    assert "이 세션에 기록된 사용량이 아직 없다" in text
+    assert "모델 1회 · 입력 1,000 · 출력 10 · $0.0100" in text
+    assert "모델 1회 · 입력 2,000 (캐시 읽기 900 · 쓰기 0) · 출력 20 · $0.0020" in text
+    assert f"세션 {app.thread_id} · 턴 2개 · 모델 2회 · 입력 3,000 (캐시 읽기 900 · 쓰기 0) · 출력 30 · $0.0120" in text
+    total, turns = app.sessions.usage_of(app.thread_id)
+    assert (turns, total.calls, total.output_tokens) == (2, 2, 30)
+
+
+def test_interrupted_turn_still_records_usage(tmp_path: Path) -> None:
+    """승인 프롬프트에서 Ctrl+C 로 턴을 끊어도 이미 쓴 모델 호출은 남는다."""
+    step = ai(inp=500, out=5, cost=0.004, tool_calls=[
+        {"name": "execute", "args": {"command": "uv run pytest"}, "id": "c1", "type": "tool_call"}])
+    app, _, out, _ = make_app(tmp_path, [step], "테스트 돌려", KeyboardInterrupt(), "/exit")
+    app.run()
+    assert "중단했다" in out.getvalue()
+    total, turns = app.sessions.usage_of(app.thread_id)
+    assert (turns, total.calls, round(total.cost, 6)) == (1, 1, 0.004)
 
 
 def test_unknown_session_is_none(tmp_path: Path) -> None:

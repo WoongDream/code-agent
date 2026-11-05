@@ -8,6 +8,7 @@ import subprocess
 import sys
 import uuid
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from code_agent.agent import build_agent, run_turn
 from code_agent.approval import APPROVE, MODES, decide_all, reject
 from code_agent.render import Renderer, describe_action, todos_markup
 from code_agent.settings import Settings, load_settings
+from code_agent.tracing import Tracer, langfuse_installed, make_tracer
 from code_agent.usage import Usage, UsageCallback
 
 HELP = """\
@@ -80,11 +82,12 @@ class Sessions:
 
 class App:
     def __init__(self, settings: Settings, workspace: Path, mode: str, sessions: Sessions, thread_id: str,
-                 console: Console, read_line: ReadLine, *, agent=None) -> None:
+                 console: Console, read_line: ReadLine, *, agent=None, tracer: Tracer | None = None) -> None:
         self.settings, self.workspace, self.mode = settings, workspace, mode
         self.sessions, self.thread_id = sessions, thread_id
         self.console, self.read_line = console, read_line
         self.agent = agent if agent is not None else build_agent(settings, workspace, SqliteSaver(sessions.conn))
+        self.tracer = tracer
 
     @property
     def config(self) -> dict:
@@ -94,8 +97,17 @@ class App:
         self.console.print(f"[bold]code-agent[/]  작업 폴더 [cyan]{escape(str(self.workspace))}[/]\n"
                            f"모델 {escape(self.settings.model)} · 승인 모드 {self.mode} · 세션 {self.thread_id}  "
                            "[dim](/help)[/]")
+        if self.tracer is not None:
+            self.console.print(f"[dim]Langfuse 트레이스 켜짐 → {escape(self.settings.langfuse_base_url)}[/]")
         if self.mode == "yolo":
             self.console.print(YOLO_WARNING)
+        try:
+            return self._loop()
+        finally:
+            if self.tracer is not None:
+                self.tracer.shutdown()  # 남은 트레이스를 보낸다
+
+    def _loop(self) -> int:
         while True:
             try:
                 line = self.read_line("› ").strip()
@@ -148,22 +160,32 @@ class App:
     def turn(self, text: str) -> None:
         renderer = Renderer(self.console)
         meter = UsageCallback()
+        tags = [self.workspace.name, f"mode:{self.mode}", f"model:{self.settings.model}"]
+        trace_context = (self.tracer.turn(text, session_id=self.thread_id, tags=tags) if self.tracer is not None
+                         else nullcontext())
+        with trace_context as trace:
+            def decide(action_requests: list[dict]) -> list[dict]:
+                renderer.end_turn()
+                return decide_all(action_requests, self.mode, self.ask,
+                                  on_decision=trace.decision if trace is not None else None)
 
-        def decide(action_requests: list[dict]) -> list[dict]:
-            renderer.end_turn()
-            return decide_all(action_requests, self.mode, self.ask)
-
-        try:
-            run_turn(self.agent, {"messages": [{"role": "user", "content": text}]},
-                     {**self.config, "callbacks": [meter]}, decide=decide, on_part=renderer.on_part)
-        except KeyboardInterrupt:
-            renderer.end_turn()
-            self.console.print("[yellow]중단했다.[/]")
-        except Exception as e:  # noqa: BLE001 - 한 턴의 실패로 REPL 을 끝내지 않는다
-            renderer.end_turn()
-            self.console.print(f"[red]오류: {type(e).__name__}: {escape(str(e))}[/]")
-        else:
-            renderer.end_turn()
+            callbacks = [meter, *(trace.callbacks if trace is not None else [])]
+            error = None
+            try:
+                run_turn(self.agent, {"messages": [{"role": "user", "content": text}]},
+                         {**self.config, "callbacks": callbacks}, decide=decide, on_part=renderer.on_part)
+            except KeyboardInterrupt:
+                renderer.end_turn()
+                self.console.print("[yellow]중단했다.[/]")
+                error = "사용자가 중단"
+            except Exception as e:  # noqa: BLE001 - 한 턴의 실패로 REPL 을 끝내지 않는다
+                renderer.end_turn()
+                self.console.print(f"[red]오류: {type(e).__name__}: {escape(str(e))}[/]")
+                error = f"{type(e).__name__}: {e}"
+            else:
+                renderer.end_turn()
+            if trace is not None:
+                trace.end(output=renderer.last_text, usage=meter.usage, error=error)
         if meter.usage.calls:  # 중단·오류로 끝난 턴도 쓴 만큼은 남긴다
             self.sessions.add_usage(self.thread_id, meter.usage)
             self.console.print(f"[dim]{escape(meter.usage.summary())}[/]")
@@ -254,7 +276,10 @@ def main(argv: list[str] | None = None) -> int:
     except (RuntimeError, ValueError) as e:  # API 키 미설정, 모델 이름 오류 등
         console.print(f"[red]{escape(str(e))}[/]")
         return 2
+    if settings.langfuse_enabled and not langfuse_installed():
+        console.print("[dim]Langfuse 키가 있지만 패키지가 없어 트레이스를 끈다. 켜려면: uv sync --extra langfuse[/]")
+    tracer = make_tracer(settings)
     thread_id = args.resume or sessions.create(workspace)  # 시작에 성공한 뒤에만 세션을 남긴다
     app = App(settings, workspace, args.mode, sessions, thread_id, console,
-              _line_reader(settings.data_dir / "history"), agent=agent)
+              _line_reader(settings.data_dir / "history"), agent=agent, tracer=tracer)
     return app.run()

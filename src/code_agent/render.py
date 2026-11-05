@@ -24,6 +24,7 @@ class Renderer:
         self.console = console
         self._streamed: set[str] = set()  # 토큰으로 이미 그린 AI 메시지 id
         self._mid_line = False
+        self.last_text = ""  # 메인 에이전트의 마지막 AI 텍스트. 턴의 최종 답변으로 트레이스에 남긴다
 
     def on_part(self, part: tuple[tuple[str, ...], str, Any]) -> None:
         ns, mode, data = part
@@ -57,6 +58,8 @@ class Renderer:
         messages = update.get("messages")
         for message in messages if isinstance(messages, list) else []:
             if node == "model" and isinstance(message, AIMessage):
+                if not prefix and message.text:
+                    self.last_text = message.text
                 for call in message.tool_calls:
                     self._line(f"{prefix}[cyan]●[/] {escape(describe_call(call))}")
             elif isinstance(message, ToolMessage):

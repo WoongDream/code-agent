@@ -18,6 +18,7 @@ DEFAULT_MODEL = "anthropic:claude-opus-5-5"
 DEFAULT_EFFORT = "high"  # Opus 5.5 의 API 기본값은 medium 이라 항상 명시한다
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 SHELLS = ("bash", "powershell")
+DEFAULT_LANGFUSE_URL = "https://cloud.langfuse.com"
 
 
 @dataclass(frozen=True)
@@ -27,7 +28,15 @@ class Settings:
     shell: str = ""  # 비우면 Git Bash, 없으면 PowerShell
     anthropic_api_key: str = field(default="", repr=False)
     openrouter_api_key: str = field(default="", repr=False)
+    langfuse_public_key: str = field(default="", repr=False)
+    langfuse_secret_key: str = field(default="", repr=False)
+    langfuse_base_url: str = DEFAULT_LANGFUSE_URL
     data_dir: Path = DATA_DIR
+
+    @property
+    def langfuse_enabled(self) -> bool:
+        """두 키가 모두 있어야 트레이스를 보낸다."""
+        return bool(self.langfuse_public_key and self.langfuse_secret_key)
 
 
 def load_settings(data_dir: Path = DATA_DIR) -> Settings:
@@ -48,5 +57,9 @@ def load_settings(data_dir: Path = DATA_DIR) -> Settings:
         shell=shell,
         anthropic_api_key=get("ANTHROPIC_API_KEY"),
         openrouter_api_key=get("OPENROUTER_API_KEY"),
+        langfuse_public_key=get("LANGFUSE_PUBLIC_KEY"),
+        langfuse_secret_key=get("LANGFUSE_SECRET_KEY"),
+        # Langfuse v5 는 LANGFUSE_BASE_URL 을 쓴다. pjt(v4)의 LANGFUSE_HOST 도 받는다.
+        langfuse_base_url=get("LANGFUSE_BASE_URL") or get("LANGFUSE_HOST") or DEFAULT_LANGFUSE_URL,
         data_dir=data_dir,
     )

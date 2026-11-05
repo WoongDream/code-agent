@@ -19,7 +19,7 @@ from deepagents.backends import CompositeBackend, FilesystemBackend, LocalShellB
 from deepagents.backends.protocol import ExecuteResponse
 
 ARTIFACTS_ROUTE = "/.code-agent-artifacts/"  # 큰 도구 결과·대화 기록·blob 오프로드가 모두 이 아래로 간다
-SECRET_ENV = re.compile(r"_API_KEY$|TOKEN|SECRET|PASSWORD", re.IGNORECASE)
+SECRET_ENV = re.compile(r"_KEY$|TOKEN|SECRET|PASSWORD", re.IGNORECASE)  # *_API_KEY, LANGFUSE_PUBLIC_KEY 등
 _PS_UTF8 = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
 if sys.platform == "win32":
     import ctypes

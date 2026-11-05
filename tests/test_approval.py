@@ -3,7 +3,14 @@ from __future__ import annotations
 
 import pytest
 
-from code_agent.approval import APPROVE, auto_decision, decide_all, is_read_only_command, reject
+from code_agent.approval import (
+    APPROVE,
+    auto_decision,
+    decide_all,
+    is_read_only_command,
+    reject,
+    reject_reason,
+)
 
 
 def action(name: str, **args) -> dict:
@@ -74,6 +81,20 @@ def test_decide_all_keeps_request_order() -> None:
     assert [d["type"] for d in decisions] == ["approve", "approve", "reject", "approve"]
     assert asked == ["/src/app.py", "uv run pytest -q", "/new.py"]  # git status 는 묻지 않았다
     assert "싫음" in decisions[2]["message"]
+
+
+def test_on_decision_reports_each_decision_in_order() -> None:
+    seen: list[tuple[str, str, bool, str]] = []
+    decide_all([GIT_STATUS, EDIT, PYTEST], "auto-edit", lambda act: reject("느림"),
+               on_decision=lambda act, d, auto: seen.append((act["name"], d["type"], auto, reject_reason(d))))
+    assert seen == [("execute", "approve", True, ""), ("edit_file", "approve", True, ""),
+                    ("execute", "reject", False, "느림")]
+
+
+def test_reject_reason() -> None:
+    assert reject_reason(reject("다른 방법")) == "다른 방법"
+    assert reject_reason(reject()) == ""
+    assert reject_reason(APPROVE) == ""
 
 
 def test_unknown_mode_is_rejected() -> None:

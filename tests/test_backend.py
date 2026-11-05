@@ -98,11 +98,11 @@ def test_oem_codepage_output_is_decoded(shell_backend: WindowsShellBackend) -> N
 
 
 def test_shell_env_drops_secrets() -> None:
-    env = shell_env({"PATH": "p", "SYSTEMROOT": "s", "ANTHROPIC_API_KEY": "k", "GITHUB_TOKEN": "t",
-                     "DB_PASSWORD": "pw", "AWS_SECRET_ACCESS_KEY": "a", "OPENROUTER_API_KEY": "o"})
-    assert {"PATH", "SYSTEMROOT"} <= env.keys()
-    assert not {"ANTHROPIC_API_KEY", "GITHUB_TOKEN", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY",
-                "OPENROUTER_API_KEY"} & env.keys()
+    secrets = {"ANTHROPIC_API_KEY", "GITHUB_TOKEN", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "OPENROUTER_API_KEY",
+               "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "gpg_key"}
+    env = shell_env({"PATH": "p", "SYSTEMROOT": "s", "LANGFUSE_BASE_URL": "u", **dict.fromkeys(secrets, "x")})
+    assert {"PATH", "SYSTEMROOT", "LANGFUSE_BASE_URL"} <= env.keys()
+    assert not secrets & env.keys()
 
 
 @needs_bash

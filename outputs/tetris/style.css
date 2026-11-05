@@ -1,0 +1,126 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1b1d2a;
+  color: #e8e8f0;
+  font-family: "Segoe UI", "Malgun Gothic", sans-serif;
+}
+
+.game {
+  display: flex;
+  gap: 24px;
+  align-items: flex-start;
+}
+
+.board-wrap {
+  position: relative;
+}
+
+#board {
+  display: block;
+  background: #0d0e16;
+  border: 3px solid #4a4e6a;
+  border-radius: 4px;
+}
+
+.side {
+  width: 160px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.side section {
+  background: #262938;
+  border: 2px solid #3a3e56;
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+
+.side h3 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  letter-spacing: 2px;
+  color: #9aa0c0;
+}
+
+#next {
+  display: block;
+  margin: 0 auto;
+  background: #0d0e16;
+  border-radius: 4px;
+}
+
+.value {
+  margin: 0;
+  font-size: 24px;
+  font-weight: bold;
+  text-align: right;
+}
+
+.help ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 13px;
+  line-height: 1.9;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 22px;
+  padding: 0 5px;
+  border: 1px solid #5a5f80;
+  border-radius: 3px;
+  background: #1b1d2a;
+  font-family: inherit;
+  font-size: 12px;
+  text-align: center;
+}
+
+.overlay {
+  position: absolute;
+  inset: 3px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.75);
+}
+
+.overlay.hidden {
+  display: none;
+}
+
+.overlay h2 {
+  margin: 0 0 10px;
+  font-size: 34px;
+  letter-spacing: 3px;
+  color: #ff5a6e;
+}
+
+.overlay p {
+  margin: 0 0 20px;
+  font-size: 18px;
+}
+
+.overlay button {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 6px;
+  background: #5a7bff;
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+.overlay button:hover {
+  background: #7590ff;
+}

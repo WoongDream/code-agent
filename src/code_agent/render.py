@@ -8,7 +8,7 @@ messages 모드에서는 model 노드의 AI 메시지만, updates 모드에서�
 OpenRouter 는 생각을 청크의 additional_kwargs 에 담는다. reasoning_content 는 content_blocks 의 reasoning 블록이 되지만
 reasoning_details 에만 담긴 청크는 블록이 없어 그 text·summary 를 쓴다.
 모델과 도구를 기다리는 동안에는 상태 줄(StatusLine)에 단계·진행량·경과 시간을 보인다. 생각이 오래 걸리거나 큰 도구 인자를
-쓰는 동안에도 멈춘 것처럼 보이지 않게 하려는 것이다(az-quiz 첫 호출 약 15분, quizzes.js 인자 작성 99초).
+쓰는 동안에도 멈춘 것처럼 보이지 않게 하려는 것이다(az-quiz 첫 호출 658초(약 11분, Langfuse 실측), quizzes.js 인자 작성 99초).
 """
 
 from __future__ import annotations

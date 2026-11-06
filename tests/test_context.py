@@ -50,6 +50,7 @@ def test_anthropic_profile_capped() -> None:
 @pytest.mark.parametrize(("raw", "expected"), [
     (None, DEFAULT_CONTEXT_TOKENS), ("150000", 150_000), ("150,000", 150_000), ("20000", 20_000),
     ("1000000", 1_000_000), ("abc", None), ("1000", None), ("2000000", None), ("-5", None),
+    ("2²", None), ("１５００００", None),  # isdigit 이지만 int 가 안 되거나 ASCII 가 아니다
 ])
 def test_context_tokens_setting(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw: str | None,
                                 expected: int | None) -> None:
@@ -89,6 +90,7 @@ def test_summarization_slot_replaced_without_arg_truncation(tmp_path: Path, monk
     assert isinstance(ours, SummarizationMiddleware)
     assert ours._truncate_args_trigger is None  # 도구 인자 잘림을 끈다
     assert (ours._lc_helper.trigger, ours._lc_helper.keep) == (("tokens", 127_500), ("tokens", 15_000))
+    assert ours._lc_helper.trim_tokens_to_summarize is None  # 기본값 4,000 이면 버릴 기록의 끝 4K 만 요약된다
     names = [m.name for m in seen[-1]]
     assert names.index("SummarizationMiddleware") < names.index("TruncationRecoveryMiddleware")  # core 자리 그대로
 

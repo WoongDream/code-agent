@@ -18,14 +18,16 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from typing import Any
 
 from langchain.agents.middleware import (
     AgentMiddleware,
     AgentState,
+    ExtendedModelResponse,
     ModelCallLimitMiddleware,
+    ModelCallResult,
     ModelRequest,
     ModelResponse,
     ToolCallLimitMiddleware,
@@ -145,9 +147,10 @@ def hold_cut_call(message: BaseMessage) -> AIMessage | None:
     langchain-core 는 스트림 청크를 합칠 때 parse_partial_json 으로 잘린 인자를 고쳐 유효한 호출로 만든다
     (AIMessageChunk.init_tool_calls, 실측: write_file content 가 중간에서 끊긴 채 유효한 호출이 됐다). 그대로 두면
     절반만 쓴 파일이나 잘린 셸 명령이 실행된다. 옮긴 호출에는 langchain 이 '인자가 잘렸다' 결과를 붙여 다시 쓰게 한다.
-    대상이 아니면 None.
+    대상이 아니면 None. 잘린 호출이 이미 invalid_tool_calls 에 있으면(고치기도 실패했다) 앞의 완결된 호출은 그대로 둔다.
     """
-    if stop_reason(message) is None or not isinstance(message, AIMessage) or not message.tool_calls:
+    if (stop_reason(message) is None or not isinstance(message, AIMessage) or not message.tool_calls
+            or message.invalid_tool_calls):
         return None
     *kept, cut = message.tool_calls
     held = {"type": "invalid_tool_call", "name": cut["name"], "args": "{}", "id": cut["id"], "error": HELD_ERROR}
@@ -167,6 +170,18 @@ def sanitize_invalid_calls(message: AIMessage) -> AIMessage | None:
     return message.model_copy(update={"invalid_tool_calls": calls})
 
 
+def _hold_in(result: ModelCallResult) -> ModelCallResult:
+    """모델 호출 결과의 세 모양(ModelResponse, AIMessage, ExtendedModelResponse) 모두에서 hold_cut_call 을 적용한다.
+
+    안쪽 미들웨어가 무엇을 돌려주느냐에 따라 모양이 다르다. 예: SkillsMiddleware 는 항상 ExtendedModelResponse 를 돌려준다.
+    """
+    if isinstance(result, AIMessage):
+        return hold_cut_call(result) or result
+    if isinstance(result, ExtendedModelResponse):
+        return replace(result, model_response=_hold_in(result.model_response))
+    return replace(result, result=[hold_cut_call(m) or m for m in result.result])
+
+
 class TruncationRecoveryMiddleware(AgentMiddleware):
     """멈춘 응답을 정리하고, 도구 호출이 없으면 턴을 끝내지 않고 안내를 덧붙여 모델을 한 번 더 부른다(턴당 1번).
 
@@ -181,9 +196,12 @@ class TruncationRecoveryMiddleware(AgentMiddleware):
     """
 
     def wrap_model_call(self, request: ModelRequest,
-                        handler: Callable[[ModelRequest], ModelResponse]) -> ModelResponse:
-        response = handler(request)
-        return replace(response, result=[hold_cut_call(m) or m for m in response.result])
+                        handler: Callable[[ModelRequest], ModelResponse]) -> ModelCallResult:
+        return _hold_in(handler(request))
+
+    async def awrap_model_call(self, request: ModelRequest,
+                               handler: Callable[[ModelRequest], Awaitable[ModelResponse]]) -> ModelCallResult:
+        return _hold_in(await handler(request))
 
     @hook_config(can_jump_to=["model"])
     def after_model(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:

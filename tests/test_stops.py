@@ -1,10 +1,18 @@
 """말없이 멈추지 않기: 잘린 응답의 자동 복구(턴당 1번), 턴 끝 경고, 예산 상한 도달 표시. 모델은 대본이다."""
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from typing import cast
 
 import pytest
-from fakes import tool_call, tool_calls
+from fakes import ScriptedChatModel, tool_call, tool_calls
+from langchain.agents.middleware import (
+    AgentMiddleware,
+    ExtendedModelResponse,
+    ModelRequest,
+    ModelResponse,
+)
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from test_agent import Harness
 from test_cli import make_app
@@ -22,6 +30,7 @@ from code_agent.stops import (
     STOP_CONTEXT,
     STOP_ERROR,
     STOP_LENGTH,
+    TruncationRecoveryMiddleware,
     TurnStops,
     hold_cut_call,
     is_recovery,
@@ -414,7 +423,7 @@ def test_invalid_only_call_dropped(tmp_path: Path) -> None:
 def test_mixed_calls_sanitized(tmp_path: Path) -> None:
     """유효한 호출이 남으면 메시지는 두고 잘린 호출의 인자만 "{}" 로. langchain 이 '인자가 잘렸다' 결과를 붙인다.
 
-    마지막 유효 호출(c3, 쓰다가 멈춘 것)은 실행하지 않고, 그 앞의 ls(c1)만 실행한다.
+    잘린 호출(w2)이 이미 invalid 로 왔으므로 그 앞의 완결된 호출(c1, c3)은 둘 다 실행한다.
     """
     step = stopped(calls=[{"name": "ls", "args": {"path": "/"}, "id": "c1", "type": "tool_call"},
                           {"name": "ls", "args": {"path": "/sub"}, "id": "c3", "type": "tool_call"}],
@@ -423,12 +432,11 @@ def test_mixed_calls_sanitized(tmp_path: Path) -> None:
     h.run()
     request = h.model.calls[1]
     [ai] = [m for m in request if isinstance(m, AIMessage)]
-    assert ai.id == step.id and [c["id"] for c in ai.tool_calls] == ["c1"]
+    assert ai.id == step.id and [c["id"] for c in ai.tool_calls] == ["c1", "c3"]
     assert ai.additional_kwargs["reasoning_content"] == "퀴즈 150개를…"  # 생각은 그대로
-    assert [(c["id"], c["args"]) for c in ai.invalid_tool_calls] == [("w2", "{}"), ("c3", "{}")]
+    assert [(c["id"], c["args"]) for c in ai.invalid_tool_calls] == [("w2", "{}")]
     results = {m.tool_call_id: m.text for m in request if isinstance(m, ToolMessage)}
-    assert set(results) == {"c1", "w2", "c3"}
-    assert "malformed or truncated" in results["w2"] and "malformed or truncated" in results["c3"]
+    assert set(results) == {"c1", "c3", "w2"} and "malformed or truncated" in results["w2"]
 
 
 def test_hold_cut_call() -> None:
@@ -560,3 +568,65 @@ def test_context_window_not_retried(tmp_path: Path) -> None:
     assert final.text == PLACEHOLDER_CONTEXT and "reasoning_content" not in final.additional_kwargs
     warning = "응답이 컨텍스트 창이 가득 차 중단됐다. /new 로 새로 시작하거나 요약한 뒤 이어 가라."
     assert warning in out.getvalue() and tracer.turns[0].ended["warnings"] == [warning]
+
+
+def test_hold_skips_when_cut_call_already_invalid(tmp_path: Path) -> None:
+    """잘린 호출이 고치기도 실패해 invalid 로 왔으면, 앞의 완결된 호출은 막지 않고 실행한다."""
+    read = {"name": "read_file", "args": {"file_path": "/a.txt"}, "id": "r1", "type": "tool_call"}
+    step = stopped(calls=[read], invalid=[half_written("w9")])
+    assert hold_cut_call(step) is None
+    h = Harness(tmp_path, [step, AIMessage(content="끝")])
+    (h.workspace / "a.txt").write_text("A-CONTENT", encoding="utf-8")
+    h.run()
+    results = {m.tool_call_id: m.text for m in h.model.calls[-1] if isinstance(m, ToolMessage)}
+    assert "A-CONTENT" in results["r1"] and "malformed or truncated" in results["w9"]
+
+
+def cut_response() -> AIMessage:
+    return stopped(calls=[{"name": "write_file", "args": {"file_path": "/x", "content": "1\n2"}, "id": "w",
+                           "type": "tool_call"}])
+
+
+def held_of(result) -> AIMessage:
+    message = result if isinstance(result, AIMessage) else (
+        result.model_response if isinstance(result, ExtendedModelResponse) else result).result[0]
+    return cast(AIMessage, message)
+
+
+@pytest.mark.parametrize("shape", ["response", "message", "extended"])
+def test_hold_handles_every_model_call_result_shape(shape: str) -> None:
+    """안쪽 미들웨어는 ModelResponse·AIMessage·ExtendedModelResponse 중 무엇이든 돌려줄 수 있다(SkillsMiddleware 는
+    항상 Extended). 동기·비동기 모두 같은 모양으로 돌려주고 잘린 호출은 막는다."""
+    def result():
+        response = ModelResponse(result=[cut_response()])
+        return {"response": response, "message": response.result[0],
+                "extended": ExtendedModelResponse(model_response=response)}[shape]
+
+    async def ahandler(request):
+        return result()
+
+    middleware = TruncationRecoveryMiddleware()
+    request = cast(ModelRequest, None)  # 핸들러만 부르므로 쓰지 않는다
+    for out in (middleware.wrap_model_call(request, lambda r: result()),
+                asyncio.run(middleware.awrap_model_call(request, ahandler))):
+        assert type(out) is type(result())
+        held = held_of(out)
+        assert held.tool_calls == [] and [c["id"] for c in held.invalid_tool_calls] == ["w"]
+
+
+@pytest.mark.parametrize("inner", ["extended", "message"])
+def test_hold_with_inner_middleware_in_real_agent(inner: str) -> None:
+    """실제 create_agent 에서 우리보다 안쪽 미들웨어가 Extended·AIMessage 를 돌려줘도 실패하지 않고 막는다."""
+    from langchain.agents import create_agent
+
+    class Inner(AgentMiddleware):
+        def wrap_model_call(self, request, handler):
+            response = handler(request)
+            return ExtendedModelResponse(model_response=response) if inner == "extended" else response.result[0]
+
+    model = ScriptedChatModel(steps=[cut_response(), AIMessage(content="끝")])
+    agent = create_agent(model=model, tools=[], middleware=[TruncationRecoveryMiddleware(), Inner()])
+    state = agent.invoke({"messages": [HumanMessage("써줘")]})
+    first = next(m for m in state["messages"] if isinstance(m, AIMessage))
+    assert first.tool_calls == [] and "write_file 호출 인자가 잘려 실행하지 않았다" in first.text
+    assert state["messages"][-1].text == "끝" and len(model.calls) == 2

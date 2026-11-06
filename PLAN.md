@@ -418,8 +418,15 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - **같은 id**로 교체한다. 바뀌는 것은 방금 나온 마지막 메시지뿐이다. 원본은 다음 요청에 실린 적이 없어 캐시에도 없고, 그 뒤에 서명된 thinking도 없다. 그래서 덧붙이기 원칙과 preserved thinking을 깨지 않는다.
   - 효과: 잘린 64K reasoning을 이후 모든 호출이 다시 보내지 않는다(az-quiz 턴 2에서 약 $1.15).
     - 실측: az-quiz의 잘린 응답에는 reasoning 31,160자 외에, 청크 병합으로 이어 붙은 서명(171,425자)과 format 필드("anthropic-claude-v1"이 8,024번)도 있었다.
-  - 도구 호출이 있는 응답은 그대로 둔다. 다만 잘린 호출(`invalid_tool_calls`)이 섞여 있으면 그 인자만 `"{}"`로 바꾼다(K2). 그러면 langchain이 '인자가 잘렸다' 결과를 붙인다.
+  - 유효한 호출이 남은 응답은 메시지를 두고, 잘린 호출(`invalid_tool_calls`)의 인자만 `"{}"`로 바꾼다(K2). 그러면 langchain이 '인자가 잘렸다' 결과를 붙인다.
   - 유효한 호출이 없는 잘린 호출은 정리하면서 빼고, 자리표시에 이름을 남긴다.
+- **멈춘 응답의 마지막 도구 호출은 실행하지 않는다** (`stops.hold_cut_call`, 오케스트레이터 결정 변경)
+  - 처음 결정은 "도구 호출이 있는 응답은 건드리지 않는다"였다. 아래 실측 1에서 langchain-core가 잘린 인자를 `parse_partial_json`으로 고쳐 **유효한 호출**을 만든다는 것이 드러나 바꿨다. 그대로 두면 절반만 쓴 파일이나 잘린 셸 명령(예: 잘린 `rm -rf`)이 실행된다.
+  - 출력 한도·오류·컨텍스트 창으로 멈춘 응답의 마지막 호출(쓰다가 멈춘 것)을 `invalid_tool_calls`(args `"{}"`)로 옮긴다. langchain이 '인자가 잘렸다' 결과를 붙이고 모델이 다시 쓴다. 앞의 완결된 호출은 그대로 실행한다. 남는 유효 호출이 없으면 정리·복구 경로로 간다.
+    - 컨텍스트 창도 넣었다. 출력 도중 창이 차서 끊긴 것이라 같은 위험이 있다.
+  - **`wrap_model_call`에서** 한다. 응답이 state에 들어가기 전이라, HITL `after_model`(우리 `after_model`보다 먼저 돈다)이 잘린 호출의 승인을 묻지 않는다.
+  - 마지막 메시지만 바꾸므로 preserved thinking 원칙과 같다.
+  - 화면에는 "write_file 호출은 출력이 멈춰 인자가 잘렸을 수 있어 실행하지 않았다." 노란 줄과 턴 끝 경고가 나온다.
 - **정지 사유 3분류** (`stop_reason`)
   - `STOP_LENGTH`(length, max_tokens): 정리, 1회 복구, 경고
   - `STOP_ERROR`(OpenRouter error): 정리, 1회 복구, 경고. 복구 1회를 출력 한도와 함께 쓴다.
@@ -431,13 +438,26 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - **[V] K2의 전제와 달랐다.** langchain-core가 스트림 청크를 합칠 때 `parse_partial_json`으로 잘린 인자를 고쳐 **유효한 호출**을 만든다(`AIMessageChunk.init_tool_calls`).
     - 그래서 출력 한도로 잘린 write_file이 잘린 내용 그대로 실행된다.
     - K2의 `invalid_tool_calls` 정리는 고치기가 실패하는 드문 경우의 안전망이다.
-    - 400 여부를 보려던 2·3단계는 전제가 성립하지 않아 돌리지 않았다.
-    - 잘린 유효 호출을 어떻게 다룰지는 오케스트레이터에게 결정을 요청했다(아래 후속).
-- **시험**: 전체 227개가 통과한다(+33).
+    - 400 여부를 보려던 2·3단계는 전제가 성립하지 않아 돌리지 않았다. 대신 위의 결정 변경으로 이어졌다.
+- **확인 실측** (같은 조건, max_tokens 600; 비용 $0.0237, 작업 3 실측 합계 $0.0492)
+  - 잘린 응답: `finish_reason=length`. write_file `content`가 983자("273"까지)에서 끊긴 채 유효한 호출이었다.
+  - `hold_cut_call` 뒤 `tool_calls=0`, `invalid=[write_file "{}"]`
+  - (a) 막은 호출 + '인자가 잘렸다' 결과 + "1~5만" → **200**. 모델이 완결된 write_file을 다시 냈다.
+  - (b) 정리한 자리표시 + 복구 안내 → **200**
+  - 실제 응답을 대본 모델로 에이전트에 다시 넣어 모두 승인하게 해도 numbers.txt가 생기지 않았고, 승인 요청은 0번이었다.
+- **시험**: 전체 234개가 통과한다(+40).
   - `test_context.py` 14개: 프로필 3개, 설정 9개, 요약 자리 대체, 30메시지 append-only
-  - `test_stops.py` 19개: 정지 사유 7개, 부분 텍스트 표시, Anthropic thinking 제거, 복구 뒤 재정리, 도구 호출 있는 응답 보존, 렌더 안 됨, 사용량 보존, 두 공급자 요청 본문, K2 두 가지, 오류 청크, 오류 복구 1회, 컨텍스트 창
+  - `test_stops.py` 26개
+    - 정지 사유 7개, 부분 텍스트 표시, Anthropic thinking 제거, 복구 뒤 재정리
+    - 정상 응답의 도구 호출 보존 2개, 렌더 안 됨, 사용량 보존, 두 공급자 요청 본문
+    - K2 두 가지, 오류 청크, 오류 복구 1회, 컨텍스트 창
+    - 잘린 호출 막기 6개: manual에서 승인 안 물음, auto-edit에서 파일 안 바뀜(write·edit), 병렬 중 잘린 것만 막음, 잘린 execute 실행 0회, 단위
+  - 기존 시험 1개(잘렸지만 도구 호출이 있으면 재시도하지 않는다)는 새 결정에 맞게 "유일한 잘린 호출은 막고 재시도한다"로 바꿨다.
+  - `wrap_model_call`의 막기를 빼면 막기 시험 7개가 실패하는 것을 확인했다.
 - **후속**
-  - 잘린 유효 호출 처리(결정 대기)
+  - **reasoning_details 병합 부풀림**: langchain-core가 스트림 청크를 `index`로 합칠 때 문자열 필드를 이어 붙여, `format`이 "anthropic-claude-v1"을 청크 수만큼 반복한다. 정상 응답도 4~267번, az-quiz 잘린 응답은 8,024번이었다.
+    - langchain-openrouter의 `_merge_reasoning_details`는 항목이 하나뿐이면 그대로 두므로 이 값이 매 요청에 실려 나간다. 지금까지 OpenRouter는 받아들였다.
+    - 정리 대상이 아닌 응답에도 생기므로 별도 과제다.
   - OpenRouter 경로에서 요약이 남긴 메시지의 `reasoning_details`(사양 1절)
   - Anthropic 직결 실측(키 없음)
 

@@ -11,7 +11,9 @@ from test_cli import make_app
 from test_tracing import FakeTracer
 
 from code_agent import agent as agent_module
+from code_agent.approval import APPROVE
 from code_agent.stops import (
+    HELD_ERROR,
     PLACEHOLDER_CONTEXT,
     PLACEHOLDER_LENGTH,
     RECOVERY_PROMPT,
@@ -21,6 +23,7 @@ from code_agent.stops import (
     STOP_ERROR,
     STOP_LENGTH,
     TurnStops,
+    hold_cut_call,
     is_recovery,
     is_truncated,
     stop_reason,
@@ -90,12 +93,15 @@ def test_retry_is_once_per_turn(tmp_path: Path) -> None:
     assert sum(is_recovery(m) for m in h.model.calls[-1]) == 2
 
 
-def test_truncated_response_with_tool_calls_is_not_retried(tmp_path: Path) -> None:
+def test_cut_only_tool_call_is_held_then_retried(tmp_path: Path) -> None:
+    """잘린 응답의 유일한 호출은 실행하지 않는다. 남는 유효 호출이 없으니 정리하고 다시 부른다."""
     h = Harness(tmp_path, [truncated(calls=[{"name": "ls", "args": {"path": "/"}, "id": "c1", "type": "tool_call"}]),
                            AIMessage(content="끝")])
     h.run()
-    assert len(h.model.calls) == 2
-    assert not any(is_recovery(m) for m in h.model.calls[-1])
+    request = h.model.calls[-1]
+    assert len(h.model.calls) == 2 and is_recovery(request[-1])
+    assert not any(isinstance(m, ToolMessage) for m in request)  # ls 는 실행되지 않았다
+    assert "ls 호출 인자가 잘려 실행하지 않았다" in request[-2].text
 
 
 def test_retry_counts_against_model_call_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -340,12 +346,18 @@ def test_second_truncation_stripped_without_retry(tmp_path: Path) -> None:
     assert [m.text for m in request if isinstance(m, AIMessage)] == [PLACEHOLDER_LENGTH, PLACEHOLDER_LENGTH]
 
 
-def test_truncated_with_valid_tool_calls_untouched(tmp_path: Path) -> None:
-    step = stopped(calls=[{"name": "ls", "args": {"path": "/"}, "id": "c1", "type": "tool_call"}])
-    h = Harness(tmp_path, [step, AIMessage(content="끝")])
+@pytest.mark.parametrize("finish", ["tool_calls", "stop"])
+def test_normal_finish_tool_calls_untouched(tmp_path: Path, finish: str) -> None:
+    """멈추지 않은(정상) 응답의 도구 호출은 그대로 실행하고 메시지도 바꾸지 않는다(회귀 방지)."""
+    step = AIMessage(content="", response_metadata={"finish_reason": finish},
+                     additional_kwargs={"reasoning_content": "생각"}, tool_calls=[
+                         {"name": "write_file", "args": {"file_path": "/a.txt", "content": "A"}, "id": "w",
+                          "type": "tool_call"}])
+    h = Harness(tmp_path, [step, AIMessage(content="끝")], [APPROVE])
     h.run()
+    assert (h.workspace / "a.txt").read_text(encoding="utf-8") == "A"
     [kept] = [m for m in h.model.calls[-1] if isinstance(m, AIMessage)]
-    assert kept == step  # 생각도 그대로다(도구 호출이 있는 응답은 손대지 않는다)
+    assert kept == step
 
 
 def test_stripped_message_not_rendered(tmp_path: Path) -> None:
@@ -400,18 +412,94 @@ def test_invalid_only_call_dropped(tmp_path: Path) -> None:
 
 
 def test_mixed_calls_sanitized(tmp_path: Path) -> None:
-    """유효한 호출과 섞이면 메시지는 두고 잘린 호출의 인자만 "{}" 로. langchain 이 '인자가 잘렸다' 결과를 붙인다."""
-    step = stopped(calls=[{"name": "ls", "args": {"path": "/"}, "id": "c1", "type": "tool_call"}],
+    """유효한 호출이 남으면 메시지는 두고 잘린 호출의 인자만 "{}" 로. langchain 이 '인자가 잘렸다' 결과를 붙인다.
+
+    마지막 유효 호출(c3, 쓰다가 멈춘 것)은 실행하지 않고, 그 앞의 ls(c1)만 실행한다.
+    """
+    step = stopped(calls=[{"name": "ls", "args": {"path": "/"}, "id": "c1", "type": "tool_call"},
+                          {"name": "ls", "args": {"path": "/sub"}, "id": "c3", "type": "tool_call"}],
                    invalid=[half_written("w2")])
     h = Harness(tmp_path, [step, AIMessage(content="끝")])
     h.run()
     request = h.model.calls[1]
     [ai] = [m for m in request if isinstance(m, AIMessage)]
-    assert ai.id == step.id and ai.tool_calls == step.tool_calls
+    assert ai.id == step.id and [c["id"] for c in ai.tool_calls] == ["c1"]
     assert ai.additional_kwargs["reasoning_content"] == "퀴즈 150개를…"  # 생각은 그대로
-    assert [c["args"] for c in ai.invalid_tool_calls] == ["{}"]
+    assert [(c["id"], c["args"]) for c in ai.invalid_tool_calls] == [("w2", "{}"), ("c3", "{}")]
     results = {m.tool_call_id: m.text for m in request if isinstance(m, ToolMessage)}
-    assert "malformed or truncated" in results["w2"] and "c1" in results
+    assert set(results) == {"c1", "w2", "c3"}
+    assert "malformed or truncated" in results["w2"] and "malformed or truncated" in results["c3"]
+
+
+def test_hold_cut_call() -> None:
+    calls = [{"name": "read_file", "args": {"file_path": "/a"}, "id": "r", "type": "tool_call"},
+             {"name": "write_file", "args": {"file_path": "/b", "content": "1\n2"}, "id": "w", "type": "tool_call"}]
+    held = hold_cut_call(stopped(calls=calls))
+    assert held is not None and [c["id"] for c in held.tool_calls] == ["r"]
+    assert [(c["id"], c["args"]) for c in held.invalid_tool_calls] == [("w", "{}")]
+    assert held.response_metadata["code_agent_held_call"] == "write_file"
+    normal = AIMessage(content="", tool_calls=calls, response_metadata={"finish_reason": "tool_calls"})
+    assert hold_cut_call(normal) is None and hold_cut_call(stopped()) is None
+
+
+def cut_call(name: str, args: dict, *, before: list | None = None) -> AIMessage:
+    """출력 한도로 멈췄지만 langchain 이 잘린 인자를 고쳐 유효한 호출이 된 응답(실측 모양). before 는 그 앞의 완결된 호출."""
+    return stopped(calls=[*(before or []), {"name": name, "args": args, "id": "cut", "type": "tool_call"}])
+
+
+def test_cut_write_file_is_not_asked_in_manual_mode(tmp_path: Path) -> None:
+    """잘린 write_file 은 승인을 묻지도 실행하지도 않는다. 모델이 다시 쓴 호출만 묻는다."""
+    steps = [cut_call("write_file", {"file_path": "/numbers.txt", "content": "1\n2\n3\n4"}),
+             tool_call("write_file", {"file_path": "/numbers.txt", "content": "1\n2\n3\n4\n5\n"}), AIMessage(content="끝")]
+    app, _, out, script = make_app(tmp_path, steps, "만들어", "y", "/exit")
+    app.run()
+    assert script.prompts.count("[y] 승인 / [n] 거부 › ") == 1
+    assert (app.workspace / "numbers.txt").read_text(encoding="utf-8") == "1\n2\n3\n4\n5\n"
+    assert out.getvalue().count("승인 요청: write_file") == 1
+    assert f"write_file 호출은 {HELD_ERROR}." in out.getvalue()
+
+
+@pytest.mark.parametrize(("name", "args"), [
+    ("write_file", {"file_path": "/new.txt", "content": "절반"}),
+    ("edit_file", {"file_path": "/app.py", "old_string": "x = 1", "new_string": "x = 2 if"}),
+])
+def test_cut_file_call_changes_nothing_in_auto_edit(tmp_path: Path, name: str, args: dict) -> None:
+    app, _, _, _ = make_app(tmp_path, [cut_call(name, args), AIMessage(content="끝")], "고쳐", "/exit",
+                            mode="auto-edit")
+    (app.workspace / "app.py").write_text("x = 1\n", encoding="utf-8")
+    app.run()
+    assert not (app.workspace / "new.txt").exists()
+    assert (app.workspace / "app.py").read_text(encoding="utf-8") == "x = 1\n"
+
+
+def test_parallel_complete_call_runs_and_cut_call_is_blocked(tmp_path: Path) -> None:
+    read = {"name": "read_file", "args": {"file_path": "/a.txt"}, "id": "r1", "type": "tool_call"}
+    h = Harness(tmp_path, [cut_call("write_file", {"file_path": "/b.txt", "content": "절"}, before=[read]),
+                           AIMessage(content="끝")])
+    (h.workspace / "a.txt").write_text("A-CONTENT", encoding="utf-8")
+    h.run()
+    results = {m.tool_call_id: m.text for m in h.model.calls[-1] if isinstance(m, ToolMessage)}
+    assert "A-CONTENT" in results["r1"]
+    assert "malformed or truncated" in results["cut"]
+    assert not (h.workspace / "b.txt").exists()
+    assert h.requests == []  # write_file 의 승인도 묻지 않았다
+
+
+def test_cut_execute_never_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from code_agent.backend import WindowsShellBackend
+
+    ran: list[str] = []
+    real = WindowsShellBackend.execute
+
+    def counting(self, command: str, *args, **kwargs):
+        ran.append(command)
+        return real(self, command, *args, **kwargs)
+
+    monkeypatch.setattr(WindowsShellBackend, "execute", counting)
+    app, _, _, _ = make_app(tmp_path, [cut_call("execute", {"command": "rm -rf build && echo x > made.txt"}),
+                                       AIMessage(content="끝")], "정리해", "/exit", mode="yolo")
+    app.run()
+    assert ran == [] and not (app.workspace / "made.txt").exists()
 
 
 def test_openrouter_error_chunk_finishes_silently() -> None:

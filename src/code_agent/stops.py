@@ -8,7 +8,8 @@
     서명된 thinking 도 없다. 그래서 Opus 5.5 의 보존된 thinking(서명이 앞쪽 기록 전체에 묶인다)을 깨지 않는다.
     그대로 두면 잘린 64K reasoning 을 이후 모든 호출이 다시 보낸다(az-quiz 기준 약 $1.15).
   - 정리할 때 서명 없는 thinking 블록(K1)과, OpenRouter 가 그대로 다시 보내는 반쯤 쓴 도구 인자 JSON(K2)도 빠진다.
-  - 도구 호출이 있는 응답은 그대로 둔다. 잘린 호출이 섞여 있으면 그 인자만 "{}" 로 바꾼다.
+  - 멈춘 응답의 마지막 도구 호출은 실행하지 않는다. langchain 이 잘린 인자를 고쳐 유효한 호출로 만들기 때문이다(실측).
+    다른 유효한 호출은 그대로 실행하고, 잘린 호출(invalid_tool_calls)의 인자만 "{}" 로 바꾼다.
 - 예산 미들웨어(exit_behavior="end")의 종료 메시지는 model 이 아닌 미들웨어 노드에서 나온다.
 - TurnStops 는 스트림 조각에서 멈춘 응답·복구·예산 상한 도달을 모아 턴 끝의 경고 문구를 만든다. CLI 는 노란 줄로,
   트레이스는 turn 의 WARNING 수준과 작업 기록의 경고 절로 남긴다.
@@ -17,12 +18,16 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from langchain.agents.middleware import (
     AgentMiddleware,
     AgentState,
     ModelCallLimitMiddleware,
+    ModelRequest,
+    ModelResponse,
     ToolCallLimitMiddleware,
     hook_config,
 )
@@ -131,6 +136,26 @@ def strip_stopped(message: BaseMessage) -> AIMessage | None:
                                       "invalid_tool_calls": [], "response_metadata": meta})
 
 
+HELD_ERROR = "출력이 멈춰 인자가 잘렸을 수 있어 실행하지 않았다"
+
+
+def hold_cut_call(message: BaseMessage) -> AIMessage | None:
+    """멈춘 응답의 마지막 도구 호출(쓰다가 멈춘 것)을 실행하지 않게 invalid_tool_calls(args "{}")로 옮긴 같은 id 의 메시지.
+
+    langchain-core 는 스트림 청크를 합칠 때 parse_partial_json 으로 잘린 인자를 고쳐 유효한 호출로 만든다
+    (AIMessageChunk.init_tool_calls, 실측: write_file content 가 중간에서 끊긴 채 유효한 호출이 됐다). 그대로 두면
+    절반만 쓴 파일이나 잘린 셸 명령이 실행된다. 옮긴 호출에는 langchain 이 '인자가 잘렸다' 결과를 붙여 다시 쓰게 한다.
+    대상이 아니면 None.
+    """
+    if stop_reason(message) is None or not isinstance(message, AIMessage) or not message.tool_calls:
+        return None
+    *kept, cut = message.tool_calls
+    held = {"type": "invalid_tool_call", "name": cut["name"], "args": "{}", "id": cut["id"], "error": HELD_ERROR}
+    meta = {**message.response_metadata, "code_agent_held_call": cut["name"]}
+    return message.model_copy(update={"tool_calls": kept, "invalid_tool_calls": [*message.invalid_tool_calls, held],
+                                      "response_metadata": meta})
+
+
 def sanitize_invalid_calls(message: AIMessage) -> AIMessage | None:
     """유효한 호출과 잘린 호출이 섞인 멈춘 응답에서 잘린 호출의 인자만 "{}" 로 바꾼 같은 id 의 메시지(K2). 없으면 None.
 
@@ -145,13 +170,20 @@ def sanitize_invalid_calls(message: AIMessage) -> AIMessage | None:
 class TruncationRecoveryMiddleware(AgentMiddleware):
     """멈춘 응답을 정리하고, 도구 호출이 없으면 턴을 끝내지 않고 안내를 덧붙여 모델을 한 번 더 부른다(턴당 1번).
 
+    - wrap_model_call: 멈춘 응답의 마지막 도구 호출은 실행하지 않는다(hold_cut_call). 응답이 state 에 들어가기 전에
+      바꿔야 HITL after_model 보다 앞서 잘린 호출의 승인을 묻지 않는다.
     - 출력 한도·공급자 오류: 정리하고 다시 부른다. 두 사유가 복구 1회를 함께 쓴다. 이미 복구했으면 정리만 한다.
     - 컨텍스트 창: 다시 불러도 같으므로 정리만 한다.
-    - 도구 호출이 있는 응답은 잘린 호출의 인자만 고친다.
+    - 유효한 도구 호출이 남은 응답은 잘린 호출의 인자만 고친다.
 
     after_model 은 미들웨어 목록의 역순으로 돈다. 목록 맨 앞에 두어 모델 호출 상한이 이번 호출을 센 뒤에 돌게 한다.
     jump_to "model" 은 루프 입구(before_model)로 가므로 다시 부를 때도 상한 검사를 거친다.
     """
+
+    def wrap_model_call(self, request: ModelRequest,
+                        handler: Callable[[ModelRequest], ModelResponse]) -> ModelResponse:
+        response = handler(request)
+        return replace(response, result=[hold_cut_call(m) or m for m in response.result])
 
     @hook_config(can_jump_to=["model"])
     def after_model(self, state: AgentState, runtime: Runtime) -> dict[str, Any] | None:
@@ -212,6 +244,7 @@ class TurnStops:
         self.last: AIMessage | None = None  # 마지막 모델 응답
         self.last_is_retry = False  # last 가 자동 복구 뒤에 나온 응답인지
         self.budget = ""  # 예산 미들웨어의 종료 메시지
+        self.held: list[str] = []  # 실행하지 않은 잘린 도구 호출 이름
 
     def on_part(self, part: tuple[tuple[str, ...], str, Any]) -> None:
         ns, mode, data = part
@@ -224,6 +257,8 @@ class TurnStops:
                     self.last, self.last_is_retry = message, self.recoveries > 0
                     if stop_reason(message) is not None:
                         self.stopped.append(message)
+                    if held := message.response_metadata.get("code_agent_held_call"):
+                        self.held.append(held)
                 elif recovery_notice(node, message):
                     self.recoveries += 1
                 elif budget_stop(node, message):
@@ -251,6 +286,8 @@ class TurnStops:
             retried = " 자동으로 한 번 다시 요청해 이어 갔다." if self.recoveries else ""
             for why, count in Counter(_why(stop_reason(m) or "", m) for m in self.stopped).items():
                 warnings.append(f"응답 {count}개가 {why}{retried}")
+        if self.held:
+            warnings.append(f"{', '.join(self.held)} 호출은 {HELD_ERROR}.")
         if self.budget:
             warnings.append(f"예산 상한에 걸려 턴을 멈췄다({self.budget.rstrip('.')}). '계속해줘'로 이어 갈 수 있다.")
         return warnings

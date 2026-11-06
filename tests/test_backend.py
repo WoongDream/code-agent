@@ -102,7 +102,7 @@ def test_shell_env_drops_secrets() -> None:
     secrets = {"ANTHROPIC_API_KEY", "GITHUB_TOKEN", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "OPENROUTER_API_KEY",
                "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "gpg_key"}
     env = shell_env({"PATH": "p", "SYSTEMROOT": "s", "LANGFUSE_BASE_URL": "u", **dict.fromkeys(secrets, "x")},
-                    find_python=lambda env: None)
+                    find_python=lambda env, workspace: None)
     assert {"PATH", "SYSTEMROOT", "LANGFUSE_BASE_URL"} <= env.keys()
     assert not secrets & env.keys()
 
@@ -112,7 +112,7 @@ def test_shell_env_drops_tool_venv(tmp_path: Path) -> None:
     scripts, other = tmp_path / ".venv" / "Scripts", tmp_path / "bin"
     base = {"PATH": os.pathsep.join([str(scripts), str(other)]), "VIRTUAL_ENV": str(tmp_path / ".venv"),
             "UV": "uv.exe", "UV_RUN_RECURSION_DEPTH": "1", "PYTHONHOME": "x", "SYSTEMROOT": "s"}
-    env = shell_env(base, tool_scripts=str(scripts), find_python=lambda env: None)
+    env = shell_env(base, tool_scripts=str(scripts), find_python=lambda env, workspace: None)
     assert not {"VIRTUAL_ENV", "UV", "UV_RUN_RECURSION_DEPTH", "PYTHONHOME"} & env.keys()
     assert env["PATH"].split(os.pathsep) == [str(other)] and env["SYSTEMROOT"] == "s"
 
@@ -126,7 +126,7 @@ def test_shell_env_prepends_uv_python_when_stub(tmp_path: Path) -> None:
     uv_python.write_bytes(b"x")
     asked: list[dict] = []
     env = shell_env({"PATH": str(stubs)}, tool_scripts=str(tmp_path / "none"),
-                    find_python=lambda env: asked.append(dict(env)) or str(uv_python))
+                    find_python=lambda env, workspace: asked.append(dict(env)) or str(uv_python))
     assert env["PATH"].split(os.pathsep) == [str(uv_python.parent), str(stubs)]
     assert "VIRTUAL_ENV" not in asked[0]  # 정리한 env 로 묻는다
 
@@ -135,6 +135,57 @@ def test_shell_env_without_uv(tmp_path: Path) -> None:
     """uv 가 없으면(uv python find 실패) PATH 를 더하지 않고 예외도 없다. 프롬프트에는 python 이 없음으로 나온다."""
     env = shell_env({"PATH": str(tmp_path)}, tool_scripts=str(tmp_path / "none"))
     assert env["PATH"] == str(tmp_path)
+
+
+def test_shell_env_keeps_activated_project_venv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """대상 프로젝트의 venv 를 켜고 그 폴더에서 띄우면 셸의 python 은 그 venv 다(PR #8 리뷰 1).
+
+    고치기 전에는 '현재 폴더 안'이라 버려서 uv 인터프리터를 PATH 맨 앞에 붙여 프로젝트 venv 를 가렸다.
+    """
+    project = tmp_path / "proj"
+    venv_scripts = project / ".venv" / "Scripts"
+    venv_scripts.mkdir(parents=True)
+    (venv_scripts / "python.exe").write_bytes(b"x")
+    monkeypatch.chdir(project)
+    asked: list[Path | None] = []
+    env = shell_env({"PATH": os.pathsep.join([str(venv_scripts), str(tmp_path / "bin")])}, workspace=project,
+                    tool_scripts=str(tmp_path / "none"),
+                    find_python=lambda env, workspace: asked.append(workspace) or str(tmp_path / "uv" / "python.exe"))
+    assert env["PATH"].split(os.pathsep) == [str(venv_scripts), str(tmp_path / "bin")]
+    assert asked == []
+
+
+def test_shell_env_drops_relative_path_entries(tmp_path: Path) -> None:
+    """상대 경로 항목은 셸의 현재 폴더(작업 폴더) 기준으로 풀린다. 저장소에 심은 실행 파일이 자동 승인 명령으로 불리지 않게 뺀다."""
+    absolute, quoted = str(tmp_path / "a"), f'"{tmp_path / "b c"}"'  # Windows PATH 는 따옴표로 감싼 항목도 받는다
+    base = {"PATH": os.pathsep.join([".", "bin", "", absolute, "node_modules/.bin", quoted, ".."])}
+    env = shell_env(base, tool_scripts=str(tmp_path / "none"), find_python=lambda env, workspace: None)
+    assert env["PATH"].split(os.pathsep) == [absolute, quoted]
+
+
+def test_shell_env_passes_workspace_to_find_python(tmp_path: Path) -> None:
+    asked: list[Path | None] = []
+    shell_env({"PATH": str(tmp_path)}, workspace=tmp_path / "ws", tool_scripts=str(tmp_path / "none"),
+              find_python=lambda env, workspace: asked.append(workspace))
+    assert asked == [tmp_path / "ws"]
+
+
+def test_shell_backend_and_detection_share_workspace_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """셸 백엔드와 환경 탐지(cli.detect_environment)는 같은 작업 폴더 기준 환경을 쓰고, 작업 폴더마다 한 번만 만든다."""
+    from code_agent import backend
+
+    made: list[Path | None] = []
+
+    def fake_shell_env(**kwargs) -> dict[str, str]:
+        made.append(kwargs["workspace"])
+        return {"PATH": f"env{len(made)}"}
+
+    monkeypatch.setattr(backend, "shell_env", fake_shell_env)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    shell = WindowsShellBackend(workspace, shell=SHELLS[-1])
+    assert backend.process_shell_env(tmp_path / "ws" / ".." / "ws") == shell._env == {"PATH": "env1"}
+    assert made == [workspace.resolve()]
 
 
 def test_powershell_hides_progress() -> None:

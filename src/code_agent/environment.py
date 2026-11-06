@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shutil
@@ -25,6 +26,7 @@ from pathlib import Path, PureWindowsPath
 # 표시 순서이기도 하다. 결과 텍스트가 결정적이어야 한다
 TOOLS = ("python", "uv", "git", "node", "npm", "deno", "py", "pwsh", "powershell")
 VERSION_TIMEOUT_S = 3
+IN_WORKSPACE = "작업 폴더 안이라 버전을 확인하지 않았다"  # 셸은 쓰지만 시작할 때 실행하지 않은 도구의 덧붙임
 _VERSION = re.compile(r"\d+(?:\.\d+)+")
 _PS_REGISTRY = (r"SOFTWARE\Microsoft\PowerShell\3\PowerShellEngine", "PowerShellVersion")
 _APP_PATHS = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
@@ -85,11 +87,20 @@ def trusted_tool(path: str | None, workspace: Path | None = None) -> str | None:
     return path
 
 
-def uv_python_find(env: Mapping[str, str]) -> str | None:
-    """uv 가 관리하는 인터프리터 경로. venv 를 고르지 않게 VIRTUAL_ENV 없는 env 와 임시 폴더에서 묻는다. 실패하면 None."""
-    uv = trusted_tool(shutil.which("uv", path=env.get("PATH", "")))
+def uv_python_find(env: Mapping[str, str], workspace: Path | None = None) -> str | None:
+    """uv 가 관리하는 인터프리터 경로. venv 를 고르지 않게 VIRTUAL_ENV 없는 env 와 임시 폴더에서 묻는다. 실패하면 None.
+
+    uv 를 실행하므로 현재 폴더·작업 폴더 안의 uv 는 쓰지 않는다(trusted_tool). -w 로 다른 폴더에서 띄워도 같다.
+    """
+    uv = trusted_tool(shutil.which("uv", path=env.get("PATH", "")), workspace)
     if uv is None:
         return None
+    return _uv_python_find(uv, frozenset(env.items()))
+
+
+@functools.cache
+def _uv_python_find(uv: str, env: frozenset[tuple[str, str]]) -> str | None:
+    """작업 폴더마다 셸 환경을 만들어도(backend.process_shell_env) uv 는 같은 uv·env 에 한 번만 묻는다."""
     try:
         result = subprocess.run([uv, "python", "find"], cwd=tempfile.gettempdir(), env=dict(env), capture_output=True,
                                 text=True, encoding="utf-8", errors="replace", timeout=5, check=False)
@@ -114,9 +125,11 @@ def _read_registry(hive: str, key: str, value: str) -> str | None:
 
 
 def _version(path: str, env: Mapping[str, str], run: Run) -> str | None:
+    """임시 폴더에서 돌린다. 현재 폴더(작업 폴더일 수 있다)에서 돌리면 npm.cmd 가 부르는 node 처럼 그 폴더의 실행 파일이나
+    .npmrc 같은 설정을 집을 수 있다."""
     try:
-        result = run([path, "--version"], env=dict(env), capture_output=True, text=True, encoding="utf-8",
-                     errors="replace", timeout=VERSION_TIMEOUT_S, check=False)
+        result = run([path, "--version"], cwd=tempfile.gettempdir(), env=dict(env), capture_output=True, text=True,
+                     encoding="utf-8", errors="replace", timeout=VERSION_TIMEOUT_S, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
     first = (result.stdout.strip() or result.stderr.strip()).splitlines()
@@ -142,22 +155,27 @@ def probe(env: Mapping[str, str], *, workspace: Path | None = None, which: Which
           run: Run = subprocess.run, read_registry: ReadRegistry = _read_registry) -> EnvInfo:
     """셸에 넘기는 env 로 도구를 찾고 버전을 병렬로 확인한다. 하나당 VERSION_TIMEOUT_S 초.
 
-    현재 폴더·작업 폴더 안에서 찾은 실행 파일은 버린다(trusted_tool). --version 으로 실행하게 되기 때문이다.
+    상대 경로 결과(Windows which 가 현재 폴더를 먼저 본 것)는 셸이 찾지 않으므로 없는 것으로 본다. 현재 폴더·작업 폴더
+    안의 절대 경로(켜 둔 대상 프로젝트 venv 등)는 셸이 쓰므로 있음으로 적되 --version 으로 실행하지 않는다(trusted_tool).
     """
     paths: dict[str, str | None] = {}
     notes: dict[str, str] = {}
     for name in TOOLS:
-        path = trusted_tool(which(name, path=env.get("PATH", "")), workspace)
+        found = which(name, path=env.get("PATH", ""))
+        path = found if found and Path(found).is_absolute() else None
         if path and is_store_stub(path):
             path, notes[name] = None, "스토어 스텁"
         paths[name] = path
     if paths["python"] and f"{os.sep}uv{os.sep}python{os.sep}" in os.path.normcase(paths["python"]):
         notes["python"] = "패키지 없는 uv 관리 인터프리터"
+    for name, path in paths.items():
+        if path and trusted_tool(path, workspace) is None:
+            notes[name] = IN_WORKSPACE
     versions: dict[str, str | None] = {}
-    if paths["powershell"]:
+    if paths["powershell"] and notes.get("powershell") != IN_WORKSPACE:
         raw = read_registry("HKLM", *_PS_REGISTRY)
         versions["powershell"] = ".".join(raw.split(".")[:2]) if raw else None
-    targets = [n for n in TOOLS if paths[n] and n not in versions]
+    targets = [n for n in TOOLS if paths[n] and n not in versions and notes.get(n) != IN_WORKSPACE]
     with ThreadPoolExecutor(4) as pool:
         for name, version in zip(targets, pool.map(lambda n: _version(str(paths[n]), env, run), targets), strict=True):
             versions[name] = version
@@ -181,8 +199,11 @@ def render(info: EnvInfo, shell: str) -> str:
             missing.append(f"{tool.name}({tool.note})" if tool.note else tool.name)
             continue
         label = "Windows PowerShell" if tool.name == "powershell" else tool.name
-        version = tool.version or "(버전 확인 실패)"
-        present.append(f"{label} {version}" + (f"({tool.note})" if tool.note else ""))
+        if tool.version:
+            label = f"{label} {tool.version}"
+        elif tool.note != IN_WORKSPACE:
+            label = f"{label} (버전 확인 실패)"
+        present.append(label + (f"({tool.note})" if tool.note else ""))
     if info.browsers:
         listed = ", ".join(f"{label} {shell_path(path, shell)}" for label, path in info.browsers)
         how = ". PowerShell 에서는 & \"경로\" 로 실행한다" if shell == "powershell" else ""

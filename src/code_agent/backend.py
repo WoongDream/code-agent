@@ -42,38 +42,49 @@ def _tool_venv_scripts() -> str | None:
     return str(Path(sys.prefix, "Scripts" if sys.platform == "win32" else "bin"))
 
 
-def shell_env(base: Mapping[str, str] | None = None, *, tool_scripts: str | None = None,
-              find_python: Callable[[Mapping[str, str]], str | None] = uv_python_find) -> dict[str, str]:
-    """셸에 넘길 환경. 부모 환경에서 비밀값과 code-agent 의 도구 venv 를 뺀다.
+def _path_entry(entry: str) -> str:
+    """PATH 항목을 비교할 형태로. Windows 는 따옴표로 감싼 항목도 받는다."""
+    return os.path.normcase(os.path.normpath(entry.strip('"')))
+
+
+def shell_env(base: Mapping[str, str] | None = None, *, workspace: Path | None = None, tool_scripts: str | None = None,
+              find_python: Callable[[Mapping[str, str], Path | None], str | None] = uv_python_find) -> dict[str, str]:
+    """셸에 넘길 환경. 부모 환경에서 비밀값과 code-agent 의 도구 venv 를 빼고, PATH 의 상대 경로 항목을 뺀다.
 
     빈 env 를 주면 PATH·SYSTEMROOT 가 없어 셸이 제대로 뜨지 않으므로 나머지는 물려준다. 도구 venv 를 빼서 python 이
     없거나 스토어 스텁만 남으면, uv 가 관리하는 인터프리터(PEP 668 표식이 있어 pip install 이 막힌다)를 PATH 앞에 둔다.
     tool_scripts 는 PATH 에서 뺄 도구 venv 의 실행 파일 폴더다(기본: 지금 venv 에서 돌면 그 폴더).
+
+    상대 경로 항목(., bin, 빈 항목 등)은 셸의 현재 폴더인 작업 폴더 기준으로 풀려, 자동 승인되는 git status·ls 가 저장소에
+    심은 실행 파일이 될 수 있다. 절대 경로 항목은 작업 폴더 안이라도 둔다. 켜 둔 대상 프로젝트 venv 가 그런 것이다.
+    python 은 여기서 실행하지 않으므로 그 venv 의 python 도 있는 것으로 본다. workspace 는 find_python 에 넘긴다.
     """
     env = {k: v for k, v in (os.environ if base is None else base).items()
            if not SECRET_ENV.search(k) and k not in TOOL_VENV_ENV}
     scripts = tool_scripts if tool_scripts is not None else _tool_venv_scripts()
-    if scripts:
-        drop = os.path.normcase(os.path.normpath(scripts))
-        entries = env.get("PATH", "").split(os.pathsep)
-        env["PATH"] = os.pathsep.join(e for e in entries if not e or os.path.normcase(os.path.normpath(e)) != drop)
-    python = trusted_tool(shutil.which("python", path=env.get("PATH", "")))
+    drop = _path_entry(scripts) if scripts else None
+    entries = env.get("PATH", "").split(os.pathsep)
+    env["PATH"] = os.pathsep.join(e for e in entries
+                                  if e and Path(e.strip('"')).is_absolute() and _path_entry(e) != drop)
+    python = shutil.which("python", path=env["PATH"])
+    if python is not None and not Path(python).is_absolute():
+        python = None  # Windows which 가 현재 폴더를 먼저 본 결과다. 셸은 현재 폴더를 찾지 않는다
     if python is None or is_store_stub(python):
-        found = find_python(env)
+        found = find_python(env, workspace)
         if found:
-            env["PATH"] = os.pathsep.join([str(Path(found).parent), env.get("PATH", "")])
+            env["PATH"] = os.pathsep.join([str(Path(found).parent), env["PATH"]])
     env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8", CHERE_INVOKING="1")
     return env
 
 
 @functools.cache
-def _process_shell_env() -> dict[str, str]:
-    return shell_env()
+def _process_shell_env(workspace: Path | None) -> dict[str, str]:
+    return shell_env(workspace=workspace)
 
 
-def process_shell_env() -> dict[str, str]:
-    """이 프로세스의 셸 환경. uv python find 를 부르므로 한 번만 계산한다. 셸 백엔드와 환경 탐지가 같은 것을 쓴다."""
-    return dict(_process_shell_env())
+def process_shell_env(workspace: Path | None = None) -> dict[str, str]:
+    """이 프로세스의 셸 환경. 작업 폴더마다 한 번만 계산한다. 셸 백엔드와 환경 탐지가 같은 것을 쓴다."""
+    return dict(_process_shell_env(Path(workspace).resolve() if workspace is not None else None))
 
 
 def system32(name: str) -> str:
@@ -117,7 +128,7 @@ class WindowsShellBackend(LocalShellBackend):
     def __init__(self, root_dir: str | Path, *, shell: str = "", timeout: int = 120,
                  env: Mapping[str, str] | None = None) -> None:
         super().__init__(root_dir=root_dir, virtual_mode=True, timeout=timeout,
-                         env=process_shell_env() if env is None else dict(env), inherit_env=False)
+                         env=process_shell_env(Path(root_dir)) if env is None else dict(env), inherit_env=False)
         self.shell, self._argv = resolve_shell(shell, Path(root_dir))
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:

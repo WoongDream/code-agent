@@ -65,7 +65,7 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
     _disable_general_purpose_subagent(model)
     if backend is None:
         backend = make_backend(workspace, artifacts_dir=settings.data_dir / "artifacts", shell=settings.shell)
-    middleware: list[Middleware] = [TodoListMiddleware(), DotenvGuardMiddleware(), OpenRouterCacheMiddleware(),
+    middleware: list[Middleware] = [TodoListMiddleware(), DotenvGuardMiddleware(workspace), OpenRouterCacheMiddleware(),
                                     *budget_middleware()]
     shell = cast(WindowsShellBackend, backend.default).shell  # default 는 make_backend 의 셸 백엔드다
     return create_deep_agent(

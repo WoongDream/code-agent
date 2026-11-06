@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from rich.syntax import Syntax
 
 from code_agent.agent import build_agent, run_turn
 from code_agent.approval import APPROVE, MODES, decide_all, reject
+from code_agent.backend import safe_which
 from code_agent.render import Renderer, describe_action, todos_markup
 from code_agent.settings import Settings, load_settings
 from code_agent.tracing import Tracer, langfuse_installed, make_tracer
@@ -210,7 +212,11 @@ class App:
                 return reject(self.read_line("거부 이유(선택, Enter 로 건너뜀) › ").strip())
 
     def show_diff(self) -> None:
-        result = subprocess.run(["git", "diff"], cwd=self.workspace, capture_output=True, check=False)
+        git = safe_which("git", self.workspace)  # 이름만 주면 현재 폴더에 심은 git.exe 가 먼저 불릴 수 있다
+        if git is None:
+            self.console.print("[red]git 을 찾지 못했다.[/]")
+            return
+        result = subprocess.run([git, "diff"], cwd=self.workspace, capture_output=True, check=False)
         text = result.stdout.decode("utf-8", errors="replace")
         if result.returncode != 0:  # 저장소 밖이면 긴 usage 가 나오므로 첫 줄만 보인다
             first = result.stderr.decode("utf-8", errors="replace").strip().splitlines()[:1]
@@ -252,6 +258,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if sys.platform == "win32":
+        # 이것이 없으면 shutil.which 가 현재 폴더를 먼저 찾아, 악성 저장소 폴더에서 띄우기만 해도 그 안의 git.cmd 등이
+        # 불릴 수 있다. Python 3.12+ 의 which 는 이 변수를 따른다. 셸 백엔드도 이 환경을 물려받는다
+        os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
     _utf8_stdio()
     args = parse_args(argv)
     console = Console(highlight=False)

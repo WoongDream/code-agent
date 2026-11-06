@@ -5,6 +5,7 @@
 - 승인 결정은 이 모듈이 event 로 남긴다(도구, 호출 요약, approve/reject, 사람이 정했는지, 거부 사유).
 - 턴이 끝나면 루트 출력에 작업 기록(최종 답변, 도구 실행과 결과 요약, 승인, 바뀐 파일, diff)을 남긴다(worklog.py).
   LLM-as-a-Judge 평가기는 turn 하나만 읽으므로 판단 근거가 여기 있어야 한다.
+- 출력 한도로 잘린 응답이나 예산 상한 도달(stops.py)은 turn 을 WARNING 수준으로 표시하고 작업 기록에 경고 절을 둔다.
 - UsageCallback 합계(OpenRouter 실제 비용 포함)는 루트 metadata 에 남긴다. 핸들러는 토큰만 넘기고
   비용은 Langfuse 가 모델 정의로 계산하므로, OpenRouter 모델 이름에는 가격 정의를 등록해야 한다.
 
@@ -14,7 +15,7 @@ LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY 가 둘 다 있고 langfuse extra 가 �
 from __future__ import annotations
 
 import importlib.util
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
@@ -36,7 +37,7 @@ class TurnTrace(Protocol):
 
     def decision(self, action: dict, decision: dict, auto: bool) -> None: ...
 
-    def end(self, *, output: str, usage: Usage, error: str | None = None) -> None: ...
+    def end(self, *, output: str, usage: Usage, error: str | None = None, warnings: Sequence[str] = ()) -> None: ...
 
 
 class Tracer(Protocol):
@@ -108,8 +109,11 @@ class LangfuseTurn:
             level="DEFAULT" if approved else "WARNING",
         )
 
-    def end(self, *, output: str, usage: Usage, error: str | None = None) -> None:
-        """output 은 최종 답변이다. 루트 출력에는 판단 근거가 되는 작업 기록 전체를 남긴다."""
+    def end(self, *, output: str, usage: Usage, error: str | None = None, warnings: Sequence[str] = ()) -> None:
+        """output 은 최종 답변이다. 루트 출력에는 판단 근거가 되는 작업 기록 전체를 남긴다.
+
+        warnings(잘린 응답, 예산 상한 도달)가 있으면 오류가 없을 때 WARNING 수준과 status_message 로 표시한다.
+        """
         changes: list[str] | None
         if self.workspace is None:
             changes, diff = [], ""
@@ -118,8 +122,10 @@ class LangfuseTurn:
         else:
             changes, diff = diff_snapshots(self.before, after)
         fields: dict[str, Any] = {"output": self.worklog.render(answer=output, changes=changes, diff=diff,
-                                                             context=self.context),
+                                                             context=self.context, warnings=warnings),
                                   "metadata": {"usage": asdict(usage)}}
         if error:
             fields.update(level="ERROR", status_message=error)
+        elif warnings:
+            fields.update(level="WARNING", status_message="\n".join(warnings))
         self.root.update(**fields)

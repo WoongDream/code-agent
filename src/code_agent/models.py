@@ -7,7 +7,7 @@ from langchain_core.language_models import BaseChatModel
 from code_agent.settings import Settings
 
 _API_URL = "https://api.anthropic.com"  # 셸의 ANTHROPIC_BASE_URL 로 키가 다른 곳에 가지 않게 고정한다
-_MAX_TOKENS = 64000  # 항상 스트리밍하므로 HTTP 제한 시간에 걸리지 않는다
+MAX_TOKENS = 64000  # 응답 하나의 출력 한도(thinking 포함). 항상 스트리밍하므로 HTTP 제한 시간에 걸리지 않는다
 _TIMEOUT_S = 600.0
 _OPENROUTER_EFFORT = {"max": "xhigh"}
 
@@ -34,7 +34,7 @@ def _anthropic(settings: Settings, name: str) -> BaseChatModel:
         raise RuntimeError("ANTHROPIC_API_KEY 가 미설정입니다. .env.example 을 .env 로 복사해 직접 채우세요.")
     return ChatAnthropic(
         model=name, api_key=settings.anthropic_api_key, base_url=_API_URL,
-        reasoning_effort=settings.effort, max_tokens=_MAX_TOKENS, streaming=True,
+        reasoning_effort=settings.effort, max_tokens=MAX_TOKENS, streaming=True,
         timeout=_TIMEOUT_S, max_retries=2,
     )
 
@@ -53,5 +53,5 @@ def _openrouter(settings: Settings, name: str) -> BaseChatModel:
     return ChatOpenRouter(
         model=name, api_key=settings.openrouter_api_key, reasoning={"effort": _OPENROUTER_EFFORT.get(settings.effort,
                                                                                                   settings.effort)},
-        max_tokens=_MAX_TOKENS, streaming=True, max_retries=2, timeout=round(_TIMEOUT_S * 1000),
+        max_tokens=MAX_TOKENS, streaming=True, max_retries=2, timeout=round(_TIMEOUT_S * 1000),
     )

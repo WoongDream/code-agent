@@ -1,6 +1,8 @@
 """스트림 조각을 터미널에 그린다. AI 텍스트는 토큰 단위로, 도구 호출은 이름과 핵심 인자만, 도구 결과는 앞 몇 줄만 보인다.
 
-messages 모드에서는 model 노드의 AI 메시지만, updates 모드에서는 도구 호출·결과·todo 만 쓴다(중복 출력 방지).
+messages 모드에서는 model 노드의 AI 메시지만, updates 모드에서는 도구 호출·결과·todo 와 예산 미들웨어의 종료 메시지,
+잘림 자동 복구 안내만 쓴다(중복 출력 방지). HITL 이 승인 뒤 다시 내보내는 응답과 PatchToolCalls 가 다시 내보내는
+기록 전체는 그리지 않는다.
 """
 
 from __future__ import annotations
@@ -9,11 +11,20 @@ import difflib
 import json
 from typing import Any
 
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    RemoveMessage,
+    ToolMessage,
+)
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from rich.console import Console, Group, RenderableType
 from rich.markup import escape
 from rich.syntax import Syntax
 from rich.text import Text
+
+from code_agent.stops import budget_stop, recovery_notice
 
 RESULT_LINES = 6
 _TODO_MARK = {"completed": "[green]✔[/]", "in_progress": "[yellow]▶[/]", "pending": "[dim]○[/]"}
@@ -56,12 +67,21 @@ class Renderer:
 
     def _update(self, node: str, update: dict, prefix: str) -> None:
         messages = update.get("messages")
-        for message in messages if isinstance(messages, list) else []:
+        if not isinstance(messages, list) or rewrites_history(messages):
+            messages = []  # 기록 전체를 다시 내보낸 것이라 새로 그릴 것이 없다
+        for message in messages:
             if node == "model" and isinstance(message, AIMessage):
                 if not prefix and message.text:
                     self.last_text = message.text
                 for call in message.tool_calls:
                     self._line(f"{prefix}[cyan]●[/] {escape(describe_call(call))}")
+            elif recovery_notice(node, message):
+                self._line(f"{prefix}[yellow]응답이 출력 한도에 걸려 잘렸다. 안내를 덧붙여 한 번 다시 요청한다.[/]")
+            elif budget_stop(node, message):
+                # 예산 미들웨어의 종료 메시지는 model 이 아닌 노드에서 나온다
+                self._line(f"{prefix}[yellow]{escape(message.text)}[/]")
+                if not prefix:
+                    self.last_text = message.text
             elif isinstance(message, ToolMessage):
                 self._tool_result(message, prefix)
         if isinstance(update.get("todos"), list):
@@ -89,6 +109,12 @@ class Renderer:
         if self._mid_line:
             self.console.print()
             self._mid_line = False
+
+
+def rewrites_history(messages: list) -> bool:
+    """[RemoveMessage(REMOVE_ALL), *기록] 형태인지. PatchToolCallsMiddleware 는 승인 중 끊긴 턴 다음 턴 시작에 이렇게
+    기록 전체를 다시 내보낸다. 그대로 그리면 옛 도구 결과와 답변이 다시 찍힌다."""
+    return bool(messages) and isinstance(messages[0], RemoveMessage) and messages[0].id == REMOVE_ALL_MESSAGES
 
 
 def describe_call(call: dict) -> str:

@@ -12,6 +12,7 @@ from __future__ import annotations
 import difflib
 import os
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from code_agent.approval import reject_reason
 from code_agent.guards import is_env_path
 from code_agent.render import describe_call
+from code_agent.stops import is_recovery
 
 MAX_STEPS = 80
 MAX_CONTEXT_TURNS = 10
@@ -122,7 +124,7 @@ def session_context(previous: list[BaseMessage], workspace: Path | None) -> str:
     """턴 전에 에이전트가 알고 있던 것: 시스템 프롬프트의 작업 폴더와 같은 세션의 이전 턴 요약(요청, 도구 수, 바꾼 파일)."""
     turns: list[list[BaseMessage]] = []
     for message in previous:
-        if isinstance(message, HumanMessage):
+        if isinstance(message, HumanMessage) and not is_recovery(message):
             turns.append([message])
         elif turns:
             turns[-1].append(message)
@@ -173,7 +175,9 @@ class WorkLog:
         self.approvals.append(one_line(f"{describe_call(action)} → {verdict}({'자동' if auto else '사용자'})"
                                        + (f": {reason}" if reason else "")))
 
-    def render(self, *, answer: str, changes: list[str] | None, diff: str, context: str = "") -> str:
+    def render(self, *, answer: str, changes: list[str] | None, diff: str, context: str = "",
+               warnings: Sequence[str] = ()) -> str:
+        """warnings 는 잘린 응답·예산 상한 도달 같은 턴 끝 경고(stops.TurnStops)다. 있을 때만 최종 답변 뒤에 둔다."""
         shown = self.steps[:MAX_STEPS]
         steps = [f"{i}. {call} → {result}" for i, (call, result) in enumerate(shown, 1)]
         if len(self.steps) > MAX_STEPS:
@@ -182,6 +186,7 @@ class WorkLog:
                  else "\n".join(f"- {c}" for c in changes) or "(없음)")
         sections = [
             f"## 최종 답변\n{answer.strip() or '(없음)'}",
+            *(["## 경고\n" + "\n".join(f"- {w}" for w in warnings)] if warnings else []),
             f"## 실행한 도구 ({len(self.steps)}개)\n" + ("\n".join(steps) or "(없음)"),
             "## 승인 결정\n" + ("\n".join(f"- {a}" for a in self.approvals) or "(없음)"),
             f"## 바뀐 파일\n{files}",

@@ -23,6 +23,7 @@ from code_agent.agent import build_agent, run_turn
 from code_agent.approval import APPROVE, MODES, decide_all, reject
 from code_agent.render import Renderer, describe_action, todos_markup
 from code_agent.settings import Settings, load_settings
+from code_agent.stops import TurnStops
 from code_agent.tracing import Tracer, langfuse_installed, make_tracer
 from code_agent.usage import Usage, UsageCallback
 from code_agent.worklog import session_context
@@ -161,6 +162,7 @@ class App:
 
     def turn(self, text: str) -> None:
         renderer = Renderer(self.console)
+        stops = TurnStops()
         meter = UsageCallback()
         tags = [self.workspace.name, f"mode:{self.mode}", f"model:{self.settings.model}"]
         trace_context: Any = nullcontext()
@@ -176,6 +178,7 @@ class App:
 
             def on_part(part: tuple) -> None:
                 renderer.on_part(part)
+                stops.on_part(part)
                 if trace is not None:
                     trace.on_part(part)  # 작업 기록(도구 실행과 결과 요약)
 
@@ -194,8 +197,11 @@ class App:
                 error = f"{type(e).__name__}: {e}"
             else:
                 renderer.end_turn()
+            warnings = stops.warnings()  # 잘린 응답·예산 상한 도달. 말없이 멈춘 것처럼 보이지 않게 한다
+            for warning in warnings:
+                self.console.print(f"[yellow]{escape(warning)}[/]", soft_wrap=True)
             if trace is not None:
-                trace.end(output=renderer.last_text, usage=meter.usage, error=error)
+                trace.end(output=renderer.last_text, usage=meter.usage, error=error, warnings=warnings)
         if meter.usage.calls:  # 중단·오류로 끝난 턴도 쓴 만큼은 남긴다
             self.sessions.add_usage(self.thread_id, meter.usage)
             self.console.print(f"[dim]{escape(meter.usage.summary())}[/]")

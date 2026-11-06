@@ -44,6 +44,7 @@ code-agent/
 │   ├── cli.py              # argparse, REPL, 슬래시 커맨드, interrupt/resume 루프
 │   ├── subagents.py        # (2단계)
 │   ├── tracing.py          # Langfuse 트레이스 (turn 루트, CallbackHandler, 승인 event)
+│   ├── stops.py            # 잘린 응답 자동 복구(TruncationRecoveryMiddleware), 잘림·예산 상한 경고(TurnStops)
 │   └── skills/             # (2단계) 내장 SKILL.md (UTF-8, BOM 없음)
 └── tests/
     ├── fakes.py            # ScriptedChatModel (pjt에서 복사)
@@ -338,6 +339,60 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
       - 8턴 모두 1.0이고, 기준별 근거와 계산이 남았다.
       - 실행 기록 없이 "테스트 통과, README 정리"를 주장한 가짜 turn은 여전히 0.5다(검증·보고 정확성 실패). 평가기가 느슨해지지 않았다.
     - **남긴 것**: bomber-game의 실시간 옛 트레이스(답변만 있는 형식)는 모델·도구 단계 기록 때문에 지우지 않았다. 같은 세션에 backfill 트레이스가 함께 있다.
+
+#### 개선 1 — 말없이 멈추는 문제 (2026-11-06, `stops.py`)
+- **근거**: az-quiz 세션(`0cbbc12e9ef6`)의 첫 턴에서 모델 호출 한 번이 출력 64,000토큰을 **전부 reasoning**으로 썼다.
+  - `finish_reason="length"`이고 텍스트도 도구 호출도 없었다. 에이전트 루프는 도구 호출이 없으면 최종 응답으로 보고 턴을 끝낸다.
+  - 화면에는 사용량 한 줄만 나왔고 $1.32가 들었다.
+  - 같은 세션의 다음 사용자 메시지는 잘린 응답 뒤에 그대로 덧붙었고, OpenRouter가 받아들였다(다음 호출이 정상 응답). 그래서 덧붙이기만 하는 복구가 이 경로에서 API 오류를 내지 않는다는 실측 근거가 있다.
+- **자동 복구** (`TruncationRecoveryMiddleware`)
+  - 대상은 `finish_reason`(OpenRouter) 또는 `stop_reason`(Anthropic)이 `length`·`max_tokens`이고 도구 호출이 없는 응답이다.
+  - `after_model`에서 안내 메시지("직전 응답이 출력 한도로 잘렸다. 생각을 줄이고 결과물은 파일에 나눠서 바로 써라.")를 덧붙이고 `jump_to: "model"`로 다시 부른다.
+  - 기록은 고치지 않고 덧붙이기만 한다. Opus 5.5는 이전 thinking을 보존하기 때문이다.
+  - **턴당 1번**이다. 마지막 사용자 메시지 뒤에 안내가 이미 있으면 다시 부르지 않는다. 기록으로 판단하므로 승인 대기 후 재개해도 횟수가 유지된다.
+  - 안내는 `HumanMessage(name="truncation-recovery")`다. `name`은 두 공급자 모두 API로 보내지 않는다(langchain-openrouter는 `additional_kwargs["name"]`만 보낸다). 턴을 나누는 곳(`session_context`, backfill 스크립트)은 이 메시지를 건너뛴다.
+  - **[V] 그래프 배선** (langchain 1.4.7 `agents/factory.py`)
+    - `after_model`은 미들웨어 목록의 **역순**으로 돈다.
+    - `jump_to: "model"`은 루프 입구(첫 `before_model`)로 간다.
+    - 그래서 복구 미들웨어를 목록 **맨 앞**에 둔다. 그래야 `ModelCallLimitMiddleware.after_model`이 호출 수를 센 뒤에 돌고, 다시 부를 때도 모델 호출 상한 검사를 거친다.
+    - 순서를 바꾸면 상한 1회 시험에서 세지 않은 호출이 한 번 더 나가는 것을 확인했다(시험이 잡는다).
+  - **비용 주의**: 다시 부를 때 잘린 응답의 reasoning도 입력으로 다시 보낸다. az-quiz 기준으로 입력이 약 7.5만 토큰이고, 캐시 쓰기로 약 $0.38이다. 사용자가 '계속해줘'를 쳐도 같은 비용이 든다.
+- **턴 끝 경고** (`TurnStops`)
+  - 메인 에이전트의 `updates` 조각에서 잘린 응답, 자동 복구, 예산 상한 도달을 모은다.
+  - 마지막 응답이 잘렸으면 이렇게 쓴다: "응답이 출력 한도(64,000토큰)에 걸려 잘렸다. [자동으로 한 번 다시 요청했지만 또 잘렸다.] 생각만 하다 한도를 다 써서 답변도 도구 호출도 없다. '계속해줘'로 이어 갈 수 있다." 텍스트가 있으면 "답변이 중간에 끊겼다"라고 쓴다.
+  - 복구해서 이어 갔으면 "응답 N개가 출력 한도에 걸려 잘렸다. 자동으로 한 번 다시 요청해 이어 갔다."라고 쓴다.
+  - 한도 숫자는 응답의 `output_tokens`이고, 없으면 `models.MAX_TOKENS`다.
+  - CLI는 사용량 줄 앞에 노란 줄로 보인다. 다시 부르는 순간에도 노란 줄로 알린다.
+  - Langfuse는 `turn`을 WARNING 수준과 status_message로 표시한다. 오류가 있으면 ERROR가 우선이다. 작업 기록에는 최종 답변 뒤에 `## 경고` 절이 생긴다.
+- **시스템 프롬프트** (`# 출력 한도` 절)
+  - 응답 하나의 출력 한도가 생각을 포함해 64,000토큰이라는 것을 알린다.
+  - 큰 데이터나 긴 파일은 생각 속에서 완성하지 말고 바로 파일에 나눠 쓰게 한다. 예: `write_file`로 50개를 쓴 뒤 `edit_file`로 50개씩 이어 붙인다.
+  - 숫자는 `models.MAX_TOKENS`에서 가져온다(`_MAX_TOKENS`를 공개 이름으로 바꿨다).
+- **예산 상한 도달 표시**
+  - `ModelCallLimitMiddleware`(`before_model`)와 `ToolCallLimitMiddleware`(`after_model`)가 `exit_behavior="end"`로 만든 종료 AI 메시지는 `model`이 아닌 미들웨어 노드에서 나온다.
+  - 상한을 1로 낮춘 대본 시험으로 확인했다. 수정 전에는 두 메시지 모두 state 마지막에는 있었지만 **화면에는 없었다**.
+  - `render.py`가 `model`이 아닌 노드의 AI 텍스트를 노란 줄로 그리고 `last_text`(트레이스의 최종 답변)로 삼는다. 턴 끝에는 "예산 상한에 걸려 턴을 멈췄다(…). '계속해줘'로 이어 갈 수 있다."를 보인다.
+- **시험**: `test_stops.py` 19개를 추가해 전체 190개가 통과한다(모델 호출 없음).
+  - 잘린 응답을 다시 부를 때 기록에 덧붙이기만 하는지
+  - 턴당 1번인지, 다음 턴에는 다시 1번을 받는지
+  - 도구 호출이 있는 잘린 응답은 다시 부르지 않는지
+  - 다시 부를 때 모델 호출 상한을 지키는지
+  - CLI 경고 문구 세 가지와, 정상 턴에는 경고가 없는지
+  - 모델·도구 상한 도달 표시
+  - 작업 기록의 경고 절, 실제 Langfuse SDK에서 WARNING이 남는지
+- **확인하지 못한 것**
+  - Anthropic 직접 호출(`ChatAnthropic`) 경로는 실측하지 않았다. thinking 도중 `max_tokens`로 잘린 thinking 블록을 다시 보낼 때 API가 받아들이는지 모른다. OpenRouter 경로는 az-quiz 세션으로 확인됐다.
+  - 서브에이전트(ns가 있는 조각)의 잘림은 경고에 넣지 않는다. 지금은 서브에이전트를 쓰지 않는다.
+- **리뷰 반영 (2026-11-06)**
+  - **B1**: `render.py`가 `model`이 아닌 노드의 AI 메시지를 모두 노란 답변으로 그렸다. 두 경로에서 같은 텍스트가 다시 찍혔다.
+    - HITL `after_model`은 승인 뒤 같은 응답을 다시 내보낸다. 그래서 "텍스트 + 도구 호출" 응답을 승인할 때마다 텍스트가 한 번 더 찍혔다.
+    - `PatchToolCallsMiddleware.before_agent`는 승인 중 끊긴 턴 다음에 `[RemoveMessage(REMOVE_ALL), *기록 전체]`를 내보낸다. 그래서 옛 답변과 **옛 도구 결과**(이것은 main에도 있던 문제)가 다시 찍히고, `last_text`도 옛 텍스트가 될 수 있었다.
+    - 수정: 예산 노드(`budget_stop`)의 메시지만 그린다. 기록을 통째로 다시 쓰는 update는 그리지 않는다(`rewrites_history`).
+  - **B2**: 복구 안내도 노드를 보지 않아, 다시 내보낸 옛 안내가 다시 찍히고 `TurnStops.recoveries`가 늘었다. `recovery_notice`가 `TruncationRecoveryMiddleware` 노드의 것만 센다.
+  - **K4**: 실제 그래프 간선으로 순서를 고정하는 시험을 넣었다. 복구 `after_model`이 루프 출구이고, 그보다 앞에서 모델 호출 상한이 집계하며, `jump_to "model"`은 `ModelCallLimitMiddleware.before_model`로 간다.
+  - **M1**: 안내를 둘로 나눴다. 생각만 하다 잘린 경우와 답변이 끊긴 경우("끊긴 곳부터 이어서 짧게 마무리하라")다.
+  - **M2**: 프롬프트 예시를 `];` 바꾸기에서 고유한 끝 표식(`// END-OF-DATA`) 줄을 바꾸는 방식으로 바꿨다. 파일을 나눠도 된다고 적었다. `];`는 여러 번 나올 수 있어 `edit_file`이 실패한다.
+  - 시험 4개를 추가하고 M1 확인을 기존 시험에 넣었다. `test_stops.py`가 23개, 전체가 194개다. 수정 전 코드로 돌리면 새 시험이 실패하는 것을 확인했다.
 
 ### 4단계 — 평가·확장 (선택)
 - `evals/`: 수정 과제 5~10개(fixture 저장소와 숨김 검증 테스트)를 헤드리스로 돌려 통과율, 비용, 시간을 집계한다. `pjt\Day04\coding_skills\verify_agent.py` 패턴을 참고한다.

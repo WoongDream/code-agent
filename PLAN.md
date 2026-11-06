@@ -395,6 +395,41 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - **M2**: 프롬프트 예시를 `];` 바꾸기에서 고유한 끝 표식(`// END-OF-DATA`) 줄을 바꾸는 방식으로 바꿨다. 파일을 나눠도 된다고 적었다. `];`는 여러 번 나올 수 있어 `edit_file`이 실패한다.
   - 시험 4개를 추가하고 M1 확인을 기존 시험에 넣었다. `test_stops.py`가 23개, 전체가 194개다. 수정 전 코드로 돌리면 새 시험이 실패하는 것을 확인했다.
 
+#### 개선 2 — 생각 중 표시 (2026-11-06, `render.py`)
+- **근거**
+  - 모델이 오래 생각하거나 큰 도구 인자를 쓰는 동안 화면이 멈춘 것처럼 보였다. az-quiz 첫 호출은 약 15분이 걸렸고, quizzes.js(14,755토큰) 인자를 쓰는 99초 동안 화면에 아무것도 없었다. `render.py`는 `tool_call_chunks`를 그리지 않았다.
+- **[V] OpenRouter 생각 청크** (langchain-openrouter 0.2.8 `_convert_chunk_to_message_chunk`, langchain-core `AIMessageChunk.content_blocks`)
+  - `delta.reasoning`은 `additional_kwargs["reasoning_content"]`가 되고, 등록된 번역기가 없는 `openrouter`도 best-effort 파싱으로 `reasoning` 블록이 된다.
+  - 실제 변환 함수 → 대본 스트리밍 → Renderer로 확인했다. **이 청크는 수정 전에도 찍혔다.** 다만 다음 답변이 같은 줄에 붙었다.
+  - `reasoning_details`만 담긴 청크는 `content_blocks`가 `[]`라 찍히지 않았다. 이제 그 `text`·`summary`를 쓴다. 두 필드가 함께 오면 블록 쪽만 써서 두 번 세지 않는다.
+  - az-quiz 기록에서 `reasoning_content`와 `reasoning_details` 텍스트 길이가 같았다(31,160자). 그래서 "15분간 아무것도 안 보였다"의 원인이 화면 그리기인지, 공급자가 생각 요약을 늦게 보낸 것인지는 실측 없이 확정하지 못했다. 상태 줄은 어느 쪽이든 멈춤처럼 보이지 않게 한다.
+  - 참고: langchain-core는 `_stream`을 run_manager 없이 부르고 청크마다 직접 `on_llm_new_token`을 낸다. 그래서 ChatOpenRouter 안의 호출과 겹치지 않는다(토큰이 두 번 오지 않는다).
+- **생각 표시**
+  - 줄 단위로 흐리게(dim italic) 찍는다. 줄바꿈 없이 찍으면 상태 줄과 섞이기 때문이다.
+  - 기본은 메모다. 줄(OpenRouter 요약은 문단 하나가 한 줄)마다 앞 100자만 찍고, 100자가 모이면 줄이 끝나기 전에 `…`를 붙여 찍는다.
+  - `/thinking [on|off]`로 원문 표시를 켜고 끈다. 인자가 없으면 바꾼다. 다음 턴부터 적용된다.
+  - Anthropic 경로(thinking 블록)도 같은 규칙을 따른다. 전에는 원문 전체를 토큰 단위로 찍었다.
+- **상태 줄** (`StatusLine`)
+  - **[V] rich `Status`** (Spinner + transient `Live`)를 쓴다. 스피너 텍스트를 `__rich__`가 있는 객체로 넘겨, 자동 새로고침 때마다 경과 시간을 다시 센다. `Live`가 켜져 있어도 `console.print` 한 줄은 그 위에 찍힌다.
+  - 단계
+    - `생각 중 N자… 42초`: 턴 시작, 도구 결과를 다 받은 뒤, 복구 안내 뒤
+    - `<도구> <경로> 작성 중 NKB`: `tool_call_chunks`의 이름과 인자 조각. 경로는 인자 JSON 조각에서 `"file_path"`만 꺼낸다.
+    - `$ cmd 실행 중… 35초` 또는 `도구 N개 실행 중`: 결과를 기다리는 도구 호출 id로 센다.
+  - 단계가 바뀌면 경과 시간을 0부터 센다. 진행량만 바뀌면 이어서 센다.
+  - 답변 텍스트가 나오면 사라진다(줄바꿈 없는 토큰 출력과 섞이지 않게).
+  - 승인 프롬프트 직전에 멈추고(`App.ask` 래퍼 → `Renderer.pause`), 결정 뒤에 다시 켠다(`resume`). Ctrl+C·오류·턴 끝에서도 멈춘다.
+  - 그리는 조건은 콘솔이 터미널이고 stdin·stdout이 모두 TTY인 것이다(`_line_reader`와 같은 `_interactive()`). 파이프, mintty, 테스트의 StringIO에서는 상태만 기록하고 그리지 않는다.
+  - 터미널이 아닐 때 15초마다 heartbeat 줄을 찍는 대체 경로(선택)는 넣지 않았다. 답변 토큰이 줄 중간에 있을 때 끼어들면 출력이 섞인다.
+- **시험**: `test_render.py` 11개를 추가했다. 대본 모델에 스트리밍 판(`fakes.StreamingChatModel`)을 더했고, 청크는 langchain-openrouter의 실제 변환 함수로 만든다.
+  - 메모 표시와 흐린 스타일, 원문 모드, `reasoning_details`만 있는 청크와 이중 계산 방지
+  - 단계 전환: 생각 → 작성 중 12.3KB → 도구 2개 실행 중 → `$ …` 실행 중 → 생각 → 텍스트에서 사라짐
+  - 경과 시간 표기
+  - 터미널일 때만 그림, App의 판정
+  - 스트리밍한 write_file 인자가 합쳐져 실제로 실행됨
+  - 승인 프롬프트 때 꺼져 있음(`pause`를 빼면 실패하는 것을 확인), Ctrl+C 뒤 꺼짐
+  - `/thinking` 전환(rich 마크업이 `[on|off]`를 삼키던 것도 고쳤다)
+  - 강제 터미널 콘솔로 실제 `Live`를 돌려 스피너와 단계 문구가 그려지는 것도 따로 확인했다.
+
 #### 개선 3 — 컨텍스트 한도와 멈춘 응답 정리 (2026-11-06, 사양 `code-agent-specs/task3-context-and-stops.md`)
 - **사실 정정**
   - Opus 5.5 캐시 읽기는 $0.20/M(입력의 0.05배)이다. 위 가격 정의의 $0.40과 `caching.py` 주석의 0.1배를 고쳤다.

@@ -172,3 +172,15 @@ def test_offload_goes_to_artifacts_not_workspace(tmp_path: Path) -> None:
     assert backend.write(f"{middleware._large_tool_results_prefix}/call-1", "big").error is None
     assert (artifacts / "large_tool_results" / "call-1").read_text(encoding="utf-8") == "big"
     assert list(workspace.iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell 5.1 전용")
+def test_powershell_progress_suppressed(tmp_path: Path) -> None:
+    """진행률 출력이 CLIXML 로 stderr 에 섞이지 않는다($ProgressPreference).
+
+    이 PC 에서는 설정이 없어도 CLIXML 이 재현되지 않았다(Write-Progress, 모듈 가져오기 모두). 그래서 수정의 증거가 아니라
+    출력 모양을 지키는 안전망이다. 다른 환경(CI 러너 등)에서 섞이면 이 시험이 잡는다.
+    """
+    backend = WindowsShellBackend(tmp_path, shell="powershell", timeout=60)
+    result = backend.execute("Write-Progress -Activity x -Status y; [Console]::Error.WriteLine('bad')")
+    assert "CLIXML" not in result.output and "[stderr] bad" in result.output, result.output

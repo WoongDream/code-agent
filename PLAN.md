@@ -551,6 +551,20 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
     - 옛 프로세스의 INSERT 호환
   - `test_agent.py` 1개: system에 env 절이 있음. 기존 시험에 '절 없음' 단언도 더했다.
   - resume이 다시 탐지하게 바꾸면 resume 시험 2개가 실패하는 것을 확인했다.
+- **리뷰 반영** (c2a04d1)
+  - **환경 탐지도 심은 실행 파일을 고르지 않는다** (`environment.trusted_tool`)
+    - Windows의 `which`는 `NoDefaultCurrentDirectoryInExePath`가 없으면 PATH를 주어도 현재 폴더를 먼저 찾는다. 그래서 `probe`가 저장소의 `node.cmd`를 `--version`으로 실행할 수 있었다(리뷰 재현).
+    - 상대 경로이거나 현재 폴더·작업 폴더 **안**인 결과를 버린다. direnv처럼 저장소 안 폴더를 PATH에 넣는 경우도 막으려고 '바로 아래'가 아니라 '안'을 본다.
+    - 드라이브 루트나 홈을 품은 폴더는 기준에서 뺀다. 홈에서 띄우면 `~\.local\bin\uv.exe`까지 버리게 되기 때문이다.
+    - `probe(workspace=…)`, `uv_python_find`, `shell_env`의 python 판정이 이것을 쓴다. #9의 `safe_which`도 merge 때 이것으로 통일했다.
+  - 절이 없던 옛 thread를 이어 온 뒤 `/new` 하면 다시 탐지한 절로 agent를 새로 만든다(`App.fresh_agent`). system은 agent를 만들 때 고정되기 때문이다.
+  - README: 활성화한 venv 안에 설치해 실행하면 그 venv도 에이전트 셸에서 빠진다.
+- **통합** (사용자가 #8 하나만 병합하면 #5~#10이 모두 들어간다)
+  - #9 merge(e55f40f): agent.py middleware 목록, backend.py(`process_shell_env`와 `system32`·`safe_which`·`find_git_bash(workspace)`를 함께 둠), cli.py import
+  - #10 merge(a8ea2e0): models.py(dict 전달 + `MAX_TOKENS`), render.py(#6의 `_ai_text`와 `Mapping` 인자)
+    - 병합한 코드에 pyright를 돌려 새 오류 2개를 고쳤다(`_pending` 키의 None, `Sequence[BaseMessage]`).
+  - `test_powershell_progress_suppressed`를 추가했다. 다만 이 PC에서는 설정이 없어도 CLIXML이 재현되지 않았다. 그래서 수정의 증거가 아니라 출력 모양을 지키는 안전망이다.
+  - ruff 통과, pyright 0, 전체 352개 통과
 
 ### 4단계 — 평가·확장 (선택)
 - `evals/`: 수정 과제 5~10개(fixture 저장소와 숨김 검증 테스트)를 헤드리스로 돌려 통과율, 비용, 시간을 집계한다. `pjt\Day04\coding_skills\verify_agent.py` 패턴을 참고한다.

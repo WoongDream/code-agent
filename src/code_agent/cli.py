@@ -26,6 +26,7 @@ from code_agent.approval import APPROVE, MODES, decide_all, reject
 from code_agent.backend import process_shell_env, resolve_shell, safe_which
 from code_agent.environment import probe, render
 from code_agent.render import Renderer, describe_action, todos_markup
+from code_agent.resume_compat import SqlitePromptStore
 from code_agent.settings import REPO_ROOT, Settings, load_settings
 from code_agent.stops import TurnStops
 from code_agent.tracing import Tracer, langfuse_installed, make_tracer
@@ -113,8 +114,7 @@ class App:
         self.console, self.read_line = console, read_line
         self.env_text = env_text
         self.fresh_agent = fresh_agent  # (env_text, agent): 환경을 다시 탐지해 새로 만든 agent
-        self.agent = agent if agent is not None else build_agent(settings, workspace, SqliteSaver(sessions.conn),
-                                                                 env_text=env_text)
+        self.agent = agent if agent is not None else session_agent(settings, workspace, sessions, env_text)
         self.tracer = tracer
         self.status_line = console.is_terminal and _interactive()  # 파이프·테스트(StringIO)에서는 상태 줄을 그리지 않는다
         self.full_thinking = False  # /thinking
@@ -368,7 +368,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         # --resume 은 그 thread 에 저장한 절을 그대로 쓴다(다시 탐지하면 system 이 바뀔 수 있다)
         env_text = sessions.env_text_of(args.resume) if args.resume else detect_environment(settings.shell, workspace)
-        agent = build_agent(settings, workspace, SqliteSaver(sessions.conn), env_text=env_text)
+        agent = session_agent(settings, workspace, sessions, env_text)
     except (RuntimeError, ValueError) as e:  # API 키 미설정, 모델 이름 오류, Git Bash 없음 등
         console.print(f"[red]{escape(str(e))}[/]")
         return 2
@@ -378,12 +378,23 @@ def main(argv: list[str] | None = None) -> int:
     thread_id = args.resume or sessions.create(workspace, env_text)  # 시작에 성공한 뒤에만 세션을 남긴다
     def fresh_agent() -> tuple[str, Any]:
         text = detect_environment(settings.shell, workspace)
-        return text, build_agent(settings, workspace, SqliteSaver(sessions.conn), env_text=text)
+        return text, session_agent(settings, workspace, sessions, text)
 
     app = App(settings, workspace, args.mode, sessions, thread_id, console,
               _line_reader(settings.data_dir / "history"), agent=agent, tracer=tracer, env_text=env_text,
               fresh_agent=fresh_agent)
     return app.run()
+
+
+def session_agent(settings: Settings, workspace: Path, sessions: Sessions, env_text: str) -> Any:
+    """sessions.db 에 체크포인트와 프롬프트 지문(resume_compat)을 남기는 agent.
+
+    지문 저장소는 그래프 실행 중(모델 호출 직전)에 쓰고, 그때 SqliteSaver 는 앞 단계의 체크포인트를 백그라운드에서 같은
+    연결로 저장할 수 있다. 그래서 두 쪽이 같은 잠금을 쓴다.
+    """
+    saver = SqliteSaver(sessions.conn)
+    return build_agent(settings, workspace, saver, env_text=env_text,
+                       prompt_store=SqlitePromptStore(sessions.conn, saver.lock))
 
 
 def detect_environment(shell_preference: str, workspace: Path | None = None) -> str:

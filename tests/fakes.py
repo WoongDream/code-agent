@@ -21,6 +21,7 @@ class ScriptedChatModel(BaseChatModel):
     steps: SkipValidation[list[AIMessage | Callable[[list[BaseMessage]], AIMessage]]]
     calls: list[list[BaseMessage]] = Field(default_factory=list)
     bound_tool_names: list[str] = Field(default_factory=list)
+    bound_tools: list[dict] = Field(default_factory=list)  # 모델이 받는 도구 스키마(이름·설명·인자)
 
     @property
     def _llm_type(self) -> str:
@@ -28,7 +29,8 @@ class ScriptedChatModel(BaseChatModel):
 
     def bind_tools(self, tools: Sequence[dict | type[BaseModel] | Callable | BaseTool],
                    **kwargs: object) -> ScriptedChatModel:
-        self.bound_tool_names = [convert_to_openai_tool(t)["function"]["name"] for t in tools]
+        self.bound_tools = [convert_to_openai_tool(t) for t in tools]
+        self.bound_tool_names = [t["function"]["name"] for t in self.bound_tools]
         return self
 
     def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None,

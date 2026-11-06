@@ -32,8 +32,10 @@ from code_agent.caching import OpenRouterCacheMiddleware
 from code_agent.guards import DotenvGuardMiddleware
 from code_agent.models import make_model
 from code_agent.prompts import coding_prompt
+from code_agent.resume_compat import MemoryPromptStore, PromptFingerprintMiddleware, PromptStore
 from code_agent.settings import Settings
 from code_agent.stops import TruncationRecoveryMiddleware
+from code_agent.tool_text import TODO_PROMPT, TOOL_DESCRIPTIONS, ToolArgsMiddleware
 
 INTERRUPT_TOOLS = ("execute", "write_file", "edit_file", "delete")
 MODEL_CALLS = 100  # 사용자 메시지 하나(재개 포함)의 모델 호출 상한
@@ -69,24 +71,37 @@ def summarization_middleware(model: BaseChatModel, backend: CompositeBackend, co
                                    truncate_args_settings=None)
 
 
-def _disable_general_purpose_subagent(model: BaseChatModel) -> None:
-    """MVP 는 서브에이전트를 쓰지 않는다. 프로필은 공급자 단위로 등록되고 내장 프로필과 병합된다."""
+def _register_harness_profile(model: BaseChatModel) -> None:
+    """프로필은 공급자 단위로 등록되고 내장 프로필과 병합된다.
+
+    - MVP 는 서브에이전트를 쓰지 않는다.
+    - 기본 도구 설명 중 우리 환경과 다른 것(execute 의 'sandbox'·절대 경로·&& 연결, ls 의 'ALWAYS' 등)을 고친다(tool_text).
+      등록은 프로세스 전역이고 같은 키에 병합된다(deepagents _merge_profiles).
+    """
     provider = get_model_provider(model)
     if provider:
         register_harness_profile(provider, HarnessProfile(
-            general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False)))
+            general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
+            tool_description_overrides=TOOL_DESCRIPTIONS))
 
 
 def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpointSaver | None, *,
-                model: BaseChatModel | None = None, backend: CompositeBackend | None = None, env_text: str = ""):
-    """env_text 는 시스템 프롬프트 끝의 '이 PC 의 도구' 절이다(prompts.coding_prompt)."""
+                model: BaseChatModel | None = None, backend: CompositeBackend | None = None, env_text: str = "",
+                prompt_store: PromptStore | None = None):
+    """env_text 는 시스템 프롬프트 끝의 '이 PC 의 도구' 절이다(prompts.coding_prompt).
+
+    prompt_store 는 thread 별 프롬프트 지문 저장소다(resume_compat). 없으면 이 agent 안에서만 기억한다.
+    """
     model = model if model is not None else make_model(settings)
-    _disable_general_purpose_subagent(model)
+    _register_harness_profile(model)
     if backend is None:
         backend = make_backend(workspace, artifacts_dir=settings.data_dir / "artifacts", shell=settings.shell)
     # 잘림 복구는 맨 앞이어야 after_model 이 예산 미들웨어의 호출 집계 뒤에 돈다(after_model 은 역순).
     # 요약은 이름이 같아 core 자리를 대신하므로 목록 위치와 상관없다. .env 가드는 작업 폴더로 실제 파일 이름도 본다.
-    middleware: list[Middleware] = [TruncationRecoveryMiddleware(), TodoListMiddleware(),
+    # 지문은 TodoList 와 도구 인자 고치기 뒤라야(wrap_model_call 은 앞이 바깥) 모델이 받는 system·도구를 본다.
+    store = prompt_store if prompt_store is not None else MemoryPromptStore()
+    middleware: list[Middleware] = [TruncationRecoveryMiddleware(), TodoListMiddleware(system_prompt=TODO_PROMPT),
+                                    ToolArgsMiddleware(), PromptFingerprintMiddleware(store),
                                     DotenvGuardMiddleware(workspace), OpenRouterCacheMiddleware(),
                                     *budget_middleware(), summarization_middleware(model, backend, settings.context_tokens)]
     shell = cast(WindowsShellBackend, backend.default).shell  # default 는 make_backend 의 셸 백엔드다
@@ -105,11 +120,13 @@ def run_turn(agent, inp: dict | Command, config: dict, *,
     """interrupt 가 없어질 때까지 스트림 → 결정 → 재개를 반복한다(pjt Day08 guardlab/runner.py:107).
 
     서브에이전트의 interrupt 는 ns 가 다른 두 이벤트로 같은 id 를 달고 오므로 id 로 중복을 없앤다(0단계 d).
+    custom 모드는 미들웨어가 get_stream_writer 로 보내는 알림이다(resume_compat 의 prompt_migrated 등).
     """
     config = {"recursion_limit": RECURSION_LIMIT, **config}
     while True:
         pending: dict[str, Any] = {}
-        for part in agent.stream(inp, config, stream_mode=["messages", "updates"], subgraphs=True):
+        for part in agent.stream(inp, config, stream_mode=["messages", "updates", "custom"],
+                                 subgraphs=True):
             _ns, mode, data = part
             if mode == "updates" and "__interrupt__" in data:
                 for interrupt in data["__interrupt__"]:

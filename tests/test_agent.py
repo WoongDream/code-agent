@@ -57,6 +57,18 @@ def test_system_prompt_has_runtime_info(tmp_path: Path) -> None:
     assert "/.code-agent-artifacts/" in system
     assert "생각(thinking)을 포함해 64,000토큰까지" in system  # 출력 한도와 파일에 나눠 쓰기 규칙
     assert "끝 표식 줄(`// END-OF-DATA`)" in system
+    assert "이 PC 의 도구" not in system  # env_text 를 주지 않으면 절이 없다(옛 thread 와 같은 system)
+
+
+def test_system_prompt_has_env_section(tmp_path: Path) -> None:
+    env_text = "\n# 이 PC 의 도구 (세션 시작 때 확인했다)\n- 있음: uv 0.13.7\n"
+    model = ScriptedChatModel(steps=[DONE])
+    (tmp_path / "ws").mkdir()
+    agent = build_agent(Settings(data_dir=tmp_path / "data"), tmp_path / "ws", InMemorySaver(), model=model,
+                        env_text=env_text)
+    run_turn(agent, {"messages": [{"role": "user", "content": "go"}]}, {"configurable": {"thread_id": "t"}},
+             decide=lambda requests: [], on_part=lambda part: None)
+    assert env_text in model.calls[0][0].text
 
 
 def test_execute_interrupts_with_approve_or_reject_only(tmp_path: Path) -> None:

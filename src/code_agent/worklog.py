@@ -162,7 +162,7 @@ class WorkLog:
             for message in messages if isinstance(messages, list) else []:
                 if node == "model" and isinstance(message, AIMessage):
                     for call in message.tool_calls:
-                        self._by_call_id[call["id"]] = len(self.steps)
+                        self._by_call_id[call["id"] or ""] = len(self.steps)
                         self.steps.append([one_line(prefix + describe_call(call)), "(결과 없음)"])
                 elif isinstance(message, ToolMessage):
                     index = self._by_call_id.get(message.tool_call_id)

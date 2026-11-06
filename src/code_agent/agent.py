@@ -78,20 +78,21 @@ def _disable_general_purpose_subagent(model: BaseChatModel) -> None:
 
 
 def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpointSaver | None, *,
-                model: BaseChatModel | None = None, backend: CompositeBackend | None = None):
+                model: BaseChatModel | None = None, backend: CompositeBackend | None = None, env_text: str = ""):
+    """env_text 는 시스템 프롬프트 끝의 '이 PC 의 도구' 절이다(prompts.coding_prompt)."""
     model = model if model is not None else make_model(settings)
     _disable_general_purpose_subagent(model)
     if backend is None:
         backend = make_backend(workspace, artifacts_dir=settings.data_dir / "artifacts", shell=settings.shell)
     # 잘림 복구는 맨 앞이어야 after_model 이 예산 미들웨어의 호출 집계 뒤에 돈다(after_model 은 역순).
-    # 요약은 이름이 같아 core 자리를 대신하므로 목록 위치와 상관없다.
-    middleware: list[Middleware] = [TruncationRecoveryMiddleware(), TodoListMiddleware(), DotenvGuardMiddleware(),
-                                    OpenRouterCacheMiddleware(), *budget_middleware(),
-                                    summarization_middleware(model, backend, settings.context_tokens)]
+    # 요약은 이름이 같아 core 자리를 대신하므로 목록 위치와 상관없다. .env 가드는 작업 폴더로 실제 파일 이름도 본다.
+    middleware: list[Middleware] = [TruncationRecoveryMiddleware(), TodoListMiddleware(),
+                                    DotenvGuardMiddleware(workspace), OpenRouterCacheMiddleware(),
+                                    *budget_middleware(), summarization_middleware(model, backend, settings.context_tokens)]
     shell = cast(WindowsShellBackend, backend.default).shell  # default 는 make_backend 의 셸 백엔드다
     return create_deep_agent(
         name="code-agent", model=model, backend=backend,
-        system_prompt=coding_prompt(workspace=workspace, shell=shell),
+        system_prompt=coding_prompt(workspace=workspace, shell=shell, env_text=env_text),
         middleware=middleware,
         # 결정은 approve/reject 만 받는다. edit 은 고친 인자가 재검증 없이 실행된다.
         interrupt_on={tool: {"allowed_decisions": ["approve", "reject"]} for tool in INTERRUPT_TOOLS},

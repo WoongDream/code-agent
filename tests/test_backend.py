@@ -1,6 +1,7 @@
 """셸 백엔드: 셸 선택, 종료 코드, 한글, 타임아웃, 비밀값 제거, 경로 탈출, 오프로드 위치."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -56,7 +57,7 @@ def test_echo_and_exit_code(shell_backend: WindowsShellBackend) -> None:
 
 def test_stderr_is_prefixed(shell_backend: WindowsShellBackend) -> None:
     result = shell_backend.execute(run_python(shell_backend.shell, '-c "import sys; sys.stderr.write(\'bad\\n\')"'))
-    assert "[stderr] bad" in result.output
+    assert "[stderr] bad" in result.output, result.output  # 가끔 실패했다. PS 진행률 CLIXML 이 섞였는지 본다
 
 
 def test_korean_output_is_not_garbled(shell_backend: WindowsShellBackend) -> None:
@@ -100,9 +101,46 @@ def test_oem_codepage_output_is_decoded(shell_backend: WindowsShellBackend) -> N
 def test_shell_env_drops_secrets() -> None:
     secrets = {"ANTHROPIC_API_KEY", "GITHUB_TOKEN", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "OPENROUTER_API_KEY",
                "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "gpg_key"}
-    env = shell_env({"PATH": "p", "SYSTEMROOT": "s", "LANGFUSE_BASE_URL": "u", **dict.fromkeys(secrets, "x")})
+    env = shell_env({"PATH": "p", "SYSTEMROOT": "s", "LANGFUSE_BASE_URL": "u", **dict.fromkeys(secrets, "x")},
+                    find_python=lambda env: None)
     assert {"PATH", "SYSTEMROOT", "LANGFUSE_BASE_URL"} <= env.keys()
     assert not secrets & env.keys()
+
+
+def test_shell_env_drops_tool_venv(tmp_path: Path) -> None:
+    """code-agent 자신의 venv 를 셸에 물려주지 않는다. 물려주면 셸의 python·pip 이 deepagents 가 깔린 도구 venv 가 된다."""
+    scripts, other = tmp_path / ".venv" / "Scripts", tmp_path / "bin"
+    base = {"PATH": os.pathsep.join([str(scripts), str(other)]), "VIRTUAL_ENV": str(tmp_path / ".venv"),
+            "UV": "uv.exe", "UV_RUN_RECURSION_DEPTH": "1", "PYTHONHOME": "x", "SYSTEMROOT": "s"}
+    env = shell_env(base, tool_scripts=str(scripts), find_python=lambda env: None)
+    assert not {"VIRTUAL_ENV", "UV", "UV_RUN_RECURSION_DEPTH", "PYTHONHOME"} & env.keys()
+    assert env["PATH"].split(os.pathsep) == [str(other)] and env["SYSTEMROOT"] == "s"
+
+
+def test_shell_env_prepends_uv_python_when_stub(tmp_path: Path) -> None:
+    stubs = tmp_path / "AppData" / "Local" / "Microsoft" / "WindowsApps"
+    stubs.mkdir(parents=True)
+    (stubs / "python.exe").write_bytes(b"")  # 스토어 실행 별칭은 크기가 0 이다
+    uv_python = tmp_path / "uv" / "python" / "cpython-3.13" / "python.exe"
+    uv_python.parent.mkdir(parents=True)
+    uv_python.write_bytes(b"x")
+    asked: list[dict] = []
+    env = shell_env({"PATH": str(stubs)}, tool_scripts=str(tmp_path / "none"),
+                    find_python=lambda env: asked.append(dict(env)) or str(uv_python))
+    assert env["PATH"].split(os.pathsep) == [str(uv_python.parent), str(stubs)]
+    assert "VIRTUAL_ENV" not in asked[0]  # 정리한 env 로 묻는다
+
+
+def test_shell_env_without_uv(tmp_path: Path) -> None:
+    """uv 가 없으면(uv python find 실패) PATH 를 더하지 않고 예외도 없다. 프롬프트에는 python 이 없음으로 나온다."""
+    env = shell_env({"PATH": str(tmp_path)}, tool_scripts=str(tmp_path / "none"))
+    assert env["PATH"] == str(tmp_path)
+
+
+def test_powershell_hides_progress() -> None:
+    from code_agent import backend
+
+    assert "$ProgressPreference = 'SilentlyContinue'" in backend._PS_UTF8
 
 
 @needs_bash
@@ -134,3 +172,15 @@ def test_offload_goes_to_artifacts_not_workspace(tmp_path: Path) -> None:
     assert backend.write(f"{middleware._large_tool_results_prefix}/call-1", "big").error is None
     assert (artifacts / "large_tool_results" / "call-1").read_text(encoding="utf-8") == "big"
     assert list(workspace.iterdir()) == []
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="PowerShell 5.1 전용")
+def test_powershell_progress_suppressed(tmp_path: Path) -> None:
+    """진행률 출력이 CLIXML 로 stderr 에 섞이지 않는다($ProgressPreference).
+
+    이 PC 에서는 설정이 없어도 CLIXML 이 재현되지 않았다(Write-Progress, 모듈 가져오기 모두). 그래서 수정의 증거가 아니라
+    출력 모양을 지키는 안전망이다. 다른 환경(CI 러너 등)에서 섞이면 이 시험이 잡는다.
+    """
+    backend = WindowsShellBackend(tmp_path, shell="powershell", timeout=60)
+    result = backend.execute("Write-Progress -Activity x -Status y; [Console]::Error.WriteLine('bad')")
+    assert "CLIXML" not in result.output and "[stderr] bad" in result.output, result.output

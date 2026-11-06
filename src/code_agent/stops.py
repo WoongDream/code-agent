@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -72,7 +72,7 @@ def is_recovery(message: BaseMessage) -> bool:
     return isinstance(message, HumanMessage) and message.name == RECOVERY_NAME
 
 
-def _recovered_this_turn(messages: list[BaseMessage]) -> bool:
+def _recovered_this_turn(messages: Sequence[BaseMessage]) -> bool:
     for message in reversed(messages):
         if is_recovery(message):
             return True
@@ -173,7 +173,8 @@ def sanitize_invalid_calls(message: AIMessage) -> AIMessage | None:
 def _hold_in(result: ModelCallResult) -> ModelCallResult:
     """모델 호출 결과의 세 모양(ModelResponse, AIMessage, ExtendedModelResponse) 모두에서 hold_cut_call 을 적용한다.
 
-    안쪽 미들웨어가 무엇을 돌려주느냐에 따라 모양이 다르다. 예: SkillsMiddleware 는 항상 ExtendedModelResponse 를 돌려준다.
+    실제 그래프에서는 langchain 이 바깥 미들웨어에 넘기는 결과를 ModelResponse 로 정규화한다(langchain 1.4.7
+    factory.py:340-355 compose_two). 직접 호출과 향후 변경에 대비한 방어다.
     """
     if isinstance(result, AIMessage):
         return hold_cut_call(result) or result

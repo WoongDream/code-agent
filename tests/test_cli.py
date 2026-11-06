@@ -7,6 +7,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import pytest
 from fakes import ScriptedChatModel, tool_call
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -172,3 +173,82 @@ def test_fixes_buggy_repo_with_approvals(tmp_path: Path) -> None:
     assert "ordered[mid - 1]" in (workspace / "stats.py").read_text(encoding="utf-8")
     assert script.prompts.count("[y] 승인 / [n] 거부 › ") == 3
     assert not (workspace / ".code-agent-artifacts").exists()
+
+
+ENV_A = "\n# 이 PC 의 도구 (세션 시작 때 확인했다)\n- 있음: python 3.13.18, uv 0.13.7\n- 없음: node\n"
+
+
+def run_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], *answers: str,
+             detected: str | None, model: ScriptedChatModel) -> int:
+    """main() 을 키·네트워크 없이 돌린다. detected 가 None 이면 환경 탐지가 불리면 안 된다."""
+    from code_agent import cli
+
+    def detect(shell: str, workspace: Path | None = None) -> str:
+        assert detected is not None, "--resume 인데 환경을 다시 탐지했다"
+        return detected
+
+    monkeypatch.setattr(cli, "load_settings", lambda: Settings(data_dir=tmp_path / "data"))
+    monkeypatch.setattr(cli, "detect_environment", detect)
+    monkeypatch.setattr(cli, "make_tracer", lambda settings: None)
+    monkeypatch.setattr(cli, "_line_reader", lambda history: Script(*answers))
+    monkeypatch.setattr(cli, "build_agent", lambda *args, **kwargs: build_agent(*args, model=model, **kwargs))
+    return cli.main(argv)
+
+
+def only_thread(tmp_path: Path) -> str:
+    with sqlite3.connect(tmp_path / "data" / "sessions.db") as conn:
+        [(thread_id,)] = conn.execute("SELECT thread_id FROM code_agent_threads").fetchall()
+    return thread_id
+
+
+def test_resume_reuses_stored_env_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """그사이 node 를 설치해 탐지 결과가 바뀌어도 --resume 의 system 은 첫 세션과 바이트 단위로 같다."""
+    (tmp_path / "ws").mkdir()
+    first = ScriptedChatModel(steps=[AIMessage(content="a")])
+    assert run_main(tmp_path, monkeypatch, ["--workspace", str(tmp_path / "ws")], "하이", "/exit",
+                    detected=ENV_A, model=first) == 0
+    thread_id = only_thread(tmp_path)
+    resumed = ScriptedChatModel(steps=[AIMessage(content="b")])  # 다시 탐지하면 detect 가 단언으로 실패한다
+    assert run_main(tmp_path, monkeypatch, ["--resume", thread_id], "또", "/exit", detected=None, model=resumed) == 0
+    assert ENV_A in first.calls[0][0].text  # deepagents 가 우리 프롬프트 뒤에 자기 절을 덧붙인다
+    assert resumed.calls[0][0].text == first.calls[0][0].text
+
+
+def test_old_thread_without_env_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """env 절이 생기기 전의 thread 를 이어 가면 절 없이(옛 system 과 같게) 쓰고 다시 탐지하지 않는다."""
+    (tmp_path / "ws").mkdir()
+    (tmp_path / "data").mkdir()
+    with sqlite3.connect(tmp_path / "data" / "sessions.db") as conn:  # 옛 버전이 만든 표와 행
+        conn.execute("CREATE TABLE code_agent_threads (thread_id TEXT PRIMARY KEY, workspace TEXT NOT NULL, "
+                     "created_at TEXT NOT NULL)")
+        conn.execute("INSERT INTO code_agent_threads VALUES ('old1', ?, 'then')", (str(tmp_path / "ws"),))
+    model = ScriptedChatModel(steps=[AIMessage(content="b")])
+    assert run_main(tmp_path, monkeypatch, ["--resume", "old1"], "또", "/exit", detected=None, model=model) == 0
+    assert "이 PC 의 도구" not in model.calls[0][0].text
+
+
+def test_new_command_reuses_env_text(tmp_path: Path) -> None:
+    app, _, _, _ = make_app(tmp_path, [], "/new", "/exit")
+    app.env_text = ENV_A
+    first = app.thread_id
+    app.run()
+    assert app.thread_id != first and app.sessions.env_text_of(app.thread_id) == ENV_A
+
+
+def test_new_after_old_thread_redetects(tmp_path: Path) -> None:
+    """절이 없던 옛 thread 를 이어 온 뒤 /new 하면, 다시 탐지한 절로 새 agent 를 만들어 새 thread 를 시작한다."""
+    app, _, _, _ = make_app(tmp_path, [], "/new", "새 질문", "/exit")
+    model = ScriptedChatModel(steps=[AIMessage(content="b")])
+    fresh = build_agent(app.settings, app.workspace, SqliteSaver(app.sessions.conn), model=model, env_text=ENV_A)
+    app.fresh_agent = lambda: (ENV_A, fresh)
+    app.run()
+    assert app.sessions.env_text_of(app.thread_id) == ENV_A
+    assert ENV_A in model.calls[0][0].text
+
+
+def test_old_process_can_still_insert_threads(tmp_path: Path) -> None:
+    """env 는 표를 따로 둬서 code_agent_threads 열이 그대로다. 아직 돌고 있는 옛 프로세스의 INSERT 가 깨지지 않는다."""
+    conn = sqlite3.connect(tmp_path / "s.db")
+    Sessions(conn).create(tmp_path, ENV_A)
+    conn.execute("INSERT INTO code_agent_threads VALUES (?, ?, ?)", ("old2", str(tmp_path), "now"))  # 옛 코드의 문장
+    assert Sessions(conn).env_text_of("old2") == ""

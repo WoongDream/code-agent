@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 from rich.console import Console
 from rich.markup import escape
@@ -21,8 +23,10 @@ from rich.syntax import Syntax
 
 from code_agent.agent import build_agent, run_turn
 from code_agent.approval import APPROVE, MODES, decide_all, reject
+from code_agent.backend import process_shell_env, resolve_shell, safe_which
+from code_agent.environment import probe, render
 from code_agent.render import Renderer, describe_action, todos_markup
-from code_agent.settings import Settings, load_settings
+from code_agent.settings import REPO_ROOT, Settings, load_settings
 from code_agent.stops import TurnStops
 from code_agent.tracing import Tracer, langfuse_installed, make_tracer
 from code_agent.usage import Usage, UsageCallback
@@ -46,22 +50,37 @@ _USAGE_COLUMNS = [(f.name, "REAL" if f.type == "float" else "INTEGER") for f in 
 
 
 class Sessions:
-    """sessions.db 에 체크포인트와 함께 thread → 작업 폴더를 남긴다. --resume 은 같은 작업 폴더로 이어 간다."""
+    """sessions.db 에 체크포인트와 함께 thread → 작업 폴더를 남긴다. --resume 은 같은 작업 폴더로 이어 간다.
+
+    thread 마다 시스템 프롬프트의 '이 PC 의 도구' 절(environment.render)도 남긴다. --resume 때 다시 탐지하면 그사이
+    설치한 도구 때문에 system 이 바뀌어 프롬프트 캐시와 Opus 5.5 의 보존된 thinking 이 깨지기 때문이다.
+    code_agent_threads 에 열을 더하지 않고 표를 따로 둔다. 열을 더하면 아직 돌고 있는 옛 프로세스의
+    'INSERT … VALUES (?, ?, ?)' 가 열 수가 맞지 않아 실패한다.
+    """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
         conn.execute("CREATE TABLE IF NOT EXISTS code_agent_threads "
                      "(thread_id TEXT PRIMARY KEY, workspace TEXT NOT NULL, created_at TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS code_agent_thread_env "
+                     "(thread_id TEXT PRIMARY KEY, env_text TEXT NOT NULL)")
         conn.execute(f"CREATE TABLE IF NOT EXISTS code_agent_usage (thread_id TEXT NOT NULL, at TEXT NOT NULL, "
                      f"{', '.join(f'{name} {kind} NOT NULL' for name, kind in _USAGE_COLUMNS)})")
         conn.commit()
 
-    def create(self, workspace: Path) -> str:
+    def create(self, workspace: Path, env_text: str = "") -> str:
         thread_id = uuid.uuid4().hex[:12]
         self.conn.execute("INSERT INTO code_agent_threads VALUES (?, ?, ?)",
                           (thread_id, str(workspace), datetime.now(UTC).isoformat()))
+        self.conn.execute("INSERT INTO code_agent_thread_env VALUES (?, ?)", (thread_id, env_text))
         self.conn.commit()
         return thread_id
+
+    def env_text_of(self, thread_id: str) -> str:
+        """저장한 '이 PC 의 도구' 절. 그 절이 생기기 전의 옛 thread 는 빈 문자열(옛 system 과 같게)."""
+        row = self.conn.execute("SELECT env_text FROM code_agent_thread_env WHERE thread_id = ?",
+                                (thread_id,)).fetchone()
+        return row[0] if row else ""
 
     def workspace_of(self, thread_id: str) -> Path | None:
         row = self.conn.execute("SELECT workspace FROM code_agent_threads WHERE thread_id = ?",
@@ -86,17 +105,22 @@ class Sessions:
 
 class App:
     def __init__(self, settings: Settings, workspace: Path, mode: str, sessions: Sessions, thread_id: str,
-                 console: Console, read_line: ReadLine, *, agent=None, tracer: Tracer | None = None) -> None:
+                 console: Console, read_line: ReadLine, *, agent=None, tracer: Tracer | None = None,
+                 env_text: str = "", fresh_agent: Callable[[], tuple[str, Any]] | None = None) -> None:
+        """env_text 는 agent 의 시스템 프롬프트에 들어간 '이 PC 의 도구' 절이다. /new 로 만드는 thread 에도 같은 것을 남긴다."""
         self.settings, self.workspace, self.mode = settings, workspace, mode
         self.sessions, self.thread_id = sessions, thread_id
         self.console, self.read_line = console, read_line
-        self.agent = agent if agent is not None else build_agent(settings, workspace, SqliteSaver(sessions.conn))
+        self.env_text = env_text
+        self.fresh_agent = fresh_agent  # (env_text, agent): 환경을 다시 탐지해 새로 만든 agent
+        self.agent = agent if agent is not None else build_agent(settings, workspace, SqliteSaver(sessions.conn),
+                                                                 env_text=env_text)
         self.tracer = tracer
         self.status_line = console.is_terminal and _interactive()  # 파이프·테스트(StringIO)에서는 상태 줄을 그리지 않는다
         self.full_thinking = False  # /thinking
 
     @property
-    def config(self) -> dict:
+    def config(self) -> RunnableConfig:
         return {"configurable": {"thread_id": self.thread_id}}
 
     def run(self) -> int:
@@ -140,7 +164,10 @@ class App:
         if name == "/help":
             self.console.print(HELP)
         elif name == "/new":
-            self.thread_id = self.sessions.create(self.workspace)
+            if not self.env_text and self.fresh_agent is not None:
+                # 절이 없던 옛 thread 를 이어 온 프로세스다. 새 thread 는 다시 탐지한 절과 그 system 으로 시작한다
+                self.env_text, self.agent = self.fresh_agent()
+            self.thread_id = self.sessions.create(self.workspace, self.env_text)
             self.console.print(f"새 세션 {self.thread_id}")
         elif name == "/mode":
             if arg not in MODES:
@@ -231,7 +258,11 @@ class App:
                 return reject(self.read_line("거부 이유(선택, Enter 로 건너뜀) › ").strip())
 
     def show_diff(self) -> None:
-        result = subprocess.run(["git", "diff"], cwd=self.workspace, capture_output=True, check=False)
+        git = safe_which("git", self.workspace)  # 이름만 주면 현재 폴더에 심은 git.exe 가 먼저 불릴 수 있다
+        if git is None:
+            self.console.print("[red]git 을 찾지 못했다.[/]")
+            return
+        result = subprocess.run([git, "diff"], cwd=self.workspace, capture_output=True, check=False)
         text = result.stdout.decode("utf-8", errors="replace")
         if result.returncode != 0:  # 저장소 밖이면 긴 usage 가 나오므로 첫 줄만 보인다
             first = result.stderr.decode("utf-8", errors="replace").strip().splitlines()[:1]
@@ -264,8 +295,25 @@ def _line_reader(history: Path) -> ReadLine:
 def _utf8_stdio() -> None:
     """파이프로 출력할 때 콘솔 코드페이지(cp949)로 한글이 깨지지 않게 한다."""
     for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
+        reconfigure = getattr(stream, "reconfigure", None)  # TextIO 타입에는 없다. 실제 콘솔은 TextIOWrapper 다
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
+
+
+def repo_warning(workspace: Path) -> str | None:
+    """작업 폴더가 code-agent 저장소(실제 키가 든 .env 가 있다)이거나 그것을 품은 폴더면 경고 문구."""
+    root = REPO_ROOT.resolve()
+    if not (root / ".env").is_file() or not root.is_relative_to(workspace.resolve()):
+        return None
+    where = "code-agent 저장소" if root == workspace.resolve() else "code-agent 저장소를 품은 폴더"
+    return f"작업 폴더가 {where}다. 실제 키가 든 .env 가 있다. 다른 폴더를 -w 로 지정하라."
+
+
+def _confirm(prompt: str) -> bool:
+    """대화형이면 y/N 을 묻는다. 파이프 입력이면 첫 요청을 먹어 버리므로 묻지 않고 진행한다."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return True
+    return input(prompt).strip().lower() in ("y", "yes", "ㅛ")
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -278,6 +326,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if sys.platform == "win32":
+        # 이것이 없으면 shutil.which 가 현재 폴더를 먼저 찾아, 악성 저장소 폴더에서 띄우기만 해도 그 안의 git.cmd 등이
+        # 불릴 수 있다. Python 3.12+ 의 which 는 이 변수를 따른다. 셸 백엔드도 이 환경을 물려받는다
+        os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
     _utf8_stdio()
     args = parse_args(argv)
     console = Console(highlight=False)
@@ -306,16 +358,35 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if workspace in (Path.home(), Path(workspace.anchor)):
         console.print(f"[yellow]주의: 작업 폴더가 {escape(str(workspace))} 다. 파일 도구가 이 폴더 전체에 접근한다.[/]")
+    if warning := repo_warning(workspace):
+        console.print(f"[bold yellow]주의: {escape(warning)}[/]")
+        # -w 를 빼먹어 저장소 폴더에서 띄운 경우가 많아 한 번 확인한다. 명시했거나 이어 가는 세션이면 묻지 않는다
+        if not args.workspace and not args.resume and not _confirm("그래도 이 폴더에서 시작할까? [y/N] › "):
+            console.print("[dim]시작하지 않았다. 작업할 폴더를 -w 로 지정하라.[/]")
+            return 2
 
     try:
-        agent = build_agent(settings, workspace, SqliteSaver(sessions.conn))
-    except (RuntimeError, ValueError) as e:  # API 키 미설정, 모델 이름 오류 등
+        # --resume 은 그 thread 에 저장한 절을 그대로 쓴다(다시 탐지하면 system 이 바뀔 수 있다)
+        env_text = sessions.env_text_of(args.resume) if args.resume else detect_environment(settings.shell, workspace)
+        agent = build_agent(settings, workspace, SqliteSaver(sessions.conn), env_text=env_text)
+    except (RuntimeError, ValueError) as e:  # API 키 미설정, 모델 이름 오류, Git Bash 없음 등
         console.print(f"[red]{escape(str(e))}[/]")
         return 2
     if settings.langfuse_enabled and not langfuse_installed():
         console.print("[dim]Langfuse 키가 있지만 패키지가 없어 트레이스를 끈다. 켜려면: uv sync --extra langfuse[/]")
     tracer = make_tracer(settings)
-    thread_id = args.resume or sessions.create(workspace)  # 시작에 성공한 뒤에만 세션을 남긴다
+    thread_id = args.resume or sessions.create(workspace, env_text)  # 시작에 성공한 뒤에만 세션을 남긴다
+    def fresh_agent() -> tuple[str, Any]:
+        text = detect_environment(settings.shell, workspace)
+        return text, build_agent(settings, workspace, SqliteSaver(sessions.conn), env_text=text)
+
     app = App(settings, workspace, args.mode, sessions, thread_id, console,
-              _line_reader(settings.data_dir / "history"), agent=agent, tracer=tracer)
+              _line_reader(settings.data_dir / "history"), agent=agent, tracer=tracer, env_text=env_text,
+              fresh_agent=fresh_agent)
     return app.run()
+
+
+def detect_environment(shell_preference: str, workspace: Path | None = None) -> str:
+    """셸 백엔드가 쓸 환경(process_shell_env)으로 도구를 확인해 '이 PC 의 도구' 절을 만든다. 약 1초 걸린다."""
+    shell = resolve_shell(shell_preference, workspace)[0]
+    return render(probe(process_shell_env(), workspace=workspace), shell)

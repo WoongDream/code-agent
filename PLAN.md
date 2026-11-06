@@ -492,10 +492,11 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - #6(개선 2)을 merge로 합쳤다(b513c3e). 두 기능이 만나는 곳은 시험 1개로 확인한다: 잘린 호출이 '작성 중'에서 '실행 중'으로 가지 않고, 막음 줄과 복구 안내 뒤 '생각 중'으로 간다. 합친 뒤 전체 246개다.
 - **리뷰 반영** (session2): 시험을 8개 더해 전체 254개다.
   - **B1**: 요약 미들웨어를 직접 만들면 `trim_tokens_to_summarize`가 생성자 기본값 4,000이 된다. 그러면 버릴 기록(약 15만 토큰) 중 마지막 4K만 요약기에 들어간다. deepagents 팩토리처럼 `None`을 넘긴다.
-  - **B2**: `wrap_model_call`이 결과의 세 모양(ModelResponse, AIMessage, ExtendedModelResponse)을 모두 다룬다. `awrap_model_call`도 같은 로직으로 구현했다.
-    - **[V]** langchain 1.4.7의 `compose_two`(factory.py:344-355)는 바깥 미들웨어에 넘기는 `inner_handler`에서 Extended를 풀고 AIMessage를 ModelResponse로 바꾼다.
-    - 그래서 `create_agent` 안에서는 우리가 늘 ModelResponse를 받는다. Skills를 켜도 AttributeError는 나지 않는다(실제 에이전트 시험이 수정 전에도 통과했다).
-    - 이 처리는 직접 호출이나 다른 버전에 대비한 방어다. 세 모양을 직접 넣는 시험은 수정 전 코드로 돌리면 실패한다.
+  - **B2 — 방어용 수정(리뷰 오판 정정)**: 실제 버그가 아니었다. 리뷰는 직접 호출로 확인해 "Skills를 켜면 AttributeError"라고 보았고, session2가 정정했다.
+    - `wrap_model_call`이 결과의 세 모양(ModelResponse, AIMessage, ExtendedModelResponse)을 모두 다루고, `awrap_model_call`도 같은 로직으로 구현했다.
+    - **[V]** langchain 1.4.7의 `compose_two`(factory.py:340-355)는 바깥 미들웨어에 넘기는 `inner_handler`에서 Extended를 풀고 AIMessage를 ModelResponse로 바꾼다.
+    - 그래서 `create_agent` 안에서는 우리가 늘 ModelResponse를 받는다(실제 에이전트 시험이 수정 전에도 통과했다).
+    - 이 처리는 직접 호출과 향후 변경에 대비한 방어다. 세 모양을 직접 넣는 시험은 수정 전 코드로 돌리면 실패한다.
   - **K3**: 잘린 호출이 이미 `invalid_tool_calls`로 왔으면 앞의 완결된 호출을 막지 않는다.
   - **M1**: `CODE_AGENT_CONTEXT_TOKENS`는 ASCII 십진수만 받는다. "²"나 전각 숫자도 우리 문구의 오류를 낸다.
   - az-quiz 첫 호출 시간을 Langfuse 실측 658초(약 11분)로 고쳤다. 전에는 "약 15분"이라고 적었다.
@@ -505,6 +506,65 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
     - 정리 대상이 아닌 응답에도 생기므로 별도 과제다.
   - OpenRouter 경로에서 요약이 남긴 메시지의 `reasoning_details`(사양 1절)
   - Anthropic 직결 실측(키 없음)
+
+#### 개선 4 — 실행 환경 탐지와 셸 venv 분리 (2026-11-06, 사양 `code-agent-specs/task4-runtime-env.md`, 결정 (b))
+- **근거** (session2 실측)
+  - 셸이 code-agent 자신의 venv를 물려받았다. `VIRTUAL_ENV`, `UV`, `UV_RUN_RECURSION_DEPTH`가 그대로 넘어갔고, PATH 맨 앞이 `…\code-agent\.venv\Scripts`였다.
+  - 그래서 에이전트의 `python`은 deepagents가 깔린 도구 venv였다(az-quiz의 `which python`). `pip install`을 하면 code-agent 환경이 오염된다.
+  - 에이전트는 없는 도구(node 등)를 매번 명령으로 확인했다.
+- **셸 env** (`backend.shell_env`)
+  - 도구 venv 변수(`VIRTUAL_ENV`, `UV`, `UV_RUN_RECURSION_DEPTH`, `PYTHONHOME`)와, venv에서 돌 때 PATH의 `<sys.prefix>\Scripts`를 뺀다.
+  - 그 뒤 `python`이 없거나 WindowsApps 스토어 스텁(크기 0인 실행 별칭)이면 `uv python find`의 인터프리터 폴더를 PATH 맨 앞에 붙인다. 이때 cwd는 임시 폴더, env는 정리한 것, 제한 시간은 5초다. uv가 없거나 실패하면 붙이지 않는다.
+  - 그 인터프리터는 PEP 668 표식이 있어 `pip install`이 거부된다(실측). 그래서 base도 오염되지 않는다.
+  - 프로세스당 한 번만 계산한다(`process_shell_env`). 셸 백엔드와 환경 탐지가 같은 것을 쓴다.
+  - 실측: 에이전트의 Git Bash에서 `which python`이 `/c/Users/SDS/AppData/Roaming/uv/python/cpython-3.13-windows-x86_64-none/python`이었다. `sys.prefix == sys.base_prefix`이고, `VIRTUAL_ENV`는 비었고, `pip install`은 PEP 668로 거부됐다.
+- **탐지** (`environment.probe`, `render`)
+  - 셸에 넘기는 env의 PATH로 python, uv, git, node, npm, deno, py, pwsh, powershell을 찾는다. 스토어 스텁은 없음으로 본다.
+  - 버전은 `ThreadPoolExecutor(4)`로 병렬로 `--version`을 돌려(하나당 3초) 숫자만 남긴다. 실패하면 "(버전 확인 실패)"로 적고 있는 것으로 친다.
+  - PowerShell은 레지스트리 `PowerShellVersion`을 major.minor로 쓴다.
+  - 브라우저는 App Paths(HKLM, HKCU) → ProgramFiles, ProgramFiles(x86), LOCALAPPDATA의 고정 경로 순으로 찾는다. 경로는 셸 형식(bash `/c/…`, powershell `C:\…`, 공백이 있으면 따옴표)으로 바꾼다.
+  - 결과는 결정적이다. 항목 순서가 고정이고 시각이나 소요 시간이 없다.
+  - 이 PC에서 실제로 렌더된 절(bash):
+    ```
+    # 이 PC 의 도구 (세션 시작 때 확인했다)
+    - 있음: python 3.13.18(패키지 없는 uv 관리 인터프리터), uv 0.13.7, git 2.56.0, Windows PowerShell 5.1
+    - 브라우저: Chrome "/c/Program Files/Google/Chrome/Application/chrome.exe", Edge "/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" (headless 로 HTML 을 확인할 수 있다)
+    - 없음: node, npm, deno, py, pwsh
+    - 없는 도구를 확인하려고 명령을 다시 실행하지 않는다. 꼭 필요하면 설치하지 말고 사용자에게 묻는다.
+    ```
+  - 시작 지연은 0.95~0.99초다(새 프로세스 3회, `detect_environment` 전체). 셸 env 0.41초와 병렬 탐지 0.62초다.
+- **스레드에 고정** (`cli.Sessions`)
+  - 탐지 텍스트를 thread와 함께 저장하고, `--resume`은 다시 탐지하지 않고 저장한 것을 쓴다. 그사이 도구를 설치해 system이 바뀌면 캐시와 Opus 5.5의 보존된 thinking이 깨지기 때문이다.
+  - 그 절이 없던 옛 thread는 빈 절로 둔다(옛 system과 같게). `/new`는 같은 프로세스의 텍스트를 쓴다.
+  - 사양은 `code_agent_threads`에 `env_text` 열을 ALTER로 더하는 것이었다. 대신 **표를 따로 두었다**(`code_agent_thread_env`). 열을 더하면 아직 돌고 있는 옛 프로세스의 `INSERT … VALUES (?, ?, ?)`가 열 수가 맞지 않아 `/new`에서 실패한다. 이것도 시험으로 확인한다.
+- **함께 고친 것**
+  - PowerShell 앞머리에 `$ProgressPreference = 'SilentlyContinue'`를 더했다. PS 5.1의 진행률 CLIXML이 stderr에 섞이는 것으로 보이는 간헐 실패 때문이다.
+  - `test_stderr_is_prefixed`의 단언 메시지에 출력을 넣었다.
+  - #7 리뷰 정정을 반영했다. `_hold_in`의 근거와 위 B2를 '방어용 수정(리뷰 오판 정정)'으로 고쳤다.
+- **시험**: 전체 270개가 통과한다(+16).
+  - `test_environment.py` 7개: 있음·없음, 스토어 스텁, 버전 시간 초과, 브라우저 경로 형식 2개, 고정 경로 브라우저, 결정적 출력
+  - `test_backend.py` 4개: 도구 venv 제거, 스텁이면 uv python을 앞에, uv 없음, PS 진행률
+  - `test_cli.py` 4개
+    - resume의 system이 바이트 단위로 같고 다시 탐지하지 않음
+    - 옛 thread는 절 없음
+    - `/new`가 텍스트를 재사용
+    - 옛 프로세스의 INSERT 호환
+  - `test_agent.py` 1개: system에 env 절이 있음. 기존 시험에 '절 없음' 단언도 더했다.
+  - resume이 다시 탐지하게 바꾸면 resume 시험 2개가 실패하는 것을 확인했다.
+- **리뷰 반영** (c2a04d1)
+  - **환경 탐지도 심은 실행 파일을 고르지 않는다** (`environment.trusted_tool`)
+    - Windows의 `which`는 `NoDefaultCurrentDirectoryInExePath`가 없으면 PATH를 주어도 현재 폴더를 먼저 찾는다. 그래서 `probe`가 저장소의 `node.cmd`를 `--version`으로 실행할 수 있었다(리뷰 재현).
+    - 상대 경로이거나 현재 폴더·작업 폴더 **안**인 결과를 버린다. direnv처럼 저장소 안 폴더를 PATH에 넣는 경우도 막으려고 '바로 아래'가 아니라 '안'을 본다.
+    - 드라이브 루트나 홈을 품은 폴더는 기준에서 뺀다. 홈에서 띄우면 `~\.local\bin\uv.exe`까지 버리게 되기 때문이다.
+    - `probe(workspace=…)`, `uv_python_find`, `shell_env`의 python 판정이 이것을 쓴다. #9의 `safe_which`도 merge 때 이것으로 통일했다.
+  - 절이 없던 옛 thread를 이어 온 뒤 `/new` 하면 다시 탐지한 절로 agent를 새로 만든다(`App.fresh_agent`). system은 agent를 만들 때 고정되기 때문이다.
+  - README: 활성화한 venv 안에 설치해 실행하면 그 venv도 에이전트 셸에서 빠진다.
+- **통합** (사용자가 #8 하나만 병합하면 #5~#10이 모두 들어간다)
+  - #9 merge(e55f40f): agent.py middleware 목록, backend.py(`process_shell_env`와 `system32`·`safe_which`·`find_git_bash(workspace)`를 함께 둠), cli.py import
+  - #10 merge(a8ea2e0): models.py(dict 전달 + `MAX_TOKENS`), render.py(#6의 `_ai_text`와 `Mapping` 인자)
+    - 병합한 코드에 pyright를 돌려 새 오류 2개를 고쳤다(`_pending` 키의 None, `Sequence[BaseMessage]`).
+  - `test_powershell_progress_suppressed`를 추가했다. 다만 이 PC에서는 설정이 없어도 CLIXML이 재현되지 않았다. 그래서 수정의 증거가 아니라 출력 모양을 지키는 안전망이다.
+  - ruff 통과, pyright 0, 전체 352개 통과
 
 ### 4단계 — 평가·확장 (선택)
 - `evals/`: 수정 과제 5~10개(fixture 저장소와 숨김 검증 테스트)를 헤드리스로 돌려 통과율, 비용, 시간을 집계한다. `pjt\Day04\coding_skills\verify_agent.py` 패턴을 참고한다.
@@ -536,9 +596,45 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
 | `permissions`가 셸 백엔드와 충돌한다(0단계에서 확인) | `.env` 차단을 `wrap_tool_call` 미들웨어(`DotenvGuardMiddleware`)로 구현 |
 | Opus 5.5 preserved thinking: 요약 미들웨어가 이력을 바꾸면 thinking 블록 검증에서 400이 날 수 있다 | 긴 세션 테스트로 확인하고, 문제가 생기면 요약 트리거와 모델 설정을 조정 |
 | 0.7.14 분석 문서와 0.7.32의 차이 | 0단계 3에서 설치된 소스 기준으로 확인 |
+| `.env`·작업 폴더 밖·개인 키를 사람에게 묻지 않고 읽는 우회(보안 점검 S1~S5, S12, S13) | 아래 "보안 1차"(2026-11-06) |
+| 현재 폴더에 심은 실행 파일(git.cmd 등)이 승인 없이 불림 | 아래 "보안 1차"(2026-11-06) |
+
+### 보안 1차 (2026-11-06, 사양 `code-agent-specs/security-review.md`)
+- **기준**: session2가 가짜 비밀값(DUMMY)과 임시 폴더로 실측한 우회 사례다. 모든 사례를 회귀 시험(`test_security.py`)으로 넣었다.
+  - main의 원래 코드로 돌리면 우회 사례가 모두 실패하는 것을 확인했다. 통과하는 것은 수정 전후 모두 통과해야 하는 대조 사례뿐이다.
+- **S1 파일 도구 `.env` 가드** (`guards.py`)
+  - Windows는 대소문자, 끝 공백·점(`.env `), 스트림(`.env::$DATA`), 8.3 짧은 이름(`ENV~1`)을 같은 파일로 연다.
+  - 대응 1: 이름을 정규화한다(`file_name`: casefold, `:` 뒤 제거, 끝 공백·점 제거). `.env.Example` 같은 견본은 그대로 허용한다.
+  - 대응 2: `DotenvGuardMiddleware(workspace)`가 실제 파일의 긴 이름(`Path.resolve`)으로 다시 판정한다. 이 PC에서 `ENV~1`, `.ENV`, `.env `, `.env::$DATA`, `.env.`가 모두 `.env`로 풀리는 것을 확인했다.
+  - 대상이 없는 쓰기는 8.3 모양 이름(`~숫자`)이면 보수적으로 막는다.
+- **S2 셸 자동 승인의 `.env`**: `re.IGNORECASE`를 붙이고, 8.3 모양 인자(`~숫자`)가 있으면 묻는다. git 인자(`HEAD~1`, `HEAD:path`)는 리비전이라 제외한다.
+- **S3 옵션 값**: `--opt=값`의 값도 경로로 검사한다. `files0-from`이 들어간 인자는 무조건 묻는다. `wc --files0-from=F`는 F의 내용을 오류 메시지로 내보낸다.
+- **S4·S13 PowerShell 공급자 경로·드라이브**: `::`(`FileSystem::C:\…`)나 `이름:`(`env:`, `HKCU:`, `Cert:`, `Variable:`)으로 시작하는 인자는 작업 폴더 밖으로 본다.
+- **S5 유니코드**
+  - 둥근 따옴표(‘ ’ ‚ ‛ “ ” „)와 긴 대시(– — ―)는 판정 전에 ASCII로 바꾼다. PowerShell은 이것들을 따옴표와 `-`로 읽는다.
+  - 비ASCII 제어·서식·공백 문자(bidi, 폭 없는 문자, NBSP 등)가 있으면 묻는다.
+- **S12**: `tail -f`, `-F`, `--follow`(묶은 `-fn5` 포함)는 묻는다. 셸 제한 시간 120초까지 돌아오지 않는다.
+- **개인 키·자격 증명 읽기는 묻기**(사용자 결정)
+  - 대상: `id_rsa`·`id_ed25519` 등(`.pub` 제외), `*.pem`/`*.key`/`*.p12`/`*.pfx`, `credentials*.json`, `*service-account*.json`, `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, `.aws/credentials`, `secrets.*`
+  - 파일 도구: 가드가 HITL과 같은 모양으로 `interrupt`를 일으킨다. 그래서 CLI의 승인 흐름이 그대로 묻는다. manual·auto-edit는 묻고, yolo는 자동이다. 거부하면 내용이 모델에 가지 않는다.
+  - 셸: 같은 이름이 인자에 있으면 자동 승인하지 않는다.
+- **현재 폴더의 실행 파일 가로채기** (PR #8 리뷰에서 발견, main에도 있던 경로)
+  - Windows의 `shutil.which`는 `NoDefaultCurrentDirectoryInExePath`가 없으면 현재 폴더를 먼저 찾는다. 그래서 악성 저장소 폴더에서 띄우기만 해도 그 안의 `git.cmd`나 `bin/bash.exe`가 에이전트 셸이 될 수 있었다.
+  - `cli.main` 맨 앞에서 그 변수를 `1`로 정한다.
+  - `safe_which`는 현재 폴더·작업 폴더 안이거나 절대 경로가 아닌 결과를 버린다. `find_git_bash`와 `/diff`의 git이 이것을 쓴다.
+  - `powershell.exe`와 `taskkill`은 `%SystemRoot%\System32` 절대 경로로 부른다.
+  - 시험은 그 변수를 지우고 임시 폴더로 chdir한 뒤 빈 `git.cmd`·`bin/bash.exe`를 둔다(실행하지 않고 존재만 본다). which가 실제로 그것을 먼저 고르는지도 확인한다.
+- **O4 저장소 폴더에서 띄움**(task12-onboarding.md)
+  - 작업 폴더가 code-agent 저장소(실제 키가 든 `.env`가 있다)이거나 그것을 품은 폴더면 시작할 때 경고한다.
+  - `-w`를 빼먹었고, 이어 가는 세션이 아니고, 대화형이면 `[y/N]`으로 한 번 확인한다. 기본은 시작하지 않는 것이다.
+  - 파이프 입력이면 첫 요청을 먹어 버리므로 묻지 않는다. `-w`를 명시했으면 경고만 한다.
+- **이번에 하지 않은 것**: S6~S11. S6의 package.json 등은 넣지 않기로 했고(사용자 결정), S11 AGENTS.md 신뢰 확인은 task8에서 한다.
 
 ## 6. 검증 방법
 1. `uv run ruff check . && uv run pytest -q`: 모델 호출 없이 백엔드, 승인, 에이전트 배선을 검증한다.
+   - CI(2026-11-06, `.github/workflows/ci.yml`): windows-latest에서 uv 0.13.7로 `uv sync --frozen --all-extras` 뒤 ruff, pyright(src와 scripts), pytest를 돌린다.
+   - pyright 1.1.414(`pyright[nodejs]`, Node가 없어도 돈다)는 1단계 게이트다. main 기준 오류 17개(src 12, scripts 5)를 고쳐 0으로 했다. tests는 2단계에서 넣는다.
+   - 로컬에서는 공유 .venv를 건드리지 않게 `uvx --from "pyright[nodejs]==1.1.414" pyright --pythonpath <.venv의 python>`으로 돌렸다.
 2. 수동 E2E(실제 API 사용, 모델 호출 약 10~30회):
    ```
    uv run code-agent --workspace <buggy_repo 복사본>

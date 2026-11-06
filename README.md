@@ -27,6 +27,8 @@ uv run code-agent --resume <세션 ID>
 - 응답이 출력 한도(64,000토큰, 생각 포함)에 걸려 잘렸거나 공급자 오류로 끊겼는데 도구 호출이 없으면, 턴을 끝내지 않고 한 번 다시 요청한다(턴당 1번). 이때 잘린 응답의 생각은 기록에서 빼서 이후 호출이 다시 보내지 않는다. 그래도 멈췄거나, 컨텍스트 창이 찼거나, 예산 상한(모델 100회·도구 300회)에 걸리면 턴 끝에 노란 경고를 보인다. '계속해줘'로 이어 갈 수 있다.
 - 대화가 입력 컨텍스트 상한(기본 200,000토큰, `CODE_AGENT_CONTEXT_TOKENS` 로 20,000~1,000,000)의 85% 에 이르면 요약한다. 그 전에는 기록을 고치지 않는다(옛 도구 인자도 자르지 않는다). 프롬프트 캐시와 Opus 5.5 의 보존된 생각을 깨지 않기 위해서다.
 - 세션과 큰 도구 결과는 `~/.code-agent/`(`sessions.db`, `artifacts/`)에 저장해 작업 폴더를 더럽히지 않는다.
+- 셸은 code-agent 자신의 venv 를 물려받지 않는다(`VIRTUAL_ENV`, `UV` 등과 venv 의 `Scripts` 를 뺀다). 활성화한 venv 안에 code-agent 를 설치해 실행하면 그 venv 도 에이전트 셸에서 빠진다. `python` 이 없거나 Windows 스토어 스텁이면 `uv python find` 의 인터프리터를 쓴다. 이 인터프리터는 PEP 668 표식이 있어 `pip install` 이 막힌다.
+- 시작할 때 셸이 쓸 PATH 로 도구·버전·브라우저(python, uv, git, node, npm, deno, py, pwsh, PowerShell, Chrome, Edge)를 확인해 시스템 프롬프트에 적는다(약 1초). 이 내용은 세션마다 저장하고 `--resume` 은 다시 확인하지 않고 그것을 쓴다. 바뀌면 프롬프트 캐시와 이전 생각이 깨지기 때문이다.
 
 ## Langfuse 트레이스 (선택)
 
@@ -47,5 +49,12 @@ uv sync --extra openrouter --extra langfuse
 ## 시험
 
 ```
-uv run ruff check . && uv run pytest -q    # 모델 호출 없음
+uv run ruff check . && uv run pyright && uv run pytest -q    # 모델 호출 없음. CI(windows-latest)도 같다
 ```
+
+## 보안 메모
+
+- `.env` 는 이름 변형(대소문자, 끝 공백·점, `::$DATA`, 8.3 짧은 이름 `ENV~1`)까지 파일 도구가 막는다. 셸의 자동 승인도 이런 변형, 작업 폴더 밖(PowerShell 공급자 경로 `FileSystem::`, `env:`, `HKCU:` 포함), `--opt=경로`, 둥근 따옴표, `tail -f` 가 들어가면 묻는다.
+- 개인 키·자격 증명 파일(`id_rsa`, `*.pem`, `credentials*.json`, `.netrc` 등) 읽기는 manual·auto-edit 에서 묻는다.
+- 현재 폴더에 있는 같은 이름의 실행 파일(`git.cmd` 등)은 고르지 않는다. 낯선 저장소 폴더에서 띄워도 그 안의 실행 파일이 에이전트 셸이 되지 않는다.
+- 작업 폴더가 code-agent 저장소 자신(실제 키가 든 `.env`)이거나 그 상위 폴더면 시작할 때 경고한다. `-w` 를 빼먹었으면 시작할지 한 번 묻는다.

@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import re
 import shlex
+import unicodedata
 from collections.abc import Callable, Iterable
+
+from code_agent.guards import SHORT_NAME, is_sensitive_path
 
 MODES = ("manual", "auto-edit", "yolo")
 FILE_TOOLS = frozenset({"write_file", "edit_file", "delete"})
@@ -22,22 +25,40 @@ READ_ONLY = frozenset({"ls", "pwd", "cat", "head", "tail", "wc", "which"})
 READ_ONLY_GIT = frozenset({"status", "diff", "log", "show"})
 _PRINTS_CONTENT = frozenset({"cat", "head", "tail"})
 _SHELL_META = re.compile(r"[;&|<>`$(){}\n\r]")  # 연결·파이프·리디렉션·치환·변수 확장
-_ENV_FILE = re.compile(r"(^|[/:])\.env")  # .env, sub/.env, .env.local, HEAD:.env
+_ENV_FILE = re.compile(r"(^|[/:])\.env", re.IGNORECASE)  # .env, .ENV, sub/.env, .env.local, HEAD:.env
 _DRIVE = re.compile(r"^[A-Za-z]:")
+# PowerShell 공급자 경로(FileSystem::C:\…)와 드라이브(env:, HKCU:, Cert:, Variable:, C:). 작업 폴더 밖으로 본다
+_PROVIDER = re.compile(r"::|^[A-Za-z][\w.]*:")
+# PowerShell 은 둥근 따옴표를 따옴표로, 긴 대시를 '-' 로 읽는다. shlex 는 글자로 보므로 판정 전에 맞춘다
+_PS_QUOTES = str.maketrans({"\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+                            "\u201c": '"', "\u201d": '"', "\u201e": '"',
+                            "\u2013": "-", "\u2014": "-", "\u2015": "-"})
+
+
+def _hidden_chars(command: str) -> bool:
+    """제어·서식(bidi, 폭 없는 문자)·비ASCII 공백. 셸마다 다르게 읽을 수 있어 묻는다."""
+    return any(not ch.isascii() and unicodedata.category(ch) in ("Cc", "Cf", "Zs", "Zl", "Zp") for ch in command)
+
+
+def _follows(arg: str) -> bool:
+    """tail -f·-F·--follow 는 셸 제한 시간(120초)까지 돌아오지 않는다."""
+    return arg.startswith("--follow") or (arg.startswith("-") and not arg.startswith("--")
+                                          and any(c in arg[1:] for c in "fF"))
 
 
 def is_read_only_command(command: str) -> bool:
-    if not command.strip() or _SHELL_META.search(command):
+    if not command.strip() or _SHELL_META.search(command) or _hidden_chars(command):
         return False
     try:
         # 역슬래시를 / 로 바꿔 PowerShell 의 ..\ 경로도 같은 규칙으로 검사한다.
-        tokens = shlex.split(command.replace("\\", "/"))
+        tokens = shlex.split(command.translate(_PS_QUOTES).replace("\\", "/"))
     except ValueError:
         return False
     if not tokens:
         return False
     head, args = tokens[0], tokens[1:]
-    if head == "git":
+    git = head == "git"
+    if git:
         # 하위 명령이 바로 와야 한다. git -c core.fsmonitor=... status 같은 전역 옵션은 명령을 실행할 수 있다.
         if not args or args[0] not in READ_ONLY_GIT:
             return False
@@ -48,14 +69,26 @@ def is_read_only_command(command: str) -> bool:
         return False
     if head in _PRINTS_CONTENT and any(ch in a for a in args for ch in "*?["):
         return False  # 와일드카드는 .env 를 포함할 수 있다
-    return all(_inside_workspace(a) for a in args)
+    if head == "tail" and any(_follows(a) for a in args):
+        return False
+    if any("files0-from" in a for a in args):
+        return False  # wc --files0-from=F 는 F 의 내용을 파일 이름으로 읽어 오류 메시지로 내보낸다
+    return all(_inside_workspace(a, git=git) for a in args)
 
 
-def _inside_workspace(arg: str) -> bool:
-    """작업 폴더 밖이나 .env 를 가리키는 인자는 읽기라도 사람에게 묻는다."""
+def _inside_workspace(arg: str, *, git: bool = False) -> bool:
+    """작업 폴더 밖·.env·개인 키를 가리키는 인자는 읽기라도 사람에게 묻는다. --opt=값 의 값도 경로로 본다."""
+    values = [arg, arg.split("=", 1)[1]] if arg.startswith("-") and "=" in arg else [arg]
+    return all(_safe_path(v, git=git) for v in values)
+
+
+def _safe_path(arg: str, *, git: bool) -> bool:
     if arg.startswith(("/", "~")) or _DRIVE.match(arg) or ".." in arg.split("/"):
         return False
-    return not _ENV_FILE.search(arg)
+    if _ENV_FILE.search(arg) or any(is_sensitive_path(part) for part in arg.split(":") if part):
+        return False
+    # git 인자의 HEAD~1, HEAD:path 는 리비전이라 셸 경로 규칙(8.3 이름·공급자 경로)을 적용하지 않는다
+    return git or not (_PROVIDER.search(arg) or SHORT_NAME.search(arg))
 
 
 def touches_git_dir(path: str) -> bool:

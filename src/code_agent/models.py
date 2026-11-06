@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from langchain_core.language_models import BaseChatModel, ModelProfile
+from pydantic import SecretStr
 
 from code_agent.settings import Settings
 
@@ -46,11 +49,13 @@ def _anthropic(settings: Settings, name: str) -> BaseChatModel:
 
     if not settings.anthropic_api_key:
         raise RuntimeError("ANTHROPIC_API_KEY 가 미설정입니다. .env.example 을 .env 로 복사해 직접 채우세요.")
-    return ChatAnthropic(
-        model=name, api_key=settings.anthropic_api_key, base_url=_API_URL,
-        reasoning_effort=settings.effort, max_tokens=MAX_TOKENS, streaming=True,
-        timeout=_TIMEOUT_S, max_retries=2,
-    )
+    # 필드 별칭(model, max_tokens 등)을 pyright 가 모르므로 키워드를 모아서 넘긴다
+    params: dict[str, Any] = {
+        "model": name, "api_key": settings.anthropic_api_key, "base_url": _API_URL,
+        "reasoning_effort": settings.effort, "max_tokens": MAX_TOKENS, "streaming": True,
+        "timeout": _TIMEOUT_S, "max_retries": 2,
+    }
+    return ChatAnthropic(**params)
 
 
 def _openrouter(settings: Settings, name: str) -> BaseChatModel:
@@ -65,7 +70,7 @@ def _openrouter(settings: Settings, name: str) -> BaseChatModel:
     if not settings.openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY 가 미설정입니다. .env.example 을 .env 로 복사해 직접 채우세요.")
     return ChatOpenRouter(
-        model=name, api_key=settings.openrouter_api_key, reasoning={"effort": _OPENROUTER_EFFORT.get(settings.effort,
+        model=name, api_key=SecretStr(settings.openrouter_api_key), reasoning={"effort": _OPENROUTER_EFFORT.get(settings.effort,
                                                                                                   settings.effort)},
         max_tokens=MAX_TOKENS, streaming=True, max_retries=2, timeout=round(_TIMEOUT_S * 1000),
     )

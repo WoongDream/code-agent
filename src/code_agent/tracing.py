@@ -94,9 +94,13 @@ class LangfuseTurn:
         self.before = snapshot(workspace) if workspace is not None else None
         self.context = context  # 작업 폴더와 이전 턴 요약. 평가기는 시스템 프롬프트와 이전 턴을 보지 못한다
         self.worklog = WorkLog()
+        self.prompt_migrated = False  # resume 때 프롬프트가 바뀌어 옛 생각을 요청에서 뺐는지(resume_compat)
 
     def on_part(self, part: tuple) -> None:
         self.worklog.on_part(part)
+        _ns, mode, data = part
+        if mode == "custom" and isinstance(data, dict) and data.get("type") == "prompt_migrated":
+            self.prompt_migrated = self.prompt_migrated or data.get("reason") == "prompt"  # 모델만 바뀐 것은 빼지 않는다
 
     def decision(self, action: dict, decision: dict, auto: bool) -> None:
         self.worklog.decision(action, decision, auto)
@@ -121,9 +125,12 @@ class LangfuseTurn:
             changes, diff = None, ""  # 파일이 너무 많아 스냅샷을 건너뛰었다
         else:
             changes, diff = diff_snapshots(self.before, after)
+        metadata: dict[str, Any] = {"usage": asdict(usage)}
+        if self.prompt_migrated:
+            metadata["prompt_migrated"] = True
         fields: dict[str, Any] = {"output": self.worklog.render(answer=output, changes=changes, diff=diff,
                                                              context=self.context, warnings=warnings),
-                                  "metadata": {"usage": asdict(usage)}}
+                                  "metadata": metadata}
         if error:
             fields.update(level="ERROR", status_message=error)
         elif warnings:

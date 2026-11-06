@@ -42,13 +42,16 @@ from code_agent.models import MAX_TOKENS
 STOP_LENGTH = frozenset({"length", "max_tokens"})  # 정리, 1회 복구, 경고
 STOP_ERROR = frozenset({"error"})  # OpenRouter: choices 가 있는 오류 청크는 예외 없이 이 값으로 끝난다. 정리, 1회 복구
 STOP_CONTEXT = frozenset({"model_context_window_exceeded"})  # Anthropic. 다시 불러도 같으므로 정리만 한다
-RECOVERY_PROMPT = "직전 응답이 출력 한도로 잘렸다. 생각을 줄이고 결과물은 파일에 나눠서 바로 써라."  # 생각만 하다 잘렸다
+# 생각만 하다 잘렸다. "생각을 줄여라"는 지킬 수 없는 말이라(Opus 5.5 는 effort 로만 조절) 행동으로 지시한다(task11 D6)
+RECOVERY_PROMPT = ("직전 응답이 출력 한도(생각 포함)로 잘려 결과물이 없다. 계획을 다시 세우지 말고 바로 write_file 호출로 "
+                   "결과물의 첫 부분부터 쓰고, 나머지는 이어서 덧붙여라.")
 RECOVERY_PROMPT_CUT = "직전 응답이 출력 한도로 잘려 답변이 끊겼다. 끊긴 곳부터 이어서 짧게 마무리하라."  # 답변이 끊겼다
 RECOVERY_PROMPT_ERROR = "직전 응답이 공급자 오류로 중단됐다. 하던 작업을 이어서 진행하라."
 RECOVERY_NAME = "truncation-recovery"  # 덧붙인 안내 메시지 표시. 두 공급자 모두 name 을 API 로 보내지 않는다
 # 노드 이름은 "<미들웨어 name>.before_model" 형식이고, ToolCallLimitMiddleware 는 도구 이름이 붙을 수 있다
 BUDGET_NODES = (ModelCallLimitMiddleware.__name__, ToolCallLimitMiddleware.__name__)
-_REASONING_BLOCKS = frozenset({"thinking", "redacted_thinking", "reasoning"})
+REASONING_KWARGS = ("reasoning_content", "reasoning_details")  # OpenRouter 응답의 생각
+REASONING_BLOCKS = frozenset({"thinking", "redacted_thinking", "reasoning"})  # content 안의 생각 블록(Anthropic 등)
 
 
 def stop_reason(message: BaseMessage) -> str | None:
@@ -114,7 +117,7 @@ def _reasoning_chars(message: AIMessage) -> int:
         text = "".join(t for d in items if isinstance(d, dict) and isinstance(t := d.get("text") or d.get("summary"), str))
     blocks = message.content if isinstance(message.content, list) else []
     in_blocks = sum(len(str(b.get("thinking") or b.get("reasoning") or "")) for b in blocks
-                    if isinstance(b, dict) and b.get("type") in _REASONING_BLOCKS)
+                    if isinstance(b, dict) and b.get("type") in REASONING_BLOCKS)
     return len(text) + in_blocks
 
 
@@ -131,7 +134,7 @@ def strip_stopped(message: BaseMessage) -> AIMessage | None:
     text = message.text.rstrip()
     content = f"{text}\n\n{_cut_marker(reason, dropped)}" if text.strip() else _placeholder(reason, dropped)
     kwargs = {k: v for k, v in message.additional_kwargs.items()
-              if k not in ("reasoning_content", "reasoning_details", "tool_calls")}
+              if k not in (*REASONING_KWARGS, "tool_calls")}
     meta = {**message.response_metadata,
             "code_agent_stripped": {"reasoning_chars": _reasoning_chars(message), "dropped_tool_calls": dropped}}
     return message.model_copy(update={"content": content, "additional_kwargs": kwargs, "tool_calls": [],

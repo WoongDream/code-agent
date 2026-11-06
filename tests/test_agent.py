@@ -56,7 +56,7 @@ def test_system_prompt_has_runtime_info(tmp_path: Path) -> None:
     assert str(h.workspace) in system
     assert "/.code-agent-artifacts/" in system
     assert "생각(thinking)을 포함해 64,000토큰까지" in system  # 출력 한도와 파일에 나눠 쓰기 규칙
-    assert "끝 표식 줄(`// END-OF-DATA`)" in system
+    assert "파일에 하나뿐인 표식" in system and "END-OF-DATA" not in system  # 한 사건의 예시 대신 일반 원칙(D7)
     assert "이 PC 의 도구" not in system  # env_text 를 주지 않으면 절이 없다(옛 thread 와 같은 system)
 
 
@@ -170,4 +170,5 @@ def test_large_output_offloads_to_artifacts(tmp_path: Path) -> None:
 def test_stream_parts_are_namespaced_tuples(tmp_path: Path) -> None:
     h = Harness(tmp_path, [DONE])
     h.run()
-    assert h.parts and all(isinstance(ns, tuple) and mode in ("messages", "updates") for ns, mode, _ in h.parts)
+    assert h.parts and all(isinstance(ns, tuple) and mode in ("messages", "updates", "custom")
+                           for ns, mode, _ in h.parts)

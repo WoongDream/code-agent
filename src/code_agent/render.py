@@ -129,6 +129,8 @@ class Renderer:
             for node, update in data.items():
                 if isinstance(update, dict):
                     self._update(node, update, prefix)
+        elif mode == "custom" and isinstance(data, dict) and data.get("type") == "prompt_migrated":
+            self._line(f"{prefix}[yellow]{escape(migration_notice(data))}[/]")
 
     def _ai_text(self, message: BaseMessage) -> None:
         """스트리밍 모델은 청크로, 스트리밍하지 않는 모델(대본 모델 등)은 완성된 메시지로 온다."""
@@ -260,6 +262,13 @@ class Renderer:
         if self._mid_line:
             self.console.print()
             self._mid_line = False
+
+
+def migration_notice(event: dict) -> str:
+    """resume_compat 의 prompt_migrated 이벤트 안내. 이전은 thread 마다 한 번만 일어난다."""
+    if event.get("reason") == "model":
+        return "이 세션은 다른 모델로 시작됐다. 이전 생각 기록은 공급자가 버리고, 캐시를 한 번 새로 쓴다."
+    return "이 세션은 이전 버전의 프롬프트로 시작돼, 이전 대화의 생각 기록을 빼고 이어 간다(캐시를 한 번 새로 쓴다)."
 
 
 def reasoning_details_text(message: BaseMessage) -> str:

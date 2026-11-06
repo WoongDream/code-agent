@@ -29,6 +29,7 @@ uv run code-agent --resume <세션 ID>
 - 세션과 큰 도구 결과는 `~/.code-agent/`(`sessions.db`, `artifacts/`)에 저장해 작업 폴더를 더럽히지 않는다.
 - 셸은 code-agent 자신의 venv 를 물려받지 않는다(`VIRTUAL_ENV`, `UV` 등과 venv 의 `Scripts` 를 뺀다). 활성화한 venv 안에 code-agent 를 설치해 실행하면 그 venv 도 에이전트 셸에서 빠진다. `python` 이 없거나 Windows 스토어 스텁이면 `uv python find` 의 인터프리터를 쓴다. 이 인터프리터는 PEP 668 표식이 있어 `pip install` 이 막힌다.
 - 시작할 때 셸이 쓸 PATH 로 도구·버전·브라우저(python, uv, git, node, npm, deno, py, pwsh, PowerShell, Chrome, Edge)를 확인해 시스템 프롬프트에 적는다(약 1초). 이 내용은 세션마다 저장하고 `--resume` 은 다시 확인하지 않고 그것을 쓴다. 바뀌면 프롬프트 캐시와 이전 생각이 깨지기 때문이다.
+- code-agent 를 업데이트해 시스템 프롬프트나 도구 설명이 달라진 뒤 `--resume` 하면(이 기능 전에 만든 세션도), 이전 대화의 생각 기록을 요청에서 빼고 이어 간다. 이전 생각의 서명은 옛 프롬프트에 묶여 있어 그대로 보내면 공급자가 거부하거나 무효인 생각이 가기 때문이다. 세션 기록은 그대로 두고, 처음 한 번 노란 줄로 알린다. 프롬프트 캐시는 한 번 새로 쓴다.
 
 ## Langfuse 트레이스 (선택)
 

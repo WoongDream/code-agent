@@ -166,7 +166,12 @@ class App:
         elif name == "/new":
             if not self.env_text and self.fresh_agent is not None:
                 # 절이 없던 옛 thread 를 이어 온 프로세스다. 새 thread 는 다시 탐지한 절과 그 system 으로 시작한다
-                self.env_text, self.agent = self.fresh_agent()
+                try:
+                    self.env_text, self.agent = self.fresh_agent()
+                except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 - 지금 세션은 그대로 이어 간다
+                    self.console.print(f"[red]새 세션을 시작하지 못했다: {type(e).__name__}: {escape(str(e))}[/]\n"
+                                       f"지금 세션 {self.thread_id} 을 이어 간다.")
+                    return True
             self.thread_id = self.sessions.create(self.workspace, self.env_text)
             self.console.print(f"새 세션 {self.thread_id}")
         elif name == "/mode":
@@ -356,7 +361,7 @@ def main(argv: list[str] | None = None) -> int:
         if not workspace.is_dir():
             console.print(f"[red]작업 폴더가 없다: {escape(str(workspace))}[/]")
             return 2
-    if workspace in (Path.home(), Path(workspace.anchor)):
+    if workspace in (Path.home().resolve(), Path(workspace.anchor)):
         console.print(f"[yellow]주의: 작업 폴더가 {escape(str(workspace))} 다. 파일 도구가 이 폴더 전체에 접근한다.[/]")
     if warning := repo_warning(workspace):
         console.print(f"[bold yellow]주의: {escape(warning)}[/]")
@@ -400,4 +405,4 @@ def session_agent(settings: Settings, workspace: Path, sessions: Sessions, env_t
 def detect_environment(shell_preference: str, workspace: Path | None = None) -> str:
     """셸 백엔드가 쓸 환경(process_shell_env)으로 도구를 확인해 '이 PC 의 도구' 절을 만든다. 약 1초 걸린다."""
     shell = resolve_shell(shell_preference, workspace)[0]
-    return render(probe(process_shell_env(), workspace=workspace), shell)
+    return render(probe(process_shell_env(workspace), workspace=workspace), shell)

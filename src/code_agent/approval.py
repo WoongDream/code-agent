@@ -41,9 +41,17 @@ def _hidden_chars(command: str) -> bool:
 
 
 def _follows(arg: str) -> bool:
-    """tail -f·-F·--follow 는 셸 제한 시간(120초)까지 돌아오지 않는다."""
-    return arg.startswith("--follow") or (arg.startswith("-") and not arg.startswith("--")
-                                          and any(c in arg[1:] for c in "fF"))
+    """tail -f·-F·--follow 는 셸 제한 시간(120초)까지 돌아오지 않는다.
+
+    GNU 는 긴 옵션을 앞부분만 써도 받는다(--f, --fo=name). tail 의 긴 옵션 중 f 로 시작하는 것은 --follow 뿐이다.
+    """
+    return arg.startswith("--f") or (arg.startswith("-") and not arg.startswith("--")
+                                     and any(c in arg[1:] for c in "fF"))
+
+
+def _waits(arg: str) -> bool:
+    """PowerShell 의 cat(Get-Content) -Wait 도 tail -f 처럼 멈춘다. 매개변수 이름은 대소문자 없이 앞부분만 써도 된다."""
+    return arg.lower().startswith("-wai")
 
 
 def is_read_only_command(command: str) -> bool:
@@ -69,10 +77,12 @@ def is_read_only_command(command: str) -> bool:
         return False
     if head in _PRINTS_CONTENT and any(ch in a for a in args for ch in "*?["):
         return False  # 와일드카드는 .env 를 포함할 수 있다
-    if head == "tail" and any(_follows(a) for a in args):
+    if (head == "tail" and any(_follows(a) for a in args)) or (head == "cat" and any(_waits(a) for a in args)):
         return False
-    if any("files0-from" in a for a in args):
-        return False  # wc --files0-from=F 는 F 의 내용을 파일 이름으로 읽어 오류 메시지로 내보낸다
+    if (head == "wc" and any(a.startswith("--f") for a in args)) or any("files0-from" in a for a in args):
+        # wc --files0-from=F 는 F 의 내용을 파일 이름으로 읽어 오류 메시지로 내보낸다. 약어(--files0, --f)도 같다.
+        # wc 의 긴 옵션 중 f 로 시작하는 것은 이것뿐이다
+        return False
     return all(_inside_workspace(a, git=git) for a in args)
 
 

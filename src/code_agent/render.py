@@ -131,6 +131,9 @@ class Renderer:
                     self._update(node, update, prefix)
         elif mode == "custom" and isinstance(data, dict) and data.get("type") == "prompt_migrated":
             self._line(f"{prefix}[yellow]{escape(migration_notice(data))}[/]")
+        elif mode == "custom" and isinstance(data, dict) and data.get("type") == "prompt_store_error":
+            self._line(f"{prefix}[yellow]세션 기록(sessions.db)을 읽거나 쓰지 못해 프롬프트 지문 기록을 건너뛰고 이어 간다"
+                       f"(다른 프로세스가 잠갔을 수 있다): {escape(str(data.get('error', '')))}[/]")
 
     def _ai_text(self, message: BaseMessage) -> None:
         """스트리밍 모델은 청크로, 스트리밍하지 않는 모델(대본 모델 등)은 완성된 메시지로 온다."""

@@ -31,9 +31,9 @@ Runs a shell command on the user's machine (not sandboxed) with the workspace as
 stdout/stderr and the exit code. Large output is truncated or moved to a file whose path is returned.
 - The shell is the one described under 실행 환경 (Git Bash or Windows PowerShell 5.1). Use paths relative to the \
 workspace; quote paths that contain spaces.
-- Commands may need the user's approval. Read-only commands (ls, cat, head, tail, wc, git status/diff/log/show) \
-without chaining, redirection or paths outside the workspace run without asking, so prefer one simple command per \
-call over chains.
+- Commands may need the user's approval. Read-only commands (e.g. ls, cat, git status/diff/log/show; in Git Bash \
+also head, tail, wc) without chaining, redirection or paths outside the workspace run without asking, so prefer one \
+simple command per call over chains.
 - Default timeout is 120 s; pass `timeout` (seconds) for longer runs such as test suites.
 - To search or read files, the grep, glob and read_file tools are cheaper and need no approval."""
 

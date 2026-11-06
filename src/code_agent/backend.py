@@ -6,21 +6,27 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shutil
 import signal
 import subprocess
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from deepagents.backends import CompositeBackend, FilesystemBackend, LocalShellBackend
 from deepagents.backends.protocol import ExecuteResponse
 
+from code_agent.environment import is_store_stub, uv_python_find
+
 ARTIFACTS_ROUTE = "/.code-agent-artifacts/"  # 큰 도구 결과·대화 기록·blob 오프로드가 모두 이 아래로 간다
 SECRET_ENV = re.compile(r"_KEY$|TOKEN|SECRET|PASSWORD", re.IGNORECASE)  # *_API_KEY, LANGFUSE_PUBLIC_KEY 등
-_PS_UTF8 = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
+# code-agent 자신의 venv. 물려주면 셸의 python 이 deepagents 가 깔린 도구 venv 가 되고 pip install 이 그것을 오염시킨다
+TOOL_VENV_ENV = ("VIRTUAL_ENV", "UV", "UV_RUN_RECURSION_DEPTH", "PYTHONHOME")
+# 진행률 표시를 끈다. PS 5.1 은 진행률을 CLIXML 로 stderr 에 섞어 내보낼 수 있다
+_PS_UTF8 = "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $ProgressPreference = 'SilentlyContinue'; "
 if sys.platform == "win32":
     import ctypes
 
@@ -29,11 +35,45 @@ else:
     _OEM_ENCODING = "utf-8"
 
 
-def shell_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
-    """부모 환경에서 비밀값만 뺀다. 빈 env 를 주면 PATH·SYSTEMROOT 가 없어 셸이 제대로 뜨지 않는다."""
-    env = {k: v for k, v in (os.environ if base is None else base).items() if not SECRET_ENV.search(k)}
+def _tool_venv_scripts() -> str | None:
+    """code-agent 가 venv 에서 돌면 그 venv 의 실행 파일 폴더."""
+    if sys.prefix == sys.base_prefix:
+        return None
+    return str(Path(sys.prefix, "Scripts" if sys.platform == "win32" else "bin"))
+
+
+def shell_env(base: Mapping[str, str] | None = None, *, tool_scripts: str | None = None,
+              find_python: Callable[[Mapping[str, str]], str | None] = uv_python_find) -> dict[str, str]:
+    """셸에 넘길 환경. 부모 환경에서 비밀값과 code-agent 의 도구 venv 를 뺀다.
+
+    빈 env 를 주면 PATH·SYSTEMROOT 가 없어 셸이 제대로 뜨지 않으므로 나머지는 물려준다. 도구 venv 를 빼서 python 이
+    없거나 스토어 스텁만 남으면, uv 가 관리하는 인터프리터(PEP 668 표식이 있어 pip install 이 막힌다)를 PATH 앞에 둔다.
+    tool_scripts 는 PATH 에서 뺄 도구 venv 의 실행 파일 폴더다(기본: 지금 venv 에서 돌면 그 폴더).
+    """
+    env = {k: v for k, v in (os.environ if base is None else base).items()
+           if not SECRET_ENV.search(k) and k not in TOOL_VENV_ENV}
+    scripts = tool_scripts if tool_scripts is not None else _tool_venv_scripts()
+    if scripts:
+        drop = os.path.normcase(os.path.normpath(scripts))
+        entries = env.get("PATH", "").split(os.pathsep)
+        env["PATH"] = os.pathsep.join(e for e in entries if not e or os.path.normcase(os.path.normpath(e)) != drop)
+    python = shutil.which("python", path=env.get("PATH", ""))
+    if python is None or is_store_stub(python):
+        found = find_python(env)
+        if found:
+            env["PATH"] = os.pathsep.join([str(Path(found).parent), env.get("PATH", "")])
     env.update(PYTHONUTF8="1", PYTHONIOENCODING="utf-8", CHERE_INVOKING="1")
     return env
+
+
+@functools.cache
+def _process_shell_env() -> dict[str, str]:
+    return shell_env()
+
+
+def process_shell_env() -> dict[str, str]:
+    """이 프로세스의 셸 환경. uv python find 를 부르므로 한 번만 계산한다. 셸 백엔드와 환경 탐지가 같은 것을 쓴다."""
+    return dict(_process_shell_env())
 
 
 def find_git_bash() -> Path | None:
@@ -63,7 +103,7 @@ class WindowsShellBackend(LocalShellBackend):
     def __init__(self, root_dir: str | Path, *, shell: str = "", timeout: int = 120,
                  env: Mapping[str, str] | None = None) -> None:
         super().__init__(root_dir=root_dir, virtual_mode=True, timeout=timeout,
-                         env=shell_env() if env is None else dict(env), inherit_env=False)
+                         env=process_shell_env() if env is None else dict(env), inherit_env=False)
         self.shell, self._argv = resolve_shell(shell)
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:

@@ -73,8 +73,12 @@ _SHELLS = {
 }
 
 
-def coding_prompt(*, workspace: Path, shell: str) -> str:
+def coding_prompt(*, workspace: Path, shell: str, env_text: str = "") -> str:
+    """env_text 는 environment.render 의 '이 PC 의 도구' 절이다. 스레드마다 저장한 것을 그대로 쓴다(cli.Sessions).
+
+    비어 있으면(그 절이 없던 옛 스레드) 아무것도 붙이지 않아 옛 system 과 같게 둔다.
+    """
     return CODING_PROMPT + _OUTPUT_LIMIT + _RUNTIME.format(
         workspace=workspace, os_name=f"{platform.system()} {platform.release()}",
         shell_desc=_SHELLS.get(shell, shell), artifacts=ARTIFACTS_ROUTE,
-    )
+    ) + env_text

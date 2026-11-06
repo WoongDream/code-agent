@@ -21,6 +21,8 @@ from rich.syntax import Syntax
 
 from code_agent.agent import build_agent, run_turn
 from code_agent.approval import APPROVE, MODES, decide_all, reject
+from code_agent.backend import process_shell_env, resolve_shell
+from code_agent.environment import probe, render
 from code_agent.render import Renderer, describe_action, todos_markup
 from code_agent.settings import Settings, load_settings
 from code_agent.stops import TurnStops
@@ -46,22 +48,37 @@ _USAGE_COLUMNS = [(f.name, "REAL" if f.type == "float" else "INTEGER") for f in 
 
 
 class Sessions:
-    """sessions.db 에 체크포인트와 함께 thread → 작업 폴더를 남긴다. --resume 은 같은 작업 폴더로 이어 간다."""
+    """sessions.db 에 체크포인트와 함께 thread → 작업 폴더를 남긴다. --resume 은 같은 작업 폴더로 이어 간다.
+
+    thread 마다 시스템 프롬프트의 '이 PC 의 도구' 절(environment.render)도 남긴다. --resume 때 다시 탐지하면 그사이
+    설치한 도구 때문에 system 이 바뀌어 프롬프트 캐시와 Opus 5.5 의 보존된 thinking 이 깨지기 때문이다.
+    code_agent_threads 에 열을 더하지 않고 표를 따로 둔다. 열을 더하면 아직 돌고 있는 옛 프로세스의
+    'INSERT … VALUES (?, ?, ?)' 가 열 수가 맞지 않아 실패한다.
+    """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
         conn.execute("CREATE TABLE IF NOT EXISTS code_agent_threads "
                      "(thread_id TEXT PRIMARY KEY, workspace TEXT NOT NULL, created_at TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS code_agent_thread_env "
+                     "(thread_id TEXT PRIMARY KEY, env_text TEXT NOT NULL)")
         conn.execute(f"CREATE TABLE IF NOT EXISTS code_agent_usage (thread_id TEXT NOT NULL, at TEXT NOT NULL, "
                      f"{', '.join(f'{name} {kind} NOT NULL' for name, kind in _USAGE_COLUMNS)})")
         conn.commit()
 
-    def create(self, workspace: Path) -> str:
+    def create(self, workspace: Path, env_text: str = "") -> str:
         thread_id = uuid.uuid4().hex[:12]
         self.conn.execute("INSERT INTO code_agent_threads VALUES (?, ?, ?)",
                           (thread_id, str(workspace), datetime.now(UTC).isoformat()))
+        self.conn.execute("INSERT INTO code_agent_thread_env VALUES (?, ?)", (thread_id, env_text))
         self.conn.commit()
         return thread_id
+
+    def env_text_of(self, thread_id: str) -> str:
+        """저장한 '이 PC 의 도구' 절. 그 절이 생기기 전의 옛 thread 는 빈 문자열(옛 system 과 같게)."""
+        row = self.conn.execute("SELECT env_text FROM code_agent_thread_env WHERE thread_id = ?",
+                                (thread_id,)).fetchone()
+        return row[0] if row else ""
 
     def workspace_of(self, thread_id: str) -> Path | None:
         row = self.conn.execute("SELECT workspace FROM code_agent_threads WHERE thread_id = ?",
@@ -86,11 +103,15 @@ class Sessions:
 
 class App:
     def __init__(self, settings: Settings, workspace: Path, mode: str, sessions: Sessions, thread_id: str,
-                 console: Console, read_line: ReadLine, *, agent=None, tracer: Tracer | None = None) -> None:
+                 console: Console, read_line: ReadLine, *, agent=None, tracer: Tracer | None = None,
+                 env_text: str = "") -> None:
+        """env_text 는 agent 의 시스템 프롬프트에 들어간 '이 PC 의 도구' 절이다. /new 로 만드는 thread 에도 같은 것을 남긴다."""
         self.settings, self.workspace, self.mode = settings, workspace, mode
         self.sessions, self.thread_id = sessions, thread_id
         self.console, self.read_line = console, read_line
-        self.agent = agent if agent is not None else build_agent(settings, workspace, SqliteSaver(sessions.conn))
+        self.env_text = env_text
+        self.agent = agent if agent is not None else build_agent(settings, workspace, SqliteSaver(sessions.conn),
+                                                                 env_text=env_text)
         self.tracer = tracer
         self.status_line = console.is_terminal and _interactive()  # 파이프·테스트(StringIO)에서는 상태 줄을 그리지 않는다
         self.full_thinking = False  # /thinking
@@ -140,7 +161,7 @@ class App:
         if name == "/help":
             self.console.print(HELP)
         elif name == "/new":
-            self.thread_id = self.sessions.create(self.workspace)
+            self.thread_id = self.sessions.create(self.workspace, self.env_text)
             self.console.print(f"새 세션 {self.thread_id}")
         elif name == "/mode":
             if arg not in MODES:
@@ -308,14 +329,22 @@ def main(argv: list[str] | None = None) -> int:
         console.print(f"[yellow]주의: 작업 폴더가 {escape(str(workspace))} 다. 파일 도구가 이 폴더 전체에 접근한다.[/]")
 
     try:
-        agent = build_agent(settings, workspace, SqliteSaver(sessions.conn))
-    except (RuntimeError, ValueError) as e:  # API 키 미설정, 모델 이름 오류 등
+        # --resume 은 그 thread 에 저장한 절을 그대로 쓴다(다시 탐지하면 system 이 바뀔 수 있다)
+        env_text = sessions.env_text_of(args.resume) if args.resume else detect_environment(settings.shell)
+        agent = build_agent(settings, workspace, SqliteSaver(sessions.conn), env_text=env_text)
+    except (RuntimeError, ValueError) as e:  # API 키 미설정, 모델 이름 오류, Git Bash 없음 등
         console.print(f"[red]{escape(str(e))}[/]")
         return 2
     if settings.langfuse_enabled and not langfuse_installed():
         console.print("[dim]Langfuse 키가 있지만 패키지가 없어 트레이스를 끈다. 켜려면: uv sync --extra langfuse[/]")
     tracer = make_tracer(settings)
-    thread_id = args.resume or sessions.create(workspace)  # 시작에 성공한 뒤에만 세션을 남긴다
+    thread_id = args.resume or sessions.create(workspace, env_text)  # 시작에 성공한 뒤에만 세션을 남긴다
     app = App(settings, workspace, args.mode, sessions, thread_id, console,
-              _line_reader(settings.data_dir / "history"), agent=agent, tracer=tracer)
+              _line_reader(settings.data_dir / "history"), agent=agent, tracer=tracer, env_text=env_text)
     return app.run()
+
+
+def detect_environment(shell_preference: str) -> str:
+    """셸 백엔드가 쓸 환경(process_shell_env)으로 도구를 확인해 '이 PC 의 도구' 절을 만든다. 약 1초 걸린다."""
+    shell = resolve_shell(shell_preference)[0]
+    return render(probe(process_shell_env()), shell)

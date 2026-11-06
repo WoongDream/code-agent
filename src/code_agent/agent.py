@@ -78,7 +78,8 @@ def _disable_general_purpose_subagent(model: BaseChatModel) -> None:
 
 
 def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpointSaver | None, *,
-                model: BaseChatModel | None = None, backend: CompositeBackend | None = None):
+                model: BaseChatModel | None = None, backend: CompositeBackend | None = None, env_text: str = ""):
+    """env_text 는 시스템 프롬프트 끝의 '이 PC 의 도구' 절이다(prompts.coding_prompt)."""
     model = model if model is not None else make_model(settings)
     _disable_general_purpose_subagent(model)
     if backend is None:
@@ -91,7 +92,7 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
     shell = cast(WindowsShellBackend, backend.default).shell  # default 는 make_backend 의 셸 백엔드다
     return create_deep_agent(
         name="code-agent", model=model, backend=backend,
-        system_prompt=coding_prompt(workspace=workspace, shell=shell),
+        system_prompt=coding_prompt(workspace=workspace, shell=shell, env_text=env_text),
         middleware=middleware,
         # 결정은 approve/reject 만 받는다. edit 은 고친 인자가 재검증 없이 실행된다.
         interrupt_on={tool: {"allowed_decisions": ["approve", "reject"]} for tool in INTERRUPT_TOOLS},

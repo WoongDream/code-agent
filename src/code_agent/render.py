@@ -24,7 +24,7 @@ from rich.markup import escape
 from rich.syntax import Syntax
 from rich.text import Text
 
-from code_agent.stops import budget_stop, recovery_notice
+from code_agent.stops import RECOVERY_PROMPT_ERROR, budget_stop, recovery_notice
 
 RESULT_LINES = 6
 _TODO_MARK = {"completed": "[green]✔[/]", "in_progress": "[yellow]▶[/]", "pending": "[dim]○[/]"}
@@ -76,7 +76,8 @@ class Renderer:
                 for call in message.tool_calls:
                     self._line(f"{prefix}[cyan]●[/] {escape(describe_call(call))}")
             elif recovery_notice(node, message):
-                self._line(f"{prefix}[yellow]응답이 출력 한도에 걸려 잘렸다. 안내를 덧붙여 한 번 다시 요청한다.[/]")
+                why = "공급자 오류로 중단됐다" if message.text == RECOVERY_PROMPT_ERROR else "출력 한도에 걸려 잘렸다"
+                self._line(f"{prefix}[yellow]응답이 {why}. 안내를 덧붙여 한 번 다시 요청한다.[/]")
             elif budget_stop(node, message):
                 # 예산 미들웨어의 종료 메시지는 model 이 아닌 노드에서 나온다
                 self._line(f"{prefix}[yellow]{escape(message.text)}[/]")

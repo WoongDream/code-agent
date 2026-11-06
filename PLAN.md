@@ -300,7 +300,8 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - 조회 API에 주의한다. SDK v5에서 `api.trace.*`와 `GET /api/public/traces`로는 보이지 않았다. `api.observations.get_many(session_id=..., fields="core,basic,model,usage")`로 조회한다.
   - **가격 정의 등록**: `anthropic/claude-opus-5.5`는 Langfuse 기본 정의에 없어 비용이 비었다. 그래서 프로젝트에 직접 등록했다.
     - 패턴: `(?i)^anthropic/claude-opus-5\.5$`
-    - 100만 토큰당 가격: input $4, output·output_reasoning $20, input_cache_read $0.40, input_cache_creation $5
+    - 100만 토큰당 가격: input $4, output·output_reasoning $20, input_cache_read $0.20, input_cache_creation $5
+      - 정정(2026-11-06): 처음에 캐시 읽기를 $0.40(입력의 0.1배)으로 적었다. Opus 5.5 는 0.05배인 $0.20 이다(bomber·az-quiz 실측 역산 $0.19~0.20, Anthropic 문서). Langfuse 정의도 고친다.
     - 시험 generation으로 계산값이 맞는 것을 확인했다. 등록 전에 수집된 generation에는 소급되지 않는다.
 - **LLM-as-a-Judge 준비 (`worklog.py`)**
   - **배경**: Langfuse의 observation 평가기는 같은 트레이스의 다른 observation(도구 실행 등)을 읽지 못한다. 그래서 `turn` 출력을 최종 답변만이 아니라 판단 근거가 되는 작업 기록 전체로 바꿨다.
@@ -393,6 +394,52 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - **M1**: 안내를 둘로 나눴다. 생각만 하다 잘린 경우와 답변이 끊긴 경우("끊긴 곳부터 이어서 짧게 마무리하라")다.
   - **M2**: 프롬프트 예시를 `];` 바꾸기에서 고유한 끝 표식(`// END-OF-DATA`) 줄을 바꾸는 방식으로 바꿨다. 파일을 나눠도 된다고 적었다. `];`는 여러 번 나올 수 있어 `edit_file`이 실패한다.
   - 시험 4개를 추가하고 M1 확인을 기존 시험에 넣었다. `test_stops.py`가 23개, 전체가 194개다. 수정 전 코드로 돌리면 새 시험이 실패하는 것을 확인했다.
+
+#### 개선 3 — 컨텍스트 한도와 멈춘 응답 정리 (2026-11-06, 사양 `code-agent-specs/task3-context-and-stops.md`)
+- **사실 정정**
+  - Opus 5.5 캐시 읽기는 $0.20/M(입력의 0.05배)이다. 위 가격 정의의 $0.40과 `caching.py` 주석의 0.1배를 고쳤다.
+  - Opus 5.5에는 preserved thinking이 있다. thinking 블록의 서명은 그 앞의 prefix 전체와 직전 thinking 체인에 묶인다. 그래서 앞쪽 기록을 고치면 뒤쪽 thinking이 무효가 되고, 프롬프트 캐시도 깨진다.
+- **컨텍스트 한도** (`settings.context_tokens`, `models.with_context_limit`)
+  - 기본은 200,000이고 `CODE_AGENT_CONTEXT_TOKENS`로 20,000~1,000,000을 줄 수 있다. 범위 밖이거나 정수가 아니면 시작 때 오류를 낸다.
+  - **[V] 프로필**: langchain-openrouter 0.2.8 데이터에는 5.5 계열(opus·sonnet·haiku-5.5, fable-5.1)이 없어 `profile`이 비어 있다. Anthropic 직결 Opus 5.5와 OpenRouter opus-5는 1M이다.
+  - `make_model`이 두 공급자 모두에 `max_input_tokens=min(설정, 알려진 창)`을 넣는다. 다른 키는 유지하고, `max_output_tokens`가 없으면 64,000을 넣는다. `model_copy`로 만든다.
+  - 비용 근거(session2 시뮬레이션): 5분 넘게 쉬어 캐시가 식으면 최악 입력 비용이 200K는 $0.85, 1M은 $4.25다. 100회를 넘는 긴 세션에서도 200K가 싸다.
+- **요약 자리 대체와 인자 잘림 끄기** (`agent.summarization_middleware`)
+  - **[V]** 프로필이 없으면 deepagents 기본값은 메시지 20개부터 옛 `write_file`·`edit_file` 인자를 2,000자로 자른다(`compute_summarization_defaults`).
+    - 30메시지 시험에서 우리 대체를 빼면 실제로 앞쪽 기록이 바뀌어 실패하는 것을 확인했다.
+    - 이것은 캐시만 깨는 것이 아니라 Opus 5.5의 뒤쪽 thinking도 무효로 만든다.
+  - deepagents `SummarizationMiddleware`를 같은 이름으로 넘겨 core 자리를 제자리에서 대신한다(graph.py `_apply_custom_middleware`).
+    - 설정: `trigger=("tokens", 0.85×한도)`, `keep=("tokens", 0.10×한도)`, `truncate_args_settings=None`
+    - fraction은 프로필이 없는 모델에서 생성자가 ValueError를 내서 tokens로 준다.
+- **멈춘 응답 정리** (`stops.strip_stopped`, K3·K1)
+  - 대상은 도구 호출 없이 멈춘 응답이다. 텍스트만 남기고, 없으면 자리표시를 넣는다(예: `[출력 한도(64,000토큰)에 걸려 잘린 응답: 생각만 하다 끝나 결과물이 없다. 생각 내용은 기록에서 뺐다.]`). Anthropic은 빈 content를 거부한다.
+  - 텍스트가 남으면 끝에 `[출력 한도로 여기서 잘림]`을 붙인다.
+  - `reasoning_content`, `reasoning_details`, thinking·redacted_thinking 블록(서명 없는 것 포함), 잘린 도구 호출을 뺀다. 사용량과 정지 사유는 남기고, 뺀 것은 `response_metadata["code_agent_stripped"]`에 적는다.
+  - **같은 id**로 교체한다. 바뀌는 것은 방금 나온 마지막 메시지뿐이다. 원본은 다음 요청에 실린 적이 없어 캐시에도 없고, 그 뒤에 서명된 thinking도 없다. 그래서 덧붙이기 원칙과 preserved thinking을 깨지 않는다.
+  - 효과: 잘린 64K reasoning을 이후 모든 호출이 다시 보내지 않는다(az-quiz 턴 2에서 약 $1.15).
+    - 실측: az-quiz의 잘린 응답에는 reasoning 31,160자 외에, 청크 병합으로 이어 붙은 서명(171,425자)과 format 필드("anthropic-claude-v1"이 8,024번)도 있었다.
+  - 도구 호출이 있는 응답은 그대로 둔다. 다만 잘린 호출(`invalid_tool_calls`)이 섞여 있으면 그 인자만 `"{}"`로 바꾼다(K2). 그러면 langchain이 '인자가 잘렸다' 결과를 붙인다.
+  - 유효한 호출이 없는 잘린 호출은 정리하면서 빼고, 자리표시에 이름을 남긴다.
+- **정지 사유 3분류** (`stop_reason`)
+  - `STOP_LENGTH`(length, max_tokens): 정리, 1회 복구, 경고
+  - `STOP_ERROR`(OpenRouter error): 정리, 1회 복구, 경고. 복구 1회를 출력 한도와 함께 쓴다.
+    - **[V]** choices가 있는 오류 청크는 예외 없이 이 값으로 끝난다. 가짜 SDK로 시험했다.
+  - `STOP_CONTEXT`(Anthropic model_context_window_exceeded): 다시 불러도 같으므로 정리만 하고 경고한다("/new 로 새로 시작하거나 요약한 뒤 이어 가라").
+  - 경고 문장과 화면의 즉시 안내는 사유별로 다르다.
+- **실측 1** (OpenRouter opus-5.5, effort low, max_tokens 1,200, write_file 하나로 숫자 1~1000; 비용 $0.0255)
+  - 결과: `finish_reason=length`, `tool_calls=1`, `invalid_tool_calls=0`, reasoning 0토큰
+  - **[V] K2의 전제와 달랐다.** langchain-core가 스트림 청크를 합칠 때 `parse_partial_json`으로 잘린 인자를 고쳐 **유효한 호출**을 만든다(`AIMessageChunk.init_tool_calls`).
+    - 그래서 출력 한도로 잘린 write_file이 잘린 내용 그대로 실행된다.
+    - K2의 `invalid_tool_calls` 정리는 고치기가 실패하는 드문 경우의 안전망이다.
+    - 400 여부를 보려던 2·3단계는 전제가 성립하지 않아 돌리지 않았다.
+    - 잘린 유효 호출을 어떻게 다룰지는 오케스트레이터에게 결정을 요청했다(아래 후속).
+- **시험**: 전체 227개가 통과한다(+33).
+  - `test_context.py` 14개: 프로필 3개, 설정 9개, 요약 자리 대체, 30메시지 append-only
+  - `test_stops.py` 19개: 정지 사유 7개, 부분 텍스트 표시, Anthropic thinking 제거, 복구 뒤 재정리, 도구 호출 있는 응답 보존, 렌더 안 됨, 사용량 보존, 두 공급자 요청 본문, K2 두 가지, 오류 청크, 오류 복구 1회, 컨텍스트 창
+- **후속**
+  - 잘린 유효 호출 처리(결정 대기)
+  - OpenRouter 경로에서 요약이 남긴 메시지의 `reasoning_details`(사양 1절)
+  - Anthropic 직결 실측(키 없음)
 
 ### 4단계 — 평가·확장 (선택)
 - `evals/`: 수정 과제 5~10개(fixture 저장소와 숨김 검증 테스트)를 헤드리스로 돌려 통과율, 비용, 시간을 집계한다. `pjt\Day04\coding_skills\verify_agent.py` 패턴을 참고한다.

@@ -16,6 +16,7 @@ from deepagents import (
 # 0.7.32 고정. 모델 인스턴스로 공급자를 얻는 공개 API 가 없다.
 from deepagents._models import get_model_provider
 from deepagents.backends import CompositeBackend
+from deepagents.middleware import SummarizationMiddleware
 from langchain.agents.middleware import (
     AgentMiddleware,
     ModelCallLimitMiddleware,
@@ -52,6 +53,19 @@ def budget_middleware(model_calls: int = MODEL_CALLS, tool_calls: int = TOOL_CAL
     ]
 
 
+def summarization_middleware(model: BaseChatModel, backend: CompositeBackend, context_tokens: int) -> Middleware:
+    """deepagents 의 기본 요약을 같은 이름(SummarizationMiddleware)으로 core 자리에서 바꾼다.
+
+    - 도구 인자 잘림을 끈다(truncate_args_settings=None). 잘림은 중간 메시지를 바꿔 프롬프트 캐시를 깨고
+      Opus 5.5 의 보존된 thinking 을 무효로 만든다(서명이 앞쪽 기록 전체에 묶인다).
+    - 프로필의 max_input_tokens(models.with_context_limit)의 85% 에서 요약하고 10% 를 남긴다. 프로필이 없는
+      모델(대본 모델 등)은 context_tokens 를 쓴다. fraction 은 프로필이 없으면 생성자가 ValueError 를 내서 tokens 로 준다.
+    """
+    limit = (model.profile or {}).get("max_input_tokens") or context_tokens
+    return SummarizationMiddleware(model=model, backend=backend, trigger=("tokens", int(limit * 0.85)),
+                                   keep=("tokens", int(limit * 0.10)), truncate_args_settings=None)
+
+
 def _disable_general_purpose_subagent(model: BaseChatModel) -> None:
     """MVP 는 서브에이전트를 쓰지 않는다. 프로필은 공급자 단위로 등록되고 내장 프로필과 병합된다."""
     provider = get_model_provider(model)
@@ -66,9 +80,11 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
     _disable_general_purpose_subagent(model)
     if backend is None:
         backend = make_backend(workspace, artifacts_dir=settings.data_dir / "artifacts", shell=settings.shell)
-    # 잘림 복구는 맨 앞이어야 after_model 이 예산 미들웨어의 호출 집계 뒤에 돈다(after_model 은 역순)
+    # 잘림 복구는 맨 앞이어야 after_model 이 예산 미들웨어의 호출 집계 뒤에 돈다(after_model 은 역순).
+    # 요약은 이름이 같아 core 자리를 대신하므로 목록 위치와 상관없다.
     middleware: list[Middleware] = [TruncationRecoveryMiddleware(), TodoListMiddleware(), DotenvGuardMiddleware(),
-                                    OpenRouterCacheMiddleware(), *budget_middleware()]
+                                    OpenRouterCacheMiddleware(), *budget_middleware(),
+                                    summarization_middleware(model, backend, settings.context_tokens)]
     shell = cast(WindowsShellBackend, backend.default).shell  # default 는 make_backend 의 셸 백엔드다
     return create_deep_agent(
         name="code-agent", model=model, backend=backend,

@@ -237,3 +237,54 @@ def test_cli_main_disables_current_folder_search(tmp_path: Path, monkeypatch: py
     monkeypatch.setattr(cli, "load_settings", lambda: Settings(data_dir=tmp_path / "data"))
     assert cli.main(["--resume", "nope"]) == 2  # 시작 단계에서 끝나도 변수는 맨 앞에서 정한다
     assert cli.os.environ.get("NoDefaultCurrentDirectoryInExePath") == "1"
+
+
+# --- O4: -w 를 빼먹어 code-agent 저장소(실제 키가 든 .env)에서 띄운 경우 ---
+
+@pytest.fixture
+def fake_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """REPO_ROOT 를 가짜 .env 가 든 임시 폴더로 바꾸고, 키 없는 설정으로 main 을 돌릴 수 있게 한다."""
+    from code_agent import cli
+    from code_agent.settings import Settings
+
+    repo = tmp_path / "code-agent"
+    repo.mkdir()
+    (repo / ".env").write_text(f"OPENROUTER_API_KEY={SECRET}\n", encoding="utf-8")
+    monkeypatch.setattr(cli, "REPO_ROOT", repo)
+    monkeypatch.setattr(cli, "load_settings", lambda: Settings(data_dir=tmp_path / "data"))
+    return repo
+
+
+def test_repo_folder_warns_and_asks(fake_repo: Path, monkeypatch: pytest.MonkeyPatch,
+                                    capsys: pytest.CaptureFixture[str]) -> None:
+    from code_agent import cli
+
+    asked: list[str] = []
+    monkeypatch.setattr(cli, "_confirm", lambda prompt: asked.append(prompt) or False)
+    monkeypatch.chdir(fake_repo)
+    assert cli.main([]) == 2  # 거절하면 시작하지 않는다
+    out = capsys.readouterr().out
+    assert "작업 폴더가 code-agent 저장소다. 실제 키가 든 .env 가 있다" in out and len(asked) == 1
+    monkeypatch.chdir(fake_repo.parent)  # 저장소를 품은 상위 폴더도 같다
+    cli.main([])
+    assert "code-agent 저장소를 품은 폴더다" in capsys.readouterr().out and len(asked) == 2
+
+
+def test_repo_folder_explicit_workspace_warns_without_asking(fake_repo: Path, monkeypatch: pytest.MonkeyPatch,
+                                                             capsys: pytest.CaptureFixture[str]) -> None:
+    from code_agent import cli
+
+    monkeypatch.setattr(cli, "_confirm", lambda prompt: pytest.fail("-w 를 명시했는데 물었다"))
+    cli.main(["-w", str(fake_repo)])  # 키가 없어 모델 생성에서 끝나지만 경고는 그 전에 나온다
+    assert "작업 폴더가 code-agent 저장소다" in capsys.readouterr().out
+
+
+def test_other_folder_no_repo_warning(fake_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                      capsys: pytest.CaptureFixture[str]) -> None:
+    from code_agent import cli
+
+    other = tmp_path / "project"
+    other.mkdir()
+    monkeypatch.setattr(cli, "_confirm", lambda prompt: pytest.fail("물을 일이 아니다"))
+    cli.main(["-w", str(other)])
+    assert "code-agent 저장소" not in capsys.readouterr().out

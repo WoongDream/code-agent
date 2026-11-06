@@ -24,7 +24,7 @@ from code_agent.agent import build_agent, run_turn
 from code_agent.approval import APPROVE, MODES, decide_all, reject
 from code_agent.backend import safe_which
 from code_agent.render import Renderer, describe_action, todos_markup
-from code_agent.settings import Settings, load_settings
+from code_agent.settings import REPO_ROOT, Settings, load_settings
 from code_agent.tracing import Tracer, langfuse_installed, make_tracer
 from code_agent.usage import Usage, UsageCallback
 from code_agent.worklog import session_context
@@ -248,6 +248,22 @@ def _utf8_stdio() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+def repo_warning(workspace: Path) -> str | None:
+    """작업 폴더가 code-agent 저장소(실제 키가 든 .env 가 있다)이거나 그것을 품은 폴더면 경고 문구."""
+    root = REPO_ROOT.resolve()
+    if not (root / ".env").is_file() or not root.is_relative_to(workspace.resolve()):
+        return None
+    where = "code-agent 저장소" if root == workspace.resolve() else "code-agent 저장소를 품은 폴더"
+    return f"작업 폴더가 {where}다. 실제 키가 든 .env 가 있다. 다른 폴더를 -w 로 지정하라."
+
+
+def _confirm(prompt: str) -> bool:
+    """대화형이면 y/N 을 묻는다. 파이프 입력이면 첫 요청을 먹어 버리므로 묻지 않고 진행한다."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return True
+    return input(prompt).strip().lower() in ("y", "yes", "ㅛ")
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="code-agent", description="Deep Agents 기반 터미널 코딩 에이전트")
     parser.add_argument("--workspace", "-w", help="작업 폴더 (기본: 현재 폴더)")
@@ -290,6 +306,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if workspace in (Path.home(), Path(workspace.anchor)):
         console.print(f"[yellow]주의: 작업 폴더가 {escape(str(workspace))} 다. 파일 도구가 이 폴더 전체에 접근한다.[/]")
+    if warning := repo_warning(workspace):
+        console.print(f"[bold yellow]주의: {escape(warning)}[/]")
+        # -w 를 빼먹어 저장소 폴더에서 띄운 경우가 많아 한 번 확인한다. 명시했거나 이어 가는 세션이면 묻지 않는다
+        if not args.workspace and not args.resume and not _confirm("그래도 이 폴더에서 시작할까? [y/N] › "):
+            console.print("[dim]시작하지 않았다. 작업할 폴더를 -w 로 지정하라.[/]")
+            return 2
 
     try:
         agent = build_agent(settings, workspace, SqliteSaver(sessions.conn))

@@ -397,6 +397,10 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - `safe_which`는 현재 폴더·작업 폴더 안이거나 절대 경로가 아닌 결과를 버린다. `find_git_bash`와 `/diff`의 git이 이것을 쓴다.
   - `powershell.exe`와 `taskkill`은 `%SystemRoot%\System32` 절대 경로로 부른다.
   - 시험은 그 변수를 지우고 임시 폴더로 chdir한 뒤 빈 `git.cmd`·`bin/bash.exe`를 둔다(실행하지 않고 존재만 본다). which가 실제로 그것을 먼저 고르는지도 확인한다.
+- **O4 저장소 폴더에서 띄움**(task12-onboarding.md)
+  - 작업 폴더가 code-agent 저장소(실제 키가 든 `.env`가 있다)이거나 그것을 품은 폴더면 시작할 때 경고한다.
+  - `-w`를 빼먹었고, 이어 가는 세션이 아니고, 대화형이면 `[y/N]`으로 한 번 확인한다. 기본은 시작하지 않는 것이다.
+  - 파이프 입력이면 첫 요청을 먹어 버리므로 묻지 않는다. `-w`를 명시했으면 경고만 한다.
 - **이번에 하지 않은 것**: S6~S11. S6의 package.json 등은 넣지 않기로 했고(사용자 결정), S11 AGENTS.md 신뢰 확인은 task8에서 한다.
 
 ## 6. 검증 방법

@@ -26,7 +26,8 @@ from langgraph.runtime import Runtime
 from code_agent.models import MAX_TOKENS
 
 TRUNCATED = frozenset({"length", "max_tokens"})  # OpenAI 계열 finish_reason, Anthropic stop_reason
-RECOVERY_PROMPT = "직전 응답이 출력 한도로 잘렸다. 생각을 줄이고 결과물은 파일에 나눠서 바로 써라."
+RECOVERY_PROMPT = "직전 응답이 출력 한도로 잘렸다. 생각을 줄이고 결과물은 파일에 나눠서 바로 써라."  # 생각만 하다 잘렸다
+RECOVERY_PROMPT_CUT = "직전 응답이 출력 한도로 잘려 답변이 끊겼다. 끊긴 곳부터 이어서 짧게 마무리하라."  # 답변이 끊겼다
 RECOVERY_NAME = "truncation-recovery"  # 덧붙인 안내 메시지 표시. 두 공급자 모두 name 을 API 로 보내지 않는다
 # 노드 이름은 "<미들웨어 name>.before_model" 형식이고, ToolCallLimitMiddleware 는 도구 이름이 붙을 수 있다
 BUDGET_NODES = (ModelCallLimitMiddleware.__name__, ToolCallLimitMiddleware.__name__)
@@ -66,7 +67,27 @@ class TruncationRecoveryMiddleware(AgentMiddleware):
         if (not isinstance(last, AIMessage) or not is_truncated(last) or last.tool_calls
                 or _recovered_this_turn(messages)):
             return None
-        return {"messages": [HumanMessage(RECOVERY_PROMPT, name=RECOVERY_NAME)], "jump_to": "model"}
+        prompt = RECOVERY_PROMPT_CUT if last.text.strip() else RECOVERY_PROMPT
+        return {"messages": [HumanMessage(prompt, name=RECOVERY_NAME)], "jump_to": "model"}
+
+
+RECOVERY_NODE = TruncationRecoveryMiddleware.__name__  # 안내를 덧붙이는 노드는 "<이름>.after_model" 이다
+
+
+def recovery_notice(node: str, message: BaseMessage) -> bool:
+    """복구 미들웨어가 방금 덧붙인 안내인지.
+
+    노드를 보는 이유: PatchToolCallsMiddleware 는 승인 중 끊긴 턴 다음에 기록 전체를 다시 내보내므로 옛 안내가 섞인다.
+    """
+    return node.startswith(RECOVERY_NODE) and is_recovery(message)
+
+
+def budget_stop(node: str, message: BaseMessage) -> bool:
+    """예산 미들웨어(exit_behavior="end")가 턴을 끝내며 남긴 AI 메시지인지.
+
+    model 이 아닌 노드의 AI 메시지가 모두 이것은 아니다. HITL after_model 은 승인 뒤 같은 응답을 다시 내보낸다.
+    """
+    return node.startswith(BUDGET_NODES) and isinstance(message, AIMessage) and bool(message.text)
 
 
 def _limit(message: AIMessage) -> int:
@@ -95,9 +116,9 @@ class TurnStops:
                     self.last, self.last_is_retry = message, self.recoveries > 0
                     if is_truncated(message):
                         self.truncated.append(message)
-                elif is_recovery(message):
+                elif recovery_notice(node, message):
                     self.recoveries += 1
-                elif isinstance(message, AIMessage) and node.startswith(BUDGET_NODES):
+                elif budget_stop(node, message):
                     self.budget = message.text
 
     def warnings(self) -> list[str]:

@@ -383,6 +383,16 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
 - **확인하지 못한 것**
   - Anthropic 직접 호출(`ChatAnthropic`) 경로는 실측하지 않았다. thinking 도중 `max_tokens`로 잘린 thinking 블록을 다시 보낼 때 API가 받아들이는지 모른다. OpenRouter 경로는 az-quiz 세션으로 확인됐다.
   - 서브에이전트(ns가 있는 조각)의 잘림은 경고에 넣지 않는다. 지금은 서브에이전트를 쓰지 않는다.
+- **리뷰 반영 (2026-11-06)**
+  - **B1**: `render.py`가 `model`이 아닌 노드의 AI 메시지를 모두 노란 답변으로 그렸다. 두 경로에서 같은 텍스트가 다시 찍혔다.
+    - HITL `after_model`은 승인 뒤 같은 응답을 다시 내보낸다. 그래서 "텍스트 + 도구 호출" 응답을 승인할 때마다 텍스트가 한 번 더 찍혔다.
+    - `PatchToolCallsMiddleware.before_agent`는 승인 중 끊긴 턴 다음에 `[RemoveMessage(REMOVE_ALL), *기록 전체]`를 내보낸다. 그래서 옛 답변과 **옛 도구 결과**(이것은 main에도 있던 문제)가 다시 찍히고, `last_text`도 옛 텍스트가 될 수 있었다.
+    - 수정: 예산 노드(`budget_stop`)의 메시지만 그린다. 기록을 통째로 다시 쓰는 update는 그리지 않는다(`rewrites_history`).
+  - **B2**: 복구 안내도 노드를 보지 않아, 다시 내보낸 옛 안내가 다시 찍히고 `TurnStops.recoveries`가 늘었다. `recovery_notice`가 `TruncationRecoveryMiddleware` 노드의 것만 센다.
+  - **K4**: 실제 그래프 간선으로 순서를 고정하는 시험을 넣었다. 복구 `after_model`이 루프 출구이고, 그보다 앞에서 모델 호출 상한이 집계하며, `jump_to "model"`은 `ModelCallLimitMiddleware.before_model`로 간다.
+  - **M1**: 안내를 둘로 나눴다. 생각만 하다 잘린 경우와 답변이 끊긴 경우("끊긴 곳부터 이어서 짧게 마무리하라")다.
+  - **M2**: 프롬프트 예시를 `];` 바꾸기에서 고유한 끝 표식(`// END-OF-DATA`) 줄을 바꾸는 방식으로 바꿨다. 파일을 나눠도 된다고 적었다. `];`는 여러 번 나올 수 있어 `edit_file`이 실패한다.
+  - 시험 4개를 추가하고 M1 확인을 기존 시험에 넣었다. `test_stops.py`가 23개, 전체가 194개다. 수정 전 코드로 돌리면 새 시험이 실패하는 것을 확인했다.
 
 ### 4단계 — 평가·확장 (선택)
 - `evals/`: 수정 과제 5~10개(fixture 저장소와 숨김 검증 테스트)를 헤드리스로 돌려 통과율, 비용, 시간을 집계한다. `pjt\Day04\coding_skills\verify_agent.py` 패턴을 참고한다.

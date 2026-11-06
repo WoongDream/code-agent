@@ -26,6 +26,7 @@ from code_agent.agent import INTERRUPT_TOOLS, build_agent
 from code_agent.approval import REJECT_MESSAGE
 from code_agent.render import describe_call
 from code_agent.settings import load_settings
+from code_agent.stops import is_recovery
 from code_agent.tracing import make_tracer
 from code_agent.usage import Usage
 from code_agent.worklog import WorkLog, diff_snapshots, one_line, session_context, snapshot
@@ -40,7 +41,7 @@ def load_turns(conn: sqlite3.Connection, thread_id: str, workspace: Path) -> lis
     messages = agent.get_state({"configurable": {"thread_id": thread_id}}).values.get("messages", [])
     turns: list[list] = []
     for message in messages:
-        if isinstance(message, HumanMessage):
+        if isinstance(message, HumanMessage) and not is_recovery(message):  # 잘림 자동 복구 안내는 같은 턴이다
             turns.append([message])
         elif turns:
             turns[-1].append(message)

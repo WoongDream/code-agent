@@ -6,6 +6,7 @@ import platform
 from pathlib import Path
 
 from code_agent.backend import ARTIFACTS_ROUTE
+from code_agent.models import MAX_TOKENS
 
 CODING_PROMPT = """\
 너는 사용자의 로컬 작업 폴더에서 코드를 읽고 고치고 실행하는 터미널 코딩 에이전트다. 답변은 한국어로 한다.
@@ -46,6 +47,14 @@ CODING_PROMPT = """\
 - .env 같은 비밀값 파일은 파일 도구로 읽거나 쓸 수 없다. 셸로도 비밀값을 출력하지 않고(cat .env, printenv 등), commit 하지 않는다.
 """
 
+# 생각만 하다 출력 한도를 다 쓴 사례(az-quiz)가 있어 규칙으로 둔다. 숫자는 models.MAX_TOKENS 와 맞춘다
+_OUTPUT_LIMIT = f"""
+# 출력 한도
+- 응답 하나의 출력은 생각(thinking)을 포함해 {MAX_TOKENS:,}토큰까지다. 넘으면 응답이 잘리고, 그때까지 생각한 내용은 결과로 남지 않는다.
+- 큰 데이터나 긴 파일은 생각 속에서 완성하지 않는다. 짧게 계획한 뒤 바로 파일에 나눠 쓴다.
+  예: 문제 150개짜리 데이터 파일이면 write_file 로 처음 50개를 쓰고, 나머지는 50개씩 edit_file 로 끝부분(`];` 등)을 바꿔 이어 붙인다.
+"""
+
 _RUNTIME = """
 # 실행 환경
 - 작업 폴더: {workspace}
@@ -63,7 +72,7 @@ _SHELLS = {
 
 
 def coding_prompt(*, workspace: Path, shell: str) -> str:
-    return CODING_PROMPT + _RUNTIME.format(
+    return CODING_PROMPT + _OUTPUT_LIMIT + _RUNTIME.format(
         workspace=workspace, os_name=f"{platform.system()} {platform.release()}",
         shell_desc=_SHELLS.get(shell, shell), artifacts=ARTIFACTS_ROUTE,
     )

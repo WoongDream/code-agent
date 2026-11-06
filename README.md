@@ -22,6 +22,7 @@ uv run code-agent --resume <세션 ID>
 - 슬래시 커맨드: `/help`, `/new`, `/mode <모드>`, `/diff`, `/todos`, `/cost`, `/exit`. Ctrl+C 는 실행 중인 턴만 취소한다.
 - 턴이 끝날 때마다 모델 호출 수·토큰(캐시 읽기/쓰기)·비용을 한 줄로 보이고, `/cost` 는 세션 합계를 보인다. 비용은 OpenRouter 가 알려 준 값이다.
 - OpenRouter 의 Anthropic 모델은 프롬프트 캐시(5분 TTL)를 자동으로 켠다.
+- 응답이 출력 한도(64,000토큰, 생각 포함)에 걸려 잘렸는데 도구 호출이 없으면, 턴을 끝내지 않고 한 번 다시 요청한다(턴당 1번). 그래도 잘렸거나 예산 상한(모델 100회·도구 300회)에 걸려 멈추면 턴 끝에 노란 경고를 보인다. '계속해줘'로 이어 갈 수 있다.
 - 세션과 큰 도구 결과는 `~/.code-agent/`(`sessions.db`, `artifacts/`)에 저장해 작업 폴더를 더럽히지 않는다.
 
 ## Langfuse 트레이스 (선택)
@@ -36,7 +37,7 @@ uv sync --extra openrouter --extra langfuse
 - 그 아래에 그래프 노드, 모델 호출(입력 전체·출력·도구 선택·reasoning 텍스트·토큰), 도구 실행(인자·결과)이 남는다. 승인 대기 후 재개도 같은 트레이스로 이어진다.
 - 승인 결정은 `approval:<도구>` event 로 남는다(호출 요약, approve/reject, 자동인지 사람이 정했는지, 거부 사유). 거부는 WARNING 이다.
 - `turn` 출력에는 최종 답변과 함께 작업 기록(실행한 도구와 결과 요약, 승인 결정, 바뀐 파일, diff)이 남는다. Langfuse LLM-as-a-Judge 평가기는 같은 트레이스의 다른 observation 을 읽지 못하므로, `turn` 하나만 보고 채점할 수 있게 하려는 것이다. `.env` 는 diff 에 넣지 않는다.
-- 중단(Ctrl+C)과 오류는 `turn` 을 ERROR 로 표시한다.
+- 중단(Ctrl+C)과 오류는 `turn` 을 ERROR 로 표시한다. 출력 한도로 잘린 응답과 예산 상한 도달은 WARNING 으로 표시하고 작업 기록에 `## 경고` 절을 남긴다.
 - 에이전트가 읽은 코드와 명령 출력이 Langfuse 로 전송된다. `.env` 내용은 가드가 막는다.
 - **비용**: Langfuse 는 모델 정의로 비용을 계산한다. `anthropic/claude-opus-5.5` 같은 OpenRouter 이름은 기본 정의에 없어 Project Settings > Models 에 가격을 등록해야 한다(사용량 키: `input`, `output`, `output_reasoning`, `input_cache_read`, `input_cache_creation`). OpenRouter 가 알려 준 실제 비용은 `turn` 의 metadata `usage` 와 `/cost` 에 있다.
 

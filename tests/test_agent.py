@@ -55,6 +55,8 @@ def test_system_prompt_has_runtime_info(tmp_path: Path) -> None:
     system = h.model.calls[0][0].text
     assert str(h.workspace) in system
     assert "/.code-agent-artifacts/" in system
+    assert "생각(thinking)을 포함해 64,000토큰까지" in system  # 출력 한도와 파일에 나눠 쓰기 규칙
+    assert "write_file 로 처음 50개를 쓰고" in system
 
 
 def test_execute_interrupts_with_approve_or_reject_only(tmp_path: Path) -> None:

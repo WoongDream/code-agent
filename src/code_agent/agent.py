@@ -32,6 +32,7 @@ from code_agent.guards import DotenvGuardMiddleware
 from code_agent.models import make_model
 from code_agent.prompts import coding_prompt
 from code_agent.settings import Settings
+from code_agent.stops import TruncationRecoveryMiddleware
 
 INTERRUPT_TOOLS = ("execute", "write_file", "edit_file", "delete")
 MODEL_CALLS = 100  # 사용자 메시지 하나(재개 포함)의 모델 호출 상한
@@ -65,8 +66,9 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
     _disable_general_purpose_subagent(model)
     if backend is None:
         backend = make_backend(workspace, artifacts_dir=settings.data_dir / "artifacts", shell=settings.shell)
-    middleware: list[Middleware] = [TodoListMiddleware(), DotenvGuardMiddleware(), OpenRouterCacheMiddleware(),
-                                    *budget_middleware()]
+    # 잘림 복구는 맨 앞이어야 after_model 이 예산 미들웨어의 호출 집계 뒤에 돈다(after_model 은 역순)
+    middleware: list[Middleware] = [TruncationRecoveryMiddleware(), TodoListMiddleware(), DotenvGuardMiddleware(),
+                                    OpenRouterCacheMiddleware(), *budget_middleware()]
     shell = cast(WindowsShellBackend, backend.default).shell  # default 는 make_backend 의 셸 백엔드다
     return create_deep_agent(
         name="code-agent", model=model, backend=backend,

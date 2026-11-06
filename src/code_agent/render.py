@@ -1,6 +1,7 @@
 """스트림 조각을 터미널에 그린다. AI 텍스트는 토큰 단위로, 도구 호출은 이름과 핵심 인자만, 도구 결과는 앞 몇 줄만 보인다.
 
-messages 모드에서는 model 노드의 AI 메시지만, updates 모드에서는 도구 호출·결과·todo 만 쓴다(중복 출력 방지).
+messages 모드에서는 model 노드의 AI 메시지만, updates 모드에서는 도구 호출·결과·todo 와 model 이 아닌 노드가 남긴
+AI 메시지(예산 상한 도달 안내), 잘림 자동 복구 안내만 쓴다(중복 출력 방지).
 """
 
 from __future__ import annotations
@@ -14,6 +15,8 @@ from rich.console import Console, Group, RenderableType
 from rich.markup import escape
 from rich.syntax import Syntax
 from rich.text import Text
+
+from code_agent.stops import is_recovery
 
 RESULT_LINES = 6
 _TODO_MARK = {"completed": "[green]✔[/]", "in_progress": "[yellow]▶[/]", "pending": "[dim]○[/]"}
@@ -62,6 +65,13 @@ class Renderer:
                     self.last_text = message.text
                 for call in message.tool_calls:
                     self._line(f"{prefix}[cyan]●[/] {escape(describe_call(call))}")
+            elif is_recovery(message):
+                self._line(f"{prefix}[yellow]응답이 출력 한도에 걸려 잘렸다. 결과물을 바로 쓰라고 안내하고 한 번 다시 요청한다.[/]")
+            elif isinstance(message, AIMessage) and message.text:
+                # 예산 미들웨어(exit_behavior="end")의 종료 메시지처럼 model 이 아닌 노드가 남긴 답변
+                self._line(f"{prefix}[yellow]{escape(message.text)}[/]")
+                if not prefix:
+                    self.last_text = message.text
             elif isinstance(message, ToolMessage):
                 self._tool_result(message, prefix)
         if isinstance(update.get("todos"), list):

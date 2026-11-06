@@ -44,8 +44,8 @@ class FakeTurn:
     def decision(self, action: dict, decision: dict, auto: bool) -> None:
         self.decisions.append((action["args"].get("command", ""), decision["type"], auto, reject_reason(decision)))
 
-    def end(self, *, output, usage, error=None) -> None:
-        self.ended = {"output": output, "usage": usage, "error": error}
+    def end(self, *, output, usage, error=None, warnings=()) -> None:
+        self.ended = {"output": output, "usage": usage, "error": error, "warnings": list(warnings)}
 
 
 class FakeTracer:

@@ -18,7 +18,7 @@ jobs:
       PYTHONUTF8: "1"
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.3.3  # setup-uv 는 v10 같은 메이저 태그를 두지 않는다
         with:
           version: "0.13.7"
           python-version: "3.13"

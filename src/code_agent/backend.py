@@ -76,25 +76,39 @@ def process_shell_env() -> dict[str, str]:
     return dict(_process_shell_env())
 
 
-def find_git_bash() -> Path | None:
+def system32(name: str) -> str:
+    """Windows 기본 도구의 절대 경로. 이름만 주면 현재 폴더의 같은 이름 실행 파일이 먼저 불릴 수 있다."""
+    return str(Path(os.environ.get("SystemRoot") or r"C:\Windows", "System32", name))
+
+
+def safe_which(name: str, workspace: Path | None = None) -> str | None:
+    """shutil.which 결과 중 절대 경로이고 현재 폴더·작업 폴더 밖인 것만(environment.trusted_tool 과 같은 기준).
+
+    Windows 의 which 는 NoDefaultCurrentDirectoryInExePath 가 없으면 현재 폴더를 먼저 찾는다(cli.main 이 설정한다).
+    """
+    return trusted_tool(shutil.which(name), workspace)
+
+
+def find_git_bash(workspace: Path | None = None) -> Path | None:
     """git.exe 의 상위 폴더 중 bin/bash.exe 를 가진 Git 루트를 찾는다. System32 의 bash.exe 는 WSL 이라 쓰지 않는다."""
-    git = shutil.which("git")
+    git = safe_which("git", workspace)
     roots = [*Path(git).resolve().parents] if git else []
     roots += [Path(p, "Git") for p in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")) if p]
     return next((root / "bin" / "bash.exe" for root in roots if (root / "bin" / "bash.exe").is_file()), None)
 
 
-def resolve_shell(preference: str = "") -> tuple[str, list[str]]:
+def resolve_shell(preference: str = "", workspace: Path | None = None) -> tuple[str, list[str]]:
     """(셸 이름, 명령 앞에 붙일 argv). 로그인 셸(-l)은 프로필을 읽어 느리고 cwd 를 바꿀 수 있어 쓰지 않는다."""
     if sys.platform != "win32":
         return "bash", ["/bin/bash", "-c"]
     if preference in ("", "bash"):
-        bash = find_git_bash()
+        bash = find_git_bash(workspace)
         if bash:
             return "bash", [str(bash), "-c"]
         if preference == "bash":
             raise RuntimeError("Git Bash(bash.exe)를 찾지 못했습니다. CODE_AGENT_SHELL=powershell 로 바꾸세요.")
-    return "powershell", ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"]
+    powershell = system32(r"WindowsPowerShell\v1.0\powershell.exe")
+    return "powershell", [powershell, "-NoProfile", "-NonInteractive", "-Command"]
 
 
 class WindowsShellBackend(LocalShellBackend):
@@ -104,7 +118,7 @@ class WindowsShellBackend(LocalShellBackend):
                  env: Mapping[str, str] | None = None) -> None:
         super().__init__(root_dir=root_dir, virtual_mode=True, timeout=timeout,
                          env=process_shell_env() if env is None else dict(env), inherit_env=False)
-        self.shell, self._argv = resolve_shell(shell)
+        self.shell, self._argv = resolve_shell(shell, Path(root_dir))
 
     def execute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         if not command or not isinstance(command, str):
@@ -162,7 +176,7 @@ def _decode(data: bytes) -> str:
 def _kill_tree(proc: subprocess.Popen) -> None:
     """Windows 에는 프로세스 그룹 종료가 없어 taskkill /T 로 자식까지 끝낸다."""
     if sys.platform == "win32":
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, check=False)
+        subprocess.run([system32("taskkill.exe"), "/T", "/F", "/PID", str(proc.pid)], capture_output=True, check=False)
     else:
         os.killpg(proc.pid, signal.SIGKILL)
     try:

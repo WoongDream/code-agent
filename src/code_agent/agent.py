@@ -85,10 +85,10 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
     if backend is None:
         backend = make_backend(workspace, artifacts_dir=settings.data_dir / "artifacts", shell=settings.shell)
     # 잘림 복구는 맨 앞이어야 after_model 이 예산 미들웨어의 호출 집계 뒤에 돈다(after_model 은 역순).
-    # 요약은 이름이 같아 core 자리를 대신하므로 목록 위치와 상관없다.
-    middleware: list[Middleware] = [TruncationRecoveryMiddleware(), TodoListMiddleware(), DotenvGuardMiddleware(),
-                                    OpenRouterCacheMiddleware(), *budget_middleware(),
-                                    summarization_middleware(model, backend, settings.context_tokens)]
+    # 요약은 이름이 같아 core 자리를 대신하므로 목록 위치와 상관없다. .env 가드는 작업 폴더로 실제 파일 이름도 본다.
+    middleware: list[Middleware] = [TruncationRecoveryMiddleware(), TodoListMiddleware(),
+                                    DotenvGuardMiddleware(workspace), OpenRouterCacheMiddleware(),
+                                    *budget_middleware(), summarization_middleware(model, backend, settings.context_tokens)]
     shell = cast(WindowsShellBackend, backend.default).shell  # default 는 make_backend 의 셸 백엔드다
     return create_deep_agent(
         name="code-agent", model=model, backend=backend,

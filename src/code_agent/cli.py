@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import subprocess
 import sys
@@ -21,10 +22,10 @@ from rich.syntax import Syntax
 
 from code_agent.agent import build_agent, run_turn
 from code_agent.approval import APPROVE, MODES, decide_all, reject
-from code_agent.backend import process_shell_env, resolve_shell
+from code_agent.backend import process_shell_env, resolve_shell, safe_which
 from code_agent.environment import probe, render
 from code_agent.render import Renderer, describe_action, todos_markup
-from code_agent.settings import Settings, load_settings
+from code_agent.settings import REPO_ROOT, Settings, load_settings
 from code_agent.stops import TurnStops
 from code_agent.tracing import Tracer, langfuse_installed, make_tracer
 from code_agent.usage import Usage, UsageCallback
@@ -256,7 +257,11 @@ class App:
                 return reject(self.read_line("거부 이유(선택, Enter 로 건너뜀) › ").strip())
 
     def show_diff(self) -> None:
-        result = subprocess.run(["git", "diff"], cwd=self.workspace, capture_output=True, check=False)
+        git = safe_which("git", self.workspace)  # 이름만 주면 현재 폴더에 심은 git.exe 가 먼저 불릴 수 있다
+        if git is None:
+            self.console.print("[red]git 을 찾지 못했다.[/]")
+            return
+        result = subprocess.run([git, "diff"], cwd=self.workspace, capture_output=True, check=False)
         text = result.stdout.decode("utf-8", errors="replace")
         if result.returncode != 0:  # 저장소 밖이면 긴 usage 가 나오므로 첫 줄만 보인다
             first = result.stderr.decode("utf-8", errors="replace").strip().splitlines()[:1]
@@ -293,6 +298,22 @@ def _utf8_stdio() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+def repo_warning(workspace: Path) -> str | None:
+    """작업 폴더가 code-agent 저장소(실제 키가 든 .env 가 있다)이거나 그것을 품은 폴더면 경고 문구."""
+    root = REPO_ROOT.resolve()
+    if not (root / ".env").is_file() or not root.is_relative_to(workspace.resolve()):
+        return None
+    where = "code-agent 저장소" if root == workspace.resolve() else "code-agent 저장소를 품은 폴더"
+    return f"작업 폴더가 {where}다. 실제 키가 든 .env 가 있다. 다른 폴더를 -w 로 지정하라."
+
+
+def _confirm(prompt: str) -> bool:
+    """대화형이면 y/N 을 묻는다. 파이프 입력이면 첫 요청을 먹어 버리므로 묻지 않고 진행한다."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return True
+    return input(prompt).strip().lower() in ("y", "yes", "ㅛ")
+
+
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="code-agent", description="Deep Agents 기반 터미널 코딩 에이전트")
     parser.add_argument("--workspace", "-w", help="작업 폴더 (기본: 현재 폴더)")
@@ -303,6 +324,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if sys.platform == "win32":
+        # 이것이 없으면 shutil.which 가 현재 폴더를 먼저 찾아, 악성 저장소 폴더에서 띄우기만 해도 그 안의 git.cmd 등이
+        # 불릴 수 있다. Python 3.12+ 의 which 는 이 변수를 따른다. 셸 백엔드도 이 환경을 물려받는다
+        os.environ.setdefault("NoDefaultCurrentDirectoryInExePath", "1")
     _utf8_stdio()
     args = parse_args(argv)
     console = Console(highlight=False)
@@ -331,6 +356,12 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if workspace in (Path.home(), Path(workspace.anchor)):
         console.print(f"[yellow]주의: 작업 폴더가 {escape(str(workspace))} 다. 파일 도구가 이 폴더 전체에 접근한다.[/]")
+    if warning := repo_warning(workspace):
+        console.print(f"[bold yellow]주의: {escape(warning)}[/]")
+        # -w 를 빼먹어 저장소 폴더에서 띄운 경우가 많아 한 번 확인한다. 명시했거나 이어 가는 세션이면 묻지 않는다
+        if not args.workspace and not args.resume and not _confirm("그래도 이 폴더에서 시작할까? [y/N] › "):
+            console.print("[dim]시작하지 않았다. 작업할 폴더를 -w 로 지정하라.[/]")
+            return 2
 
     try:
         # --resume 은 그 thread 에 저장한 절을 그대로 쓴다(다시 탐지하면 system 이 바뀔 수 있다)
@@ -355,5 +386,5 @@ def main(argv: list[str] | None = None) -> int:
 
 def detect_environment(shell_preference: str, workspace: Path | None = None) -> str:
     """셸 백엔드가 쓸 환경(process_shell_env)으로 도구를 확인해 '이 PC 의 도구' 절을 만든다. 약 1초 걸린다."""
-    shell = resolve_shell(shell_preference)[0]
+    shell = resolve_shell(shell_preference, workspace)[0]
     return render(probe(process_shell_env(), workspace=workspace), shell)

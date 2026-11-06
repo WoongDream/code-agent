@@ -582,6 +582,39 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
 | `permissions`가 셸 백엔드와 충돌한다(0단계에서 확인) | `.env` 차단을 `wrap_tool_call` 미들웨어(`DotenvGuardMiddleware`)로 구현 |
 | Opus 5.5 preserved thinking: 요약 미들웨어가 이력을 바꾸면 thinking 블록 검증에서 400이 날 수 있다 | 긴 세션 테스트로 확인하고, 문제가 생기면 요약 트리거와 모델 설정을 조정 |
 | 0.7.14 분석 문서와 0.7.32의 차이 | 0단계 3에서 설치된 소스 기준으로 확인 |
+| `.env`·작업 폴더 밖·개인 키를 사람에게 묻지 않고 읽는 우회(보안 점검 S1~S5, S12, S13) | 아래 "보안 1차"(2026-11-06) |
+| 현재 폴더에 심은 실행 파일(git.cmd 등)이 승인 없이 불림 | 아래 "보안 1차"(2026-11-06) |
+
+### 보안 1차 (2026-11-06, 사양 `code-agent-specs/security-review.md`)
+- **기준**: session2가 가짜 비밀값(DUMMY)과 임시 폴더로 실측한 우회 사례다. 모든 사례를 회귀 시험(`test_security.py`)으로 넣었다.
+  - main의 원래 코드로 돌리면 우회 사례가 모두 실패하는 것을 확인했다. 통과하는 것은 수정 전후 모두 통과해야 하는 대조 사례뿐이다.
+- **S1 파일 도구 `.env` 가드** (`guards.py`)
+  - Windows는 대소문자, 끝 공백·점(`.env `), 스트림(`.env::$DATA`), 8.3 짧은 이름(`ENV~1`)을 같은 파일로 연다.
+  - 대응 1: 이름을 정규화한다(`file_name`: casefold, `:` 뒤 제거, 끝 공백·점 제거). `.env.Example` 같은 견본은 그대로 허용한다.
+  - 대응 2: `DotenvGuardMiddleware(workspace)`가 실제 파일의 긴 이름(`Path.resolve`)으로 다시 판정한다. 이 PC에서 `ENV~1`, `.ENV`, `.env `, `.env::$DATA`, `.env.`가 모두 `.env`로 풀리는 것을 확인했다.
+  - 대상이 없는 쓰기는 8.3 모양 이름(`~숫자`)이면 보수적으로 막는다.
+- **S2 셸 자동 승인의 `.env`**: `re.IGNORECASE`를 붙이고, 8.3 모양 인자(`~숫자`)가 있으면 묻는다. git 인자(`HEAD~1`, `HEAD:path`)는 리비전이라 제외한다.
+- **S3 옵션 값**: `--opt=값`의 값도 경로로 검사한다. `files0-from`이 들어간 인자는 무조건 묻는다. `wc --files0-from=F`는 F의 내용을 오류 메시지로 내보낸다.
+- **S4·S13 PowerShell 공급자 경로·드라이브**: `::`(`FileSystem::C:\…`)나 `이름:`(`env:`, `HKCU:`, `Cert:`, `Variable:`)으로 시작하는 인자는 작업 폴더 밖으로 본다.
+- **S5 유니코드**
+  - 둥근 따옴표(‘ ’ ‚ ‛ “ ” „)와 긴 대시(– — ―)는 판정 전에 ASCII로 바꾼다. PowerShell은 이것들을 따옴표와 `-`로 읽는다.
+  - 비ASCII 제어·서식·공백 문자(bidi, 폭 없는 문자, NBSP 등)가 있으면 묻는다.
+- **S12**: `tail -f`, `-F`, `--follow`(묶은 `-fn5` 포함)는 묻는다. 셸 제한 시간 120초까지 돌아오지 않는다.
+- **개인 키·자격 증명 읽기는 묻기**(사용자 결정)
+  - 대상: `id_rsa`·`id_ed25519` 등(`.pub` 제외), `*.pem`/`*.key`/`*.p12`/`*.pfx`, `credentials*.json`, `*service-account*.json`, `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, `.aws/credentials`, `secrets.*`
+  - 파일 도구: 가드가 HITL과 같은 모양으로 `interrupt`를 일으킨다. 그래서 CLI의 승인 흐름이 그대로 묻는다. manual·auto-edit는 묻고, yolo는 자동이다. 거부하면 내용이 모델에 가지 않는다.
+  - 셸: 같은 이름이 인자에 있으면 자동 승인하지 않는다.
+- **현재 폴더의 실행 파일 가로채기** (PR #8 리뷰에서 발견, main에도 있던 경로)
+  - Windows의 `shutil.which`는 `NoDefaultCurrentDirectoryInExePath`가 없으면 현재 폴더를 먼저 찾는다. 그래서 악성 저장소 폴더에서 띄우기만 해도 그 안의 `git.cmd`나 `bin/bash.exe`가 에이전트 셸이 될 수 있었다.
+  - `cli.main` 맨 앞에서 그 변수를 `1`로 정한다.
+  - `safe_which`는 현재 폴더·작업 폴더 안이거나 절대 경로가 아닌 결과를 버린다. `find_git_bash`와 `/diff`의 git이 이것을 쓴다.
+  - `powershell.exe`와 `taskkill`은 `%SystemRoot%\System32` 절대 경로로 부른다.
+  - 시험은 그 변수를 지우고 임시 폴더로 chdir한 뒤 빈 `git.cmd`·`bin/bash.exe`를 둔다(실행하지 않고 존재만 본다). which가 실제로 그것을 먼저 고르는지도 확인한다.
+- **O4 저장소 폴더에서 띄움**(task12-onboarding.md)
+  - 작업 폴더가 code-agent 저장소(실제 키가 든 `.env`가 있다)이거나 그것을 품은 폴더면 시작할 때 경고한다.
+  - `-w`를 빼먹었고, 이어 가는 세션이 아니고, 대화형이면 `[y/N]`으로 한 번 확인한다. 기본은 시작하지 않는 것이다.
+  - 파이프 입력이면 첫 요청을 먹어 버리므로 묻지 않는다. `-w`를 명시했으면 경고만 한다.
+- **이번에 하지 않은 것**: S6~S11. S6의 package.json 등은 넣지 않기로 했고(사용자 결정), S11 AGENTS.md 신뢰 확인은 task8에서 한다.
 
 ## 6. 검증 방법
 1. `uv run ruff check . && uv run pytest -q`: 모델 호출 없이 백엔드, 승인, 에이전트 배선을 검증한다.

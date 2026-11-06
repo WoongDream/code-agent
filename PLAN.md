@@ -489,6 +489,7 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
     - 잘린 호출 막기 6개: manual에서 승인 안 물음, auto-edit에서 파일 안 바뀜(write·edit), 병렬 중 잘린 것만 막음, 잘린 execute 실행 0회, 단위
   - 기존 시험 1개(잘렸지만 도구 호출이 있으면 재시도하지 않는다)는 새 결정에 맞게 "유일한 잘린 호출은 막고 재시도한다"로 바꿨다.
   - `wrap_model_call`의 막기를 빼면 막기 시험 7개가 실패하는 것을 확인했다.
+  - #6(개선 2)을 merge로 합쳤다(b513c3e). 두 기능이 만나는 곳은 시험 1개로 확인한다: 잘린 호출이 '작성 중'에서 '실행 중'으로 가지 않고, 막음 줄과 복구 안내 뒤 '생각 중'으로 간다. 합친 뒤 전체 246개다.
 - **후속**
   - **reasoning_details 병합 부풀림**: langchain-core가 스트림 청크를 `index`로 합칠 때 문자열 필드를 이어 붙여, `format`이 "anthropic-claude-v1"을 청크 수만큼 반복한다. 정상 응답도 4~267번, az-quiz 잘린 응답은 8,024번이었다.
     - langchain-openrouter의 `_merge_reasoning_details`는 항목이 하나뿐이면 그대로 두므로 이 값이 매 요청에 실려 나간다. 지금까지 OpenRouter는 받아들였다.

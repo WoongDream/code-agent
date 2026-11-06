@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from langchain_core.language_models import BaseChatModel
+from langchain_core.language_models import BaseChatModel, ModelProfile
 
 from code_agent.settings import Settings
 
@@ -17,10 +17,24 @@ def make_model(settings: Settings) -> BaseChatModel:
     if not name:
         raise ValueError(f"모델은 'anthropic:<id>' 또는 'openrouter:<id>' 형식이어야 합니다: {settings.model!r}")
     if provider == "anthropic":
-        return _anthropic(settings, name)
+        return with_context_limit(_anthropic(settings, name), settings.context_tokens)
     if provider == "openrouter":
-        return _openrouter(settings, name)
+        return with_context_limit(_openrouter(settings, name), settings.context_tokens)
     raise ValueError(f"지원하지 않는 모델 공급자입니다: {provider!r}")
+
+
+def with_context_limit(model: BaseChatModel, limit: int) -> BaseChatModel:
+    """프로필의 max_input_tokens 를 limit 로 정한 복사본. 알려진 창이 더 작으면 그쪽을 쓰고 다른 키는 유지한다.
+
+    요약 시점이 이 값을 따른다(agent.summarization_middleware). langchain-openrouter 0.2.8 데이터에는 5.5 계열
+    (anthropic/claude-opus-5.5 등)이 없어 프로필이 비고, Anthropic 직결은 1M 창이라 그대로 두면 요약이 너무 늦다.
+    model_copy 는 두 공급자 모두 클라이언트를 유지한다.
+    """
+    profile = ModelProfile(**(model.profile or {}))
+    known = profile.get("max_input_tokens")
+    profile["max_input_tokens"] = min(limit, known) if isinstance(known, int) else limit
+    profile.setdefault("max_output_tokens", MAX_TOKENS)
+    return model.model_copy(update={"profile": profile})
 
 
 def _anthropic(settings: Settings, name: str) -> BaseChatModel:

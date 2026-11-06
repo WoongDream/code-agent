@@ -8,7 +8,7 @@ messages 모드에서는 model 노드의 AI 메시지만, updates 모드에서�
 OpenRouter 는 생각을 청크의 additional_kwargs 에 담는다. reasoning_content 는 content_blocks 의 reasoning 블록이 되지만
 reasoning_details 에만 담긴 청크는 블록이 없어 그 text·summary 를 쓴다.
 모델과 도구를 기다리는 동안에는 상태 줄(StatusLine)에 단계·진행량·경과 시간을 보인다. 생각이 오래 걸리거나 큰 도구 인자를
-쓰는 동안에도 멈춘 것처럼 보이지 않게 하려는 것이다(az-quiz 첫 호출 약 15분, quizzes.js 인자 작성 99초).
+쓰는 동안에도 멈춘 것처럼 보이지 않게 하려는 것이다(az-quiz 첫 호출 658초(약 11분, Langfuse 실측), quizzes.js 인자 작성 99초).
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from rich.status import Status
 from rich.syntax import Syntax
 from rich.text import Text
 
-from code_agent.stops import budget_stop, recovery_notice
+from code_agent.stops import HELD_ERROR, RECOVERY_PROMPT_ERROR, budget_stop, recovery_notice
 
 RESULT_LINES = 6
 MEMO_CHARS = 100  # 메모 모드에서 생각 한 줄(문단)에 보이는 글자 수
@@ -162,10 +162,13 @@ class Renderer:
                 for call in message.tool_calls:
                     self._line(f"{prefix}[cyan]●[/] {escape(describe_call(call))}")
                     self._pending[call["id"]] = describe_call(call)
+                if held := message.response_metadata.get("code_agent_held_call"):
+                    self._line(f"{prefix}[yellow]{escape(str(held))} 호출은 {HELD_ERROR}.[/]")
                 if message.tool_calls:
                     self._wait()
             elif recovery_notice(node, message):
-                self._line(f"{prefix}[yellow]응답이 출력 한도에 걸려 잘렸다. 안내를 덧붙여 한 번 다시 요청한다.[/]")
+                why = "공급자 오류로 중단됐다" if message.text == RECOVERY_PROMPT_ERROR else "출력 한도에 걸려 잘렸다"
+                self._line(f"{prefix}[yellow]응답이 {why}. 안내를 덧붙여 한 번 다시 요청한다.[/]")
                 self._wait()
             elif budget_stop(node, message):
                 # 예산 미들웨어의 종료 메시지는 model 이 아닌 노드에서 나온다

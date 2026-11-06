@@ -13,7 +13,7 @@ from deepagents._models import get_model_provider  # 0.7.32 고정 (agent.py 와
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langgraph.config import get_config
 
-CACHE_CONTROL = {"type": "ephemeral"}  # 5분 TTL. 쓰기 1.25배, 읽기 0.1배 가격
+CACHE_CONTROL = {"type": "ephemeral"}  # 5분 TTL. 쓰기 1.25배, 읽기 0.05배(Opus 5.5) 가격
 
 
 def is_anthropic_on_openrouter(model_name: str) -> bool:

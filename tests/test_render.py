@@ -248,3 +248,35 @@ def test_thinking_command_switches_full_reasoning(tmp_path: Path, monkeypatch: p
     assert "생각 원문 표시 → 켬" in text and "생각 원문 표시 → 끔(문단마다 앞부분만 메모로)" in text
     assert [r.full_reasoning for r in recorder.made] == [True, False]
     assert text.count(LONG.strip()) == 1 and LONG[:MEMO_CHARS] + "…" in text
+
+
+def test_cut_tool_call_status_and_notice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """#6 상태 줄과 #7 잘린 호출 막기가 만나는 곳: 작성 중으로 보이던 잘린 write_file 은 '실행 중'이 되지 않고,
+    막았다는 줄과 복구 안내가 나온 뒤 다시 '생각 중'으로 간다."""
+    labels: list[str] = []
+    real_update = StatusLine.update
+
+    def record(self: StatusLine, label: str, detail: str = "") -> None:
+        labels.append(label)
+        real_update(self, label, detail)
+
+    monkeypatch.setattr(StatusLine, "update", record)
+    stop = AIMessageChunk(content="", response_metadata={"finish_reason": "length", "model_provider": "openrouter"})
+    model = StreamingChatModel(steps=[
+        [thought("Writing it all.\n\n"), writing(0, "", name="write_file"),
+         writing(0, '{"file_path": "/q.js", "content": "const q = ['), stop],
+        [openrouter(content="나눠서 쓰겠다")],
+    ])
+    (tmp_path / "ws").mkdir()
+    agent = build_agent(Settings(data_dir=tmp_path / "data"), tmp_path / "ws", InMemorySaver(), model=model)
+    r, out = renderer()
+    r.start()
+    run_turn(agent, {"messages": [{"role": "user", "content": "만들어"}]}, {"configurable": {"thread_id": "t"}},
+             decide=lambda requests: [APPROVE for _ in requests], on_part=r.on_part)
+    r.end_turn()
+    assert not (tmp_path / "ws" / "q.js").exists()
+    assert "write_file /q.js 작성 중" in labels and not any("실행 중" in label for label in labels)
+    assert labels[-1] == "생각 중"  # 복구 안내 뒤 다시 모델을 기다렸다
+    assert plain(out) == ["Writing it all.", "write_file 호출은 출력이 멈춰 인자가 잘렸을 수 있어 실행하지 않았다.",
+                          "응답이 출력 한도에 걸려 잘렸다. 안내를 덧붙여 한 번 다시 요청한다.", "나눠서 쓰겠다"]
+    assert not r.status.visible

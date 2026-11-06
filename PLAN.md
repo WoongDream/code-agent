@@ -300,7 +300,8 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - 조회 API에 주의한다. SDK v5에서 `api.trace.*`와 `GET /api/public/traces`로는 보이지 않았다. `api.observations.get_many(session_id=..., fields="core,basic,model,usage")`로 조회한다.
   - **가격 정의 등록**: `anthropic/claude-opus-5.5`는 Langfuse 기본 정의에 없어 비용이 비었다. 그래서 프로젝트에 직접 등록했다.
     - 패턴: `(?i)^anthropic/claude-opus-5\.5$`
-    - 100만 토큰당 가격: input $4, output·output_reasoning $20, input_cache_read $0.40, input_cache_creation $5
+    - 100만 토큰당 가격: input $4, output·output_reasoning $20, input_cache_read $0.20, input_cache_creation $5
+      - 정정(2026-11-06): 처음에 캐시 읽기를 $0.40(입력의 0.1배)으로 적었다. Opus 5.5 는 0.05배인 $0.20 이다(bomber·az-quiz 실측 역산 $0.19~0.20, Anthropic 문서). Langfuse 정의도 고친다.
     - 시험 generation으로 계산값이 맞는 것을 확인했다. 등록 전에 수집된 generation에는 소급되지 않는다.
 - **LLM-as-a-Judge 준비 (`worklog.py`)**
   - **배경**: Langfuse의 observation 평가기는 같은 트레이스의 다른 observation(도구 실행 등)을 읽지 못한다. 그래서 `turn` 출력을 최종 답변만이 아니라 판단 근거가 되는 작업 기록 전체로 바꿨다.
@@ -396,12 +397,12 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
 
 #### 개선 2 — 생각 중 표시 (2026-11-06, `render.py`)
 - **근거**
-  - 모델이 오래 생각하거나 큰 도구 인자를 쓰는 동안 화면이 멈춘 것처럼 보였다. az-quiz 첫 호출은 약 15분이 걸렸고, quizzes.js(14,755토큰) 인자를 쓰는 99초 동안 화면에 아무것도 없었다. `render.py`는 `tool_call_chunks`를 그리지 않았다.
+  - 모델이 오래 생각하거나 큰 도구 인자를 쓰는 동안 화면이 멈춘 것처럼 보였다. az-quiz 첫 호출은 658초(약 11분, Langfuse 실측)가 걸렸고, quizzes.js(14,755토큰) 인자를 쓰는 99초 동안 화면에 아무것도 없었다. `render.py`는 `tool_call_chunks`를 그리지 않았다.
 - **[V] OpenRouter 생각 청크** (langchain-openrouter 0.2.8 `_convert_chunk_to_message_chunk`, langchain-core `AIMessageChunk.content_blocks`)
   - `delta.reasoning`은 `additional_kwargs["reasoning_content"]`가 되고, 등록된 번역기가 없는 `openrouter`도 best-effort 파싱으로 `reasoning` 블록이 된다.
   - 실제 변환 함수 → 대본 스트리밍 → Renderer로 확인했다. **이 청크는 수정 전에도 찍혔다.** 다만 다음 답변이 같은 줄에 붙었다.
   - `reasoning_details`만 담긴 청크는 `content_blocks`가 `[]`라 찍히지 않았다. 이제 그 `text`·`summary`를 쓴다. 두 필드가 함께 오면 블록 쪽만 써서 두 번 세지 않는다.
-  - az-quiz 기록에서 `reasoning_content`와 `reasoning_details` 텍스트 길이가 같았다(31,160자). 그래서 "15분간 아무것도 안 보였다"의 원인이 화면 그리기인지, 공급자가 생각 요약을 늦게 보낸 것인지는 실측 없이 확정하지 못했다. 상태 줄은 어느 쪽이든 멈춤처럼 보이지 않게 한다.
+  - az-quiz 기록에서 `reasoning_content`와 `reasoning_details` 텍스트 길이가 같았다(31,160자). 그래서 "약 11분간 아무것도 안 보였다"의 원인이 화면 그리기인지, 공급자가 생각 요약을 늦게 보낸 것인지는 실측 없이 확정하지 못했다. 상태 줄은 어느 쪽이든 멈춤처럼 보이지 않게 한다.
   - 참고: langchain-core는 `_stream`을 run_manager 없이 부르고 청크마다 직접 `on_llm_new_token`을 낸다. 그래서 ChatOpenRouter 안의 호출과 겹치지 않는다(토큰이 두 번 오지 않는다).
 - **생각 표시**
   - 줄 단위로 흐리게(dim italic) 찍는다. 줄바꿈 없이 찍으면 상태 줄과 섞이기 때문이다.
@@ -428,6 +429,82 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - 승인 프롬프트 때 꺼져 있음(`pause`를 빼면 실패하는 것을 확인), Ctrl+C 뒤 꺼짐
   - `/thinking` 전환(rich 마크업이 `[on|off]`를 삼키던 것도 고쳤다)
   - 강제 터미널 콘솔로 실제 `Live`를 돌려 스피너와 단계 문구가 그려지는 것도 따로 확인했다.
+
+#### 개선 3 — 컨텍스트 한도와 멈춘 응답 정리 (2026-11-06, 사양 `code-agent-specs/task3-context-and-stops.md`)
+- **사실 정정**
+  - Opus 5.5 캐시 읽기는 $0.20/M(입력의 0.05배)이다. 위 가격 정의의 $0.40과 `caching.py` 주석의 0.1배를 고쳤다.
+  - Opus 5.5에는 preserved thinking이 있다. thinking 블록의 서명은 그 앞의 prefix 전체와 직전 thinking 체인에 묶인다. 그래서 앞쪽 기록을 고치면 뒤쪽 thinking이 무효가 되고, 프롬프트 캐시도 깨진다.
+- **컨텍스트 한도** (`settings.context_tokens`, `models.with_context_limit`)
+  - 기본은 200,000이고 `CODE_AGENT_CONTEXT_TOKENS`로 20,000~1,000,000을 줄 수 있다. 범위 밖이거나 정수가 아니면 시작 때 오류를 낸다.
+  - **[V] 프로필**: langchain-openrouter 0.2.8 데이터에는 5.5 계열(opus·sonnet·haiku-5.5, fable-5.1)이 없어 `profile`이 비어 있다. Anthropic 직결 Opus 5.5와 OpenRouter opus-5는 1M이다.
+  - `make_model`이 두 공급자 모두에 `max_input_tokens=min(설정, 알려진 창)`을 넣는다. 다른 키는 유지하고, `max_output_tokens`가 없으면 64,000을 넣는다. `model_copy`로 만든다.
+  - 비용 근거(session2 시뮬레이션): 5분 넘게 쉬어 캐시가 식으면 최악 입력 비용이 200K는 $0.85, 1M은 $4.25다. 100회를 넘는 긴 세션에서도 200K가 싸다.
+- **요약 자리 대체와 인자 잘림 끄기** (`agent.summarization_middleware`)
+  - **[V]** 프로필이 없으면 deepagents 기본값은 메시지 20개부터 옛 `write_file`·`edit_file` 인자를 2,000자로 자른다(`compute_summarization_defaults`).
+    - 30메시지 시험에서 우리 대체를 빼면 실제로 앞쪽 기록이 바뀌어 실패하는 것을 확인했다.
+    - 이것은 캐시만 깨는 것이 아니라 Opus 5.5의 뒤쪽 thinking도 무효로 만든다.
+  - deepagents `SummarizationMiddleware`를 같은 이름으로 넘겨 core 자리를 제자리에서 대신한다(graph.py `_apply_custom_middleware`).
+    - 설정: `trigger=("tokens", 0.85×한도)`, `keep=("tokens", 0.10×한도)`, `truncate_args_settings=None`
+    - fraction은 프로필이 없는 모델에서 생성자가 ValueError를 내서 tokens로 준다.
+- **멈춘 응답 정리** (`stops.strip_stopped`, K3·K1)
+  - 대상은 도구 호출 없이 멈춘 응답이다. 텍스트만 남기고, 없으면 자리표시를 넣는다(예: `[출력 한도(64,000토큰)에 걸려 잘린 응답: 생각만 하다 끝나 결과물이 없다. 생각 내용은 기록에서 뺐다.]`). Anthropic은 빈 content를 거부한다.
+  - 텍스트가 남으면 끝에 `[출력 한도로 여기서 잘림]`을 붙인다.
+  - `reasoning_content`, `reasoning_details`, thinking·redacted_thinking 블록(서명 없는 것 포함), 잘린 도구 호출을 뺀다. 사용량과 정지 사유는 남기고, 뺀 것은 `response_metadata["code_agent_stripped"]`에 적는다.
+  - **같은 id**로 교체한다. 바뀌는 것은 방금 나온 마지막 메시지뿐이다. 원본은 다음 요청에 실린 적이 없어 캐시에도 없고, 그 뒤에 서명된 thinking도 없다. 그래서 덧붙이기 원칙과 preserved thinking을 깨지 않는다.
+  - 효과: 잘린 64K reasoning을 이후 모든 호출이 다시 보내지 않는다(az-quiz 턴 2에서 약 $1.15).
+    - 실측: az-quiz의 잘린 응답에는 reasoning 31,160자 외에, 청크 병합으로 이어 붙은 서명(171,425자)과 format 필드("anthropic-claude-v1"이 8,024번)도 있었다.
+  - 유효한 호출이 남은 응답은 메시지를 두고, 잘린 호출(`invalid_tool_calls`)의 인자만 `"{}"`로 바꾼다(K2). 그러면 langchain이 '인자가 잘렸다' 결과를 붙인다.
+  - 유효한 호출이 없는 잘린 호출은 정리하면서 빼고, 자리표시에 이름을 남긴다.
+- **멈춘 응답의 마지막 도구 호출은 실행하지 않는다** (`stops.hold_cut_call`, 오케스트레이터 결정 변경)
+  - 처음 결정은 "도구 호출이 있는 응답은 건드리지 않는다"였다. 아래 실측 1에서 langchain-core가 잘린 인자를 `parse_partial_json`으로 고쳐 **유효한 호출**을 만든다는 것이 드러나 바꿨다. 그대로 두면 절반만 쓴 파일이나 잘린 셸 명령(예: 잘린 `rm -rf`)이 실행된다.
+  - 출력 한도·오류·컨텍스트 창으로 멈춘 응답의 마지막 호출(쓰다가 멈춘 것)을 `invalid_tool_calls`(args `"{}"`)로 옮긴다. langchain이 '인자가 잘렸다' 결과를 붙이고 모델이 다시 쓴다. 앞의 완결된 호출은 그대로 실행한다. 남는 유효 호출이 없으면 정리·복구 경로로 간다.
+    - 컨텍스트 창도 넣었다. 출력 도중 창이 차서 끊긴 것이라 같은 위험이 있다.
+  - **`wrap_model_call`에서** 한다. 응답이 state에 들어가기 전이라, HITL `after_model`(우리 `after_model`보다 먼저 돈다)이 잘린 호출의 승인을 묻지 않는다.
+  - 마지막 메시지만 바꾸므로 preserved thinking 원칙과 같다.
+  - 화면에는 "write_file 호출은 출력이 멈춰 인자가 잘렸을 수 있어 실행하지 않았다." 노란 줄과 턴 끝 경고가 나온다.
+- **정지 사유 3분류** (`stop_reason`)
+  - `STOP_LENGTH`(length, max_tokens): 정리, 1회 복구, 경고
+  - `STOP_ERROR`(OpenRouter error): 정리, 1회 복구, 경고. 복구 1회를 출력 한도와 함께 쓴다.
+    - **[V]** choices가 있는 오류 청크는 예외 없이 이 값으로 끝난다. 가짜 SDK로 시험했다.
+  - `STOP_CONTEXT`(Anthropic model_context_window_exceeded): 다시 불러도 같으므로 정리만 하고 경고한다("/new 로 새로 시작하거나 요약한 뒤 이어 가라").
+  - 경고 문장과 화면의 즉시 안내는 사유별로 다르다.
+- **실측 1** (OpenRouter opus-5.5, effort low, max_tokens 1,200, write_file 하나로 숫자 1~1000; 비용 $0.0255)
+  - 결과: `finish_reason=length`, `tool_calls=1`, `invalid_tool_calls=0`, reasoning 0토큰
+  - **[V] K2의 전제와 달랐다.** langchain-core가 스트림 청크를 합칠 때 `parse_partial_json`으로 잘린 인자를 고쳐 **유효한 호출**을 만든다(`AIMessageChunk.init_tool_calls`).
+    - 그래서 출력 한도로 잘린 write_file이 잘린 내용 그대로 실행된다.
+    - K2의 `invalid_tool_calls` 정리는 고치기가 실패하는 드문 경우의 안전망이다.
+    - 400 여부를 보려던 2·3단계는 전제가 성립하지 않아 돌리지 않았다. 대신 위의 결정 변경으로 이어졌다.
+- **확인 실측** (같은 조건, max_tokens 600; 비용 $0.0237, 작업 3 실측 합계 $0.0492)
+  - 잘린 응답: `finish_reason=length`. write_file `content`가 983자("273"까지)에서 끊긴 채 유효한 호출이었다.
+  - `hold_cut_call` 뒤 `tool_calls=0`, `invalid=[write_file "{}"]`
+  - (a) 막은 호출 + '인자가 잘렸다' 결과 + "1~5만" → **200**. 모델이 완결된 write_file을 다시 냈다.
+  - (b) 정리한 자리표시 + 복구 안내 → **200**
+  - 실제 응답을 대본 모델로 에이전트에 다시 넣어 모두 승인하게 해도 numbers.txt가 생기지 않았고, 승인 요청은 0번이었다.
+- **시험**: 전체 234개가 통과한다(+40).
+  - `test_context.py` 14개: 프로필 3개, 설정 9개, 요약 자리 대체, 30메시지 append-only
+  - `test_stops.py` 26개
+    - 정지 사유 7개, 부분 텍스트 표시, Anthropic thinking 제거, 복구 뒤 재정리
+    - 정상 응답의 도구 호출 보존 2개, 렌더 안 됨, 사용량 보존, 두 공급자 요청 본문
+    - K2 두 가지, 오류 청크, 오류 복구 1회, 컨텍스트 창
+    - 잘린 호출 막기 6개: manual에서 승인 안 물음, auto-edit에서 파일 안 바뀜(write·edit), 병렬 중 잘린 것만 막음, 잘린 execute 실행 0회, 단위
+  - 기존 시험 1개(잘렸지만 도구 호출이 있으면 재시도하지 않는다)는 새 결정에 맞게 "유일한 잘린 호출은 막고 재시도한다"로 바꿨다.
+  - `wrap_model_call`의 막기를 빼면 막기 시험 7개가 실패하는 것을 확인했다.
+  - #6(개선 2)을 merge로 합쳤다(b513c3e). 두 기능이 만나는 곳은 시험 1개로 확인한다: 잘린 호출이 '작성 중'에서 '실행 중'으로 가지 않고, 막음 줄과 복구 안내 뒤 '생각 중'으로 간다. 합친 뒤 전체 246개다.
+- **리뷰 반영** (session2): 시험을 8개 더해 전체 254개다.
+  - **B1**: 요약 미들웨어를 직접 만들면 `trim_tokens_to_summarize`가 생성자 기본값 4,000이 된다. 그러면 버릴 기록(약 15만 토큰) 중 마지막 4K만 요약기에 들어간다. deepagents 팩토리처럼 `None`을 넘긴다.
+  - **B2**: `wrap_model_call`이 결과의 세 모양(ModelResponse, AIMessage, ExtendedModelResponse)을 모두 다룬다. `awrap_model_call`도 같은 로직으로 구현했다.
+    - **[V]** langchain 1.4.7의 `compose_two`(factory.py:344-355)는 바깥 미들웨어에 넘기는 `inner_handler`에서 Extended를 풀고 AIMessage를 ModelResponse로 바꾼다.
+    - 그래서 `create_agent` 안에서는 우리가 늘 ModelResponse를 받는다. Skills를 켜도 AttributeError는 나지 않는다(실제 에이전트 시험이 수정 전에도 통과했다).
+    - 이 처리는 직접 호출이나 다른 버전에 대비한 방어다. 세 모양을 직접 넣는 시험은 수정 전 코드로 돌리면 실패한다.
+  - **K3**: 잘린 호출이 이미 `invalid_tool_calls`로 왔으면 앞의 완결된 호출을 막지 않는다.
+  - **M1**: `CODE_AGENT_CONTEXT_TOKENS`는 ASCII 십진수만 받는다. "²"나 전각 숫자도 우리 문구의 오류를 낸다.
+  - az-quiz 첫 호출 시간을 Langfuse 실측 658초(약 11분)로 고쳤다. 전에는 "약 15분"이라고 적었다.
+- **후속**
+  - **reasoning_details 병합 부풀림**: langchain-core가 스트림 청크를 `index`로 합칠 때 문자열 필드를 이어 붙여, `format`이 "anthropic-claude-v1"을 청크 수만큼 반복한다. 정상 응답도 4~267번, az-quiz 잘린 응답은 8,024번이었다.
+    - langchain-openrouter의 `_merge_reasoning_details`는 항목이 하나뿐이면 그대로 두므로 이 값이 매 요청에 실려 나간다. 지금까지 OpenRouter는 받아들였다.
+    - 정리 대상이 아닌 응답에도 생기므로 별도 과제다.
+  - OpenRouter 경로에서 요약이 남긴 메시지의 `reasoning_details`(사양 1절)
+  - Anthropic 직결 실측(키 없음)
 
 ### 4단계 — 평가·확장 (선택)
 - `evals/`: 수정 과제 5~10개(fixture 저장소와 숨김 검증 테스트)를 헤드리스로 돌려 통과율, 비용, 시간을 집계한다. `pjt\Day04\coding_skills\verify_agent.py` 패턴을 참고한다.

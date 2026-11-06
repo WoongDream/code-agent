@@ -104,12 +104,13 @@ class Sessions:
 class App:
     def __init__(self, settings: Settings, workspace: Path, mode: str, sessions: Sessions, thread_id: str,
                  console: Console, read_line: ReadLine, *, agent=None, tracer: Tracer | None = None,
-                 env_text: str = "") -> None:
+                 env_text: str = "", fresh_agent: Callable[[], tuple[str, Any]] | None = None) -> None:
         """env_text 는 agent 의 시스템 프롬프트에 들어간 '이 PC 의 도구' 절이다. /new 로 만드는 thread 에도 같은 것을 남긴다."""
         self.settings, self.workspace, self.mode = settings, workspace, mode
         self.sessions, self.thread_id = sessions, thread_id
         self.console, self.read_line = console, read_line
         self.env_text = env_text
+        self.fresh_agent = fresh_agent  # (env_text, agent): 환경을 다시 탐지해 새로 만든 agent
         self.agent = agent if agent is not None else build_agent(settings, workspace, SqliteSaver(sessions.conn),
                                                                  env_text=env_text)
         self.tracer = tracer
@@ -161,6 +162,9 @@ class App:
         if name == "/help":
             self.console.print(HELP)
         elif name == "/new":
+            if not self.env_text and self.fresh_agent is not None:
+                # 절이 없던 옛 thread 를 이어 온 프로세스다. 새 thread 는 다시 탐지한 절과 그 system 으로 시작한다
+                self.env_text, self.agent = self.fresh_agent()
             self.thread_id = self.sessions.create(self.workspace, self.env_text)
             self.console.print(f"새 세션 {self.thread_id}")
         elif name == "/mode":
@@ -330,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         # --resume 은 그 thread 에 저장한 절을 그대로 쓴다(다시 탐지하면 system 이 바뀔 수 있다)
-        env_text = sessions.env_text_of(args.resume) if args.resume else detect_environment(settings.shell)
+        env_text = sessions.env_text_of(args.resume) if args.resume else detect_environment(settings.shell, workspace)
         agent = build_agent(settings, workspace, SqliteSaver(sessions.conn), env_text=env_text)
     except (RuntimeError, ValueError) as e:  # API 키 미설정, 모델 이름 오류, Git Bash 없음 등
         console.print(f"[red]{escape(str(e))}[/]")
@@ -339,12 +343,17 @@ def main(argv: list[str] | None = None) -> int:
         console.print("[dim]Langfuse 키가 있지만 패키지가 없어 트레이스를 끈다. 켜려면: uv sync --extra langfuse[/]")
     tracer = make_tracer(settings)
     thread_id = args.resume or sessions.create(workspace, env_text)  # 시작에 성공한 뒤에만 세션을 남긴다
+    def fresh_agent() -> tuple[str, Any]:
+        text = detect_environment(settings.shell, workspace)
+        return text, build_agent(settings, workspace, SqliteSaver(sessions.conn), env_text=text)
+
     app = App(settings, workspace, args.mode, sessions, thread_id, console,
-              _line_reader(settings.data_dir / "history"), agent=agent, tracer=tracer, env_text=env_text)
+              _line_reader(settings.data_dir / "history"), agent=agent, tracer=tracer, env_text=env_text,
+              fresh_agent=fresh_agent)
     return app.run()
 
 
-def detect_environment(shell_preference: str) -> str:
+def detect_environment(shell_preference: str, workspace: Path | None = None) -> str:
     """셸 백엔드가 쓸 환경(process_shell_env)으로 도구를 확인해 '이 PC 의 도구' 절을 만든다. 약 1초 걸린다."""
     shell = resolve_shell(shell_preference)[0]
-    return render(probe(process_shell_env()), shell)
+    return render(probe(process_shell_env(), workspace=workspace), shell)

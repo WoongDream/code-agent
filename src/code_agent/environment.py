@@ -64,9 +64,30 @@ def is_store_stub(path: str | os.PathLike) -> bool:
         return True
 
 
+def trusted_tool(path: str | None, workspace: Path | None = None) -> str | None:
+    """which 결과 중 절대 경로이고 현재 폴더·작업 폴더 밖인 것만. 저장소에 심은 node.cmd 같은 것을 고르지 않는다.
+
+    Windows 의 which 는 NoDefaultCurrentDirectoryInExePath 가 없으면 PATH 를 주어도 현재 폴더를 먼저 찾는다.
+    저장소 안 폴더가 PATH 에 들어간 경우(direnv 등)도 막으려고 '바로 아래'가 아니라 '안'을 본다. 다만 드라이브 루트나
+    홈을 품은 폴더는 저장소가 아니고 넓어서(~\\.local\\bin 의 uv 까지 버리게 된다) 기준에서 뺀다.
+    """
+    if not path or not Path(path).is_absolute():
+        return None
+    resolved, home = Path(path).resolve(), Path.home().resolve()
+    for root in (Path.cwd(), workspace):
+        if root is None:
+            continue
+        root = Path(root).resolve()
+        if root == Path(root.anchor) or home.is_relative_to(root):
+            continue
+        if resolved.is_relative_to(root):
+            return None
+    return path
+
+
 def uv_python_find(env: Mapping[str, str]) -> str | None:
     """uv 가 관리하는 인터프리터 경로. venv 를 고르지 않게 VIRTUAL_ENV 없는 env 와 임시 폴더에서 묻는다. 실패하면 None."""
-    uv = shutil.which("uv", path=env.get("PATH", ""))
+    uv = trusted_tool(shutil.which("uv", path=env.get("PATH", "")))
     if uv is None:
         return None
     try:
@@ -117,13 +138,16 @@ def _browsers(env: Mapping[str, str], which: Which, read_registry: ReadRegistry)
     return tuple(found)
 
 
-def probe(env: Mapping[str, str], *, which: Which = shutil.which, run: Run = subprocess.run,
-          read_registry: ReadRegistry = _read_registry) -> EnvInfo:
-    """셸에 넘기는 env 로 도구를 찾고 버전을 병렬로 확인한다. 하나당 VERSION_TIMEOUT_S 초."""
+def probe(env: Mapping[str, str], *, workspace: Path | None = None, which: Which = shutil.which,
+          run: Run = subprocess.run, read_registry: ReadRegistry = _read_registry) -> EnvInfo:
+    """셸에 넘기는 env 로 도구를 찾고 버전을 병렬로 확인한다. 하나당 VERSION_TIMEOUT_S 초.
+
+    현재 폴더·작업 폴더 안에서 찾은 실행 파일은 버린다(trusted_tool). --version 으로 실행하게 되기 때문이다.
+    """
     paths: dict[str, str | None] = {}
     notes: dict[str, str] = {}
     for name in TOOLS:
-        path = which(name, path=env.get("PATH", ""))
+        path = trusted_tool(which(name, path=env.get("PATH", "")), workspace)
         if path and is_store_stub(path):
             path, notes[name] = None, "스토어 스텁"
         paths[name] = path

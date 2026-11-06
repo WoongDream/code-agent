@@ -19,7 +19,7 @@ from pathlib import Path
 from deepagents.backends import CompositeBackend, FilesystemBackend, LocalShellBackend
 from deepagents.backends.protocol import ExecuteResponse
 
-from code_agent.environment import is_store_stub, uv_python_find
+from code_agent.environment import is_store_stub, trusted_tool, uv_python_find
 
 ARTIFACTS_ROUTE = "/.code-agent-artifacts/"  # 큰 도구 결과·대화 기록·blob 오프로드가 모두 이 아래로 간다
 SECRET_ENV = re.compile(r"_KEY$|TOKEN|SECRET|PASSWORD", re.IGNORECASE)  # *_API_KEY, LANGFUSE_PUBLIC_KEY 등
@@ -57,7 +57,7 @@ def shell_env(base: Mapping[str, str] | None = None, *, tool_scripts: str | None
         drop = os.path.normcase(os.path.normpath(scripts))
         entries = env.get("PATH", "").split(os.pathsep)
         env["PATH"] = os.pathsep.join(e for e in entries if not e or os.path.normcase(os.path.normpath(e)) != drop)
-    python = shutil.which("python", path=env.get("PATH", ""))
+    python = trusted_tool(shutil.which("python", path=env.get("PATH", "")))
     if python is None or is_store_stub(python):
         found = find_python(env)
         if found:

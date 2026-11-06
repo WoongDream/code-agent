@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -89,6 +90,52 @@ def test_browsers_found_by_fixed_path(tmp_path: Path) -> None:
     text = render(info, "powershell")
     assert f"- 브라우저: Chrome {shell_path(chrome, 'powershell')}, Edge {shell_path(edge, 'powershell')}" in text
     assert 'PowerShell 에서는 & "경로" 로 실행한다' in text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="현재 폴더 실행 파일 탐색은 Windows 동작")
+def test_probe_skips_planted_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """저장소 폴더에 심은 node.cmd 를 찾아 --version 으로 실행하지 않는다.
+
+    NoDefaultCurrentDirectoryInExePath 를 지우지 않으면 which 가 현재 폴더를 보지 않아 이 시험은 무의미하다.
+    심은 파일은 빈 파일이고 실행되지 않는다(가짜 run 이 불린 경로만 본다).
+    """
+    import shutil
+
+    repo, bin_dir = tmp_path / "repo", tmp_path / "bin"
+    repo.mkdir()
+    bin_dir.mkdir()
+    (repo / "node.cmd").write_bytes(b"")
+    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+    monkeypatch.chdir(repo)
+    found = shutil.which("node", path=str(bin_dir))
+    if found is None or Path(found).resolve().parent != repo.resolve():
+        pytest.skip("이 Python 의 which 는 현재 폴더를 먼저 찾지 않는다")
+    ran: list[str] = []
+
+    def run(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+        ran.append(args[0])
+        return subprocess.CompletedProcess(args, 0, stdout="v1.0.0", stderr="")
+
+    env = {**fake_env(tmp_path), "PATH": str(bin_dir)}
+    info = probe(env, workspace=repo, run=run, read_registry=lambda hive, key, value: None)
+    assert next(t for t in info.tools if t.name == "node").path is None
+    assert not any(Path(p).resolve().is_relative_to(repo.resolve()) for p in ran)
+
+
+def test_trusted_tool_roots(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """저장소(현재 폴더·작업 폴더) 안은 버리고, 홈을 품은 폴더나 드라이브 루트에서 띄운 경우는 기준에서 뺀다."""
+    from code_agent.environment import trusted_tool
+
+    repo = tmp_path / "repo"
+    (repo / "bin").mkdir(parents=True)
+    tool_path = tool(repo, "bin", "git.exe")
+    monkeypatch.chdir(repo)
+    assert trusted_tool(tool_path) is None and trusted_tool("git.exe") is None  # 안이거나 상대 경로
+    elsewhere = tool(tmp_path, "tools", "git.exe")
+    assert trusted_tool(elsewhere) == elsewhere
+    assert trusted_tool(elsewhere, workspace=tmp_path / "tools") is None
+    monkeypatch.chdir(Path.home())  # 홈에서 띄워도 ~ 아래 도구(uv 등)는 버리지 않는다
+    assert trusted_tool(elsewhere) == elsewhere
 
 
 def test_render_deterministic(tmp_path: Path) -> None:

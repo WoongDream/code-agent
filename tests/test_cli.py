@@ -183,7 +183,7 @@ def run_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], *
     """main() 을 키·네트워크 없이 돌린다. detected 가 None 이면 환경 탐지가 불리면 안 된다."""
     from code_agent import cli
 
-    def detect(shell: str) -> str:
+    def detect(shell: str, workspace: Path | None = None) -> str:
         assert detected is not None, "--resume 인데 환경을 다시 탐지했다"
         return detected
 
@@ -233,6 +233,17 @@ def test_new_command_reuses_env_text(tmp_path: Path) -> None:
     first = app.thread_id
     app.run()
     assert app.thread_id != first and app.sessions.env_text_of(app.thread_id) == ENV_A
+
+
+def test_new_after_old_thread_redetects(tmp_path: Path) -> None:
+    """절이 없던 옛 thread 를 이어 온 뒤 /new 하면, 다시 탐지한 절로 새 agent 를 만들어 새 thread 를 시작한다."""
+    app, _, _, _ = make_app(tmp_path, [], "/new", "새 질문", "/exit")
+    model = ScriptedChatModel(steps=[AIMessage(content="b")])
+    fresh = build_agent(app.settings, app.workspace, SqliteSaver(app.sessions.conn), model=model, env_text=ENV_A)
+    app.fresh_agent = lambda: (ENV_A, fresh)
+    app.run()
+    assert app.sessions.env_text_of(app.thread_id) == ENV_A
+    assert ENV_A in model.calls[0][0].text
 
 
 def test_old_process_can_still_insert_threads(tmp_path: Path) -> None:

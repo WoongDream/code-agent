@@ -58,7 +58,7 @@ def load_settings(data_dir: Path = DATA_DIR) -> Settings:
         raise ValueError(f"CODE_AGENT_SHELL 은 {', '.join(SHELLS)} 중 하나이거나 비어 있어야 합니다: {shell!r}")
     raw = get("CODE_AGENT_CONTEXT_TOKENS").replace(",", "").replace("_", "")
     low, high = CONTEXT_TOKENS_RANGE
-    if raw and not (raw.isdigit() and low <= int(raw) <= high):
+    if raw and not (raw.isascii() and raw.isdecimal() and low <= int(raw) <= high):  # "²" 는 isdigit 이지만 int 가 안 된다
         raise ValueError(f"CODE_AGENT_CONTEXT_TOKENS 는 {low:,}~{high:,} 사이의 정수여야 합니다: {raw!r}")
     return Settings(
         model=get("CODE_AGENT_MODEL") or DEFAULT_MODEL,

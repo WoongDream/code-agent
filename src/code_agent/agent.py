@@ -60,10 +60,13 @@ def summarization_middleware(model: BaseChatModel, backend: CompositeBackend, co
       Opus 5.5 의 보존된 thinking 을 무효로 만든다(서명이 앞쪽 기록 전체에 묶인다).
     - 프로필의 max_input_tokens(models.with_context_limit)의 85% 에서 요약하고 10% 를 남긴다. 프로필이 없는
       모델(대본 모델 등)은 context_tokens 를 쓴다. fraction 은 프로필이 없으면 생성자가 ValueError 를 내서 tokens 로 준다.
+    - trim_tokens_to_summarize=None: 생성자 기본값(4,000)이면 요약기가 버릴 기록의 마지막 4K 만 본다.
+      deepagents 팩토리(create_summarization_middleware)도 None 을 넘긴다.
     """
     limit = (model.profile or {}).get("max_input_tokens") or context_tokens
     return SummarizationMiddleware(model=model, backend=backend, trigger=("tokens", int(limit * 0.85)),
-                                   keep=("tokens", int(limit * 0.10)), truncate_args_settings=None)
+                                   keep=("tokens", int(limit * 0.10)), trim_tokens_to_summarize=None,
+                                   truncate_args_settings=None)
 
 
 def _disable_general_purpose_subagent(model: BaseChatModel) -> None:

@@ -397,12 +397,12 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
 
 #### 개선 2 — 생각 중 표시 (2026-11-06, `render.py`)
 - **근거**
-  - 모델이 오래 생각하거나 큰 도구 인자를 쓰는 동안 화면이 멈춘 것처럼 보였다. az-quiz 첫 호출은 약 15분이 걸렸고, quizzes.js(14,755토큰) 인자를 쓰는 99초 동안 화면에 아무것도 없었다. `render.py`는 `tool_call_chunks`를 그리지 않았다.
+  - 모델이 오래 생각하거나 큰 도구 인자를 쓰는 동안 화면이 멈춘 것처럼 보였다. az-quiz 첫 호출은 658초(약 11분, Langfuse 실측)가 걸렸고, quizzes.js(14,755토큰) 인자를 쓰는 99초 동안 화면에 아무것도 없었다. `render.py`는 `tool_call_chunks`를 그리지 않았다.
 - **[V] OpenRouter 생각 청크** (langchain-openrouter 0.2.8 `_convert_chunk_to_message_chunk`, langchain-core `AIMessageChunk.content_blocks`)
   - `delta.reasoning`은 `additional_kwargs["reasoning_content"]`가 되고, 등록된 번역기가 없는 `openrouter`도 best-effort 파싱으로 `reasoning` 블록이 된다.
   - 실제 변환 함수 → 대본 스트리밍 → Renderer로 확인했다. **이 청크는 수정 전에도 찍혔다.** 다만 다음 답변이 같은 줄에 붙었다.
   - `reasoning_details`만 담긴 청크는 `content_blocks`가 `[]`라 찍히지 않았다. 이제 그 `text`·`summary`를 쓴다. 두 필드가 함께 오면 블록 쪽만 써서 두 번 세지 않는다.
-  - az-quiz 기록에서 `reasoning_content`와 `reasoning_details` 텍스트 길이가 같았다(31,160자). 그래서 "15분간 아무것도 안 보였다"의 원인이 화면 그리기인지, 공급자가 생각 요약을 늦게 보낸 것인지는 실측 없이 확정하지 못했다. 상태 줄은 어느 쪽이든 멈춤처럼 보이지 않게 한다.
+  - az-quiz 기록에서 `reasoning_content`와 `reasoning_details` 텍스트 길이가 같았다(31,160자). 그래서 "약 11분간 아무것도 안 보였다"의 원인이 화면 그리기인지, 공급자가 생각 요약을 늦게 보낸 것인지는 실측 없이 확정하지 못했다. 상태 줄은 어느 쪽이든 멈춤처럼 보이지 않게 한다.
   - 참고: langchain-core는 `_stream`을 run_manager 없이 부르고 청크마다 직접 `on_llm_new_token`을 낸다. 그래서 ChatOpenRouter 안의 호출과 겹치지 않는다(토큰이 두 번 오지 않는다).
 - **생각 표시**
   - 줄 단위로 흐리게(dim italic) 찍는다. 줄바꿈 없이 찍으면 상태 줄과 섞이기 때문이다.
@@ -490,6 +490,15 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
   - 기존 시험 1개(잘렸지만 도구 호출이 있으면 재시도하지 않는다)는 새 결정에 맞게 "유일한 잘린 호출은 막고 재시도한다"로 바꿨다.
   - `wrap_model_call`의 막기를 빼면 막기 시험 7개가 실패하는 것을 확인했다.
   - #6(개선 2)을 merge로 합쳤다(b513c3e). 두 기능이 만나는 곳은 시험 1개로 확인한다: 잘린 호출이 '작성 중'에서 '실행 중'으로 가지 않고, 막음 줄과 복구 안내 뒤 '생각 중'으로 간다. 합친 뒤 전체 246개다.
+- **리뷰 반영** (session2): 시험을 8개 더해 전체 254개다.
+  - **B1**: 요약 미들웨어를 직접 만들면 `trim_tokens_to_summarize`가 생성자 기본값 4,000이 된다. 그러면 버릴 기록(약 15만 토큰) 중 마지막 4K만 요약기에 들어간다. deepagents 팩토리처럼 `None`을 넘긴다.
+  - **B2**: `wrap_model_call`이 결과의 세 모양(ModelResponse, AIMessage, ExtendedModelResponse)을 모두 다룬다. `awrap_model_call`도 같은 로직으로 구현했다.
+    - **[V]** langchain 1.4.7의 `compose_two`(factory.py:344-355)는 바깥 미들웨어에 넘기는 `inner_handler`에서 Extended를 풀고 AIMessage를 ModelResponse로 바꾼다.
+    - 그래서 `create_agent` 안에서는 우리가 늘 ModelResponse를 받는다. Skills를 켜도 AttributeError는 나지 않는다(실제 에이전트 시험이 수정 전에도 통과했다).
+    - 이 처리는 직접 호출이나 다른 버전에 대비한 방어다. 세 모양을 직접 넣는 시험은 수정 전 코드로 돌리면 실패한다.
+  - **K3**: 잘린 호출이 이미 `invalid_tool_calls`로 왔으면 앞의 완결된 호출을 막지 않는다.
+  - **M1**: `CODE_AGENT_CONTEXT_TOKENS`는 ASCII 십진수만 받는다. "²"나 전각 숫자도 우리 문구의 오류를 낸다.
+  - az-quiz 첫 호출 시간을 Langfuse 실측 658초(약 11분)로 고쳤다. 전에는 "약 15분"이라고 적었다.
 - **후속**
   - **reasoning_details 병합 부풀림**: langchain-core가 스트림 청크를 `index`로 합칠 때 문자열 필드를 이어 붙여, `format`이 "anthropic-claude-v1"을 청크 수만큼 반복한다. 정상 응답도 4~267번, az-quiz 잘린 응답은 8,024번이었다.
     - langchain-openrouter의 `_merge_reasoning_details`는 항목이 하나뿐이면 그대로 두므로 이 값이 매 요청에 실려 나간다. 지금까지 OpenRouter는 받아들였다.

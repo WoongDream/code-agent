@@ -23,7 +23,8 @@ langfuse = ["langfuse>=5.1,<6"]
 code-agent = "code_agent.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=9,<10", "ruff>=0.16,<0.17"]
+# pyright[nodejs]: Node 가 없는 PC(이 PC)에서도 pyright 를 돌린다
+dev = ["pytest>=9,<10", "ruff>=0.16,<0.17", "pyright[nodejs]>=1.1.400,<1.2"]
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
@@ -40,3 +41,13 @@ norecursedirs = ["fixtures"]  # buggy_repo 는 일부러 실패하는 시험을 
 [tool.ruff]
 line-length = 100
 target-version = "py313"
+
+[tool.pyright]
+# 1단계: src 와 scripts 만 게이트로 둔다. tests 는 2단계(남은 오류를 고친 뒤 include 에 넣는다)
+include = ["src", "scripts"]
+exclude = ["tests/fixtures"]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+extraPaths = ["src", "tests"]  # src: 설치본이 아닌 이 체크아웃을 본다. tests: 2단계에서 fakes·test_* import 를 푼다

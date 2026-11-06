@@ -17,6 +17,7 @@ import difflib
 import json
 import re
 import time
+from collections.abc import Mapping
 from typing import Any
 
 from langchain_core.messages import (
@@ -161,7 +162,7 @@ class Renderer:
                     self.last_text = message.text
                 for call in message.tool_calls:
                     self._line(f"{prefix}[cyan]●[/] {escape(describe_call(call))}")
-                    self._pending[call["id"]] = describe_call(call)
+                    self._pending[call["id"] or ""] = describe_call(call)
                 if held := message.response_metadata.get("code_agent_held_call"):
                     self._line(f"{prefix}[yellow]{escape(str(held))} 호출은 {HELD_ERROR}.[/]")
                 if message.tool_calls:
@@ -275,7 +276,7 @@ def rewrites_history(messages: list) -> bool:
     return bool(messages) and isinstance(messages[0], RemoveMessage) and messages[0].id == REMOVE_ALL_MESSAGES
 
 
-def describe_call(call: dict) -> str:
+def describe_call(call: Mapping[str, Any]) -> str:
     name, args = call["name"], call.get("args") or {}
     if name == "execute":
         return f"$ {args.get('command', '')}"

@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolCall, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 from code_agent.agent import INTERRUPT_TOOLS, build_agent
@@ -50,13 +50,13 @@ def load_turns(conn: sqlite3.Connection, thread_id: str, workspace: Path) -> lis
 
 def build_record(turn: list, *, diff: tuple[list[str], str] | None, context: str = "") -> dict:
     log, usage, models, answer = WorkLog(), Usage(), set(), ""
-    tool_calls: dict[str, dict] = {}
+    tool_calls: dict[str, ToolCall] = {}
     for message in turn[1:]:
         if isinstance(message, AIMessage):
             usage.add_message(message)
             models.add(message.response_metadata.get("model_name") or "")
             log.on_part(((), "updates", {"model": {"messages": [message]}}))
-            tool_calls.update({call["id"]: call for call in message.tool_calls})
+            tool_calls.update({call["id"]: call for call in message.tool_calls if call["id"]})
             if message.text.strip():
                 answer = message.text
         elif isinstance(message, ToolMessage):
@@ -117,7 +117,7 @@ def main() -> None:
             context = session_context([m for previous in turns[:index] for m in previous], workspace)
             record = build_record(turn, diff=diff if file_turns and index == file_turns[-1] else ([], ""),
                                   context=context)
-            if args.dry_run:
+            if tracer is None:  # --dry-run
                 print(f"\n--- 턴 {index + 1}: {record['input'][:60]!r}\n{record['output'][:2500]}")
                 continue
             from langfuse import propagate_attributes
@@ -132,6 +132,7 @@ def main() -> None:
     if tracer is None:
         return
     tracer.client.flush()
+    api = tracer.client.api
     print(f"\n{len(sent)}개 turn 을 올렸다. 평가를 기다린다...")
     pending = {(t, i): trace_id for t, i, trace_id in sent}
     for _ in range(60):

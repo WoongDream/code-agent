@@ -49,7 +49,7 @@ uv sync --extra openrouter --extra langfuse
 ## 시험
 
 ```
-uv run ruff check . && uv run pytest -q    # 모델 호출 없음
+uv run ruff check . && uv run pyright && uv run pytest -q    # 모델 호출 없음. CI(windows-latest)도 같다
 ```
 
 ## 보안 메모

@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -72,7 +72,7 @@ def is_recovery(message: BaseMessage) -> bool:
     return isinstance(message, HumanMessage) and message.name == RECOVERY_NAME
 
 
-def _recovered_this_turn(messages: list[BaseMessage]) -> bool:
+def _recovered_this_turn(messages: Sequence[BaseMessage]) -> bool:
     for message in reversed(messages):
         if is_recovery(message):
             return True

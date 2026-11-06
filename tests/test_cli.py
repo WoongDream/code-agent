@@ -38,13 +38,15 @@ class Script:
 
 
 def make_app(tmp_path: Path, steps: list, *answers: str, workspace: Path | None = None,
-             mode: str = "manual", tracer=None) -> tuple[App, ScriptedChatModel, io.StringIO, Script]:
+             mode: str = "manual", tracer=None,
+             model: ScriptedChatModel | None = None) -> tuple[App, ScriptedChatModel, io.StringIO, Script]:
+    """model 을 주면 steps 대신 그 모델(예: StreamingChatModel)을 쓴다."""
     if workspace is None:
         workspace = tmp_path / "ws"
         workspace.mkdir()
     settings = Settings(data_dir=tmp_path / "data")
     sessions = Sessions(sqlite3.connect(tmp_path / "sessions.db", check_same_thread=False))
-    model = ScriptedChatModel(steps=steps)
+    model = model if model is not None else ScriptedChatModel(steps=steps)
     agent = build_agent(settings, workspace, SqliteSaver(sessions.conn), model=model)
     out, script = io.StringIO(), Script(*answers)
     app = App(settings, workspace, mode, sessions, sessions.create(workspace),

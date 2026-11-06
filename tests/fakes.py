@@ -1,12 +1,12 @@
 """단위 시험 전용 가짜 모델. 비용 없이 에이전트 배선을 시험한다. pjt Day02_new/tests/fakes.py 에서 가져왔다."""
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from uuid import uuid4
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, BaseMessage
-from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.tools import BaseTool
 from langchain_core.utils.function_calling import convert_to_openai_tool
 from pydantic import BaseModel, Field, SkipValidation
@@ -40,6 +40,24 @@ class ScriptedChatModel(BaseChatModel):
         step = self.steps[index]
         message = step if isinstance(step, AIMessage) else step(messages)
         return ChatResult(generations=[ChatGeneration(message=message)])
+
+
+class StreamingChatModel(ScriptedChatModel):
+    """단계마다 AIMessageChunk 목록을 차례로 스트리밍한다. callable 단계는 그때까지의 메시지를 받아 청크 목록을 만든다.
+
+    messages 스트림 모드에서는 langchain-core 가 _stream 을 부르고 청크마다 on_llm_new_token 을 낸다(실제 공급자 모델과 같다).
+    """
+    steps: SkipValidation[list[list[AIMessageChunk] | Callable[[list[BaseMessage]], list[AIMessageChunk]]]]
+
+    def _stream(self, messages: list[BaseMessage], stop: list[str] | None = None,
+                run_manager: object = None, **kwargs: object) -> Iterator[ChatGenerationChunk]:
+        index = len(self.calls)
+        self.calls.append(list(messages))
+        if index >= len(self.steps):
+            raise ScriptExhausted(f"대본은 {len(self.steps)}단계인데 {index + 1}번째 호출이 왔습니다.")
+        step = self.steps[index]
+        for chunk in step if isinstance(step, list) else step(messages):
+            yield ChatGenerationChunk(message=chunk)
 
 
 def tool_call(name: str, args: dict, call_id: str | None = None) -> AIMessage:

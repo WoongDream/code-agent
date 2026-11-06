@@ -36,6 +36,7 @@ HELP = """\
   /diff          작업 폴더의 git diff
   /todos         현재 할 일 목록
   /cost          이 세션의 모델 호출·토큰·비용 합계
+  /thinking \\[on|off]  생각(reasoning) 원문 표시. 끄면(기본) 문단마다 앞부분만 짧은 메모로 보인다
   /exit          종료
 Ctrl+C 는 실행 중인 턴만 취소한다. 읽기 전용 셸 명령(git status, ls, cat 등)은 모드와 관계없이 자동 승인된다."""
 YOLO_WARNING = "[bold red]yolo 모드: 파일 쓰기와 셸 명령을 묻지 않고 실행한다. 셸은 샌드박스가 아니다.[/]"
@@ -91,6 +92,8 @@ class App:
         self.console, self.read_line = console, read_line
         self.agent = agent if agent is not None else build_agent(settings, workspace, SqliteSaver(sessions.conn))
         self.tracer = tracer
+        self.status_line = console.is_terminal and _interactive()  # 파이프·테스트(StringIO)에서는 상태 줄을 그리지 않는다
+        self.full_thinking = False  # /thinking
 
     @property
     def config(self) -> dict:
@@ -156,12 +159,18 @@ class App:
             total, turns = self.sessions.usage_of(self.thread_id)
             self.console.print(f"세션 {self.thread_id} · 턴 {turns}개 · {escape(total.summary())}" if turns
                                else "[dim]이 세션에 기록된 사용량이 아직 없다.[/]")
+        elif name == "/thinking":
+            if arg not in ("", "on", "off"):
+                self.console.print(f"[red]{escape('/thinking [on|off]')}[/]")
+            else:
+                self.full_thinking = not self.full_thinking if not arg else arg == "on"
+                self.console.print("생각 원문 표시 → " + ("켬" if self.full_thinking else "끔(문단마다 앞부분만 메모로)"))
         else:
             self.console.print(f"[red]알 수 없는 커맨드: {escape(name)}[/] (/help)")
         return True
 
     def turn(self, text: str) -> None:
-        renderer = Renderer(self.console)
+        renderer = Renderer(self.console, status=self.status_line, full_reasoning=self.full_thinking)
         stops = TurnStops()
         meter = UsageCallback()
         tags = [self.workspace.name, f"mode:{self.mode}", f"model:{self.settings.model}"]
@@ -171,10 +180,15 @@ class App:
             trace_context = self.tracer.turn(text, session_id=self.thread_id, tags=tags, workspace=self.workspace,
                                              context=session_context(previous, self.workspace))
         with trace_context as trace:
+            def ask(action: dict) -> dict:
+                renderer.pause()  # 상태 줄이 승인 프롬프트와 입력 화면을 깨지 않게 멈춘다
+                return self.ask(action)
+
             def decide(action_requests: list[dict]) -> list[dict]:
-                renderer.end_turn()
-                return decide_all(action_requests, self.mode, self.ask,
-                                  on_decision=trace.decision if trace is not None else None)
+                decisions = decide_all(action_requests, self.mode, ask,
+                                       on_decision=trace.decision if trace is not None else None)
+                renderer.resume()
+                return decisions
 
             def on_part(part: tuple) -> None:
                 renderer.on_part(part)
@@ -185,6 +199,7 @@ class App:
             callbacks = [meter, *(trace.callbacks if trace is not None else [])]
             error = None
             try:
+                renderer.start()
                 run_turn(self.agent, {"messages": [{"role": "user", "content": text}]},
                          {**self.config, "callbacks": callbacks}, decide=decide, on_part=on_part)
             except KeyboardInterrupt:
@@ -227,9 +242,14 @@ class App:
             self.console.print(Syntax(text, "diff"))
 
 
+def _interactive() -> bool:
+    """입출력이 모두 터미널인지. 파이프나 mintty(Git Bash 창)는 아니다."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def _line_reader(history: Path) -> ReadLine:
     """Windows 콘솔이면 prompt_toolkit(기록·편집)을, 파이프나 mintty(Git Bash 창)면 input() 을 쓴다."""
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+    if not _interactive():
         return input
     from prompt_toolkit import PromptSession
     from prompt_toolkit.history import FileHistory

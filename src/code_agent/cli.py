@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 from rich.console import Console
 from rich.markup import escape
@@ -92,7 +93,7 @@ class App:
         self.tracer = tracer
 
     @property
-    def config(self) -> dict:
+    def config(self) -> RunnableConfig:
         return {"configurable": {"thread_id": self.thread_id}}
 
     def run(self) -> int:
@@ -238,8 +239,9 @@ def _line_reader(history: Path) -> ReadLine:
 def _utf8_stdio() -> None:
     """파이프로 출력할 때 콘솔 코드페이지(cp949)로 한글이 깨지지 않게 한다."""
     for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            stream.reconfigure(encoding="utf-8", errors="replace")
+        reconfigure = getattr(stream, "reconfigure", None)  # TextIO 타입에는 없다. 실제 콘솔은 TextIOWrapper 다
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:

@@ -39,7 +39,10 @@ REASONING = ("기준 1~4 를 각각 '기준 N: 통과 - 근거' 또는 '기준 N
 VALUE = ("이유에서 '실패'로 판정한 기준 수를 K 라 할 때 점수 S = 1 - 0.25 × K 다. 단 기준 1(요청 완수)이 실패면 S 는 최대 0.25 다. "
          "점수는 반드시 이유의 판정·계산과 같아야 한다. 모두 통과면 1.0 이다.")
 
-client = make_tracer(load_settings()).client
+tracer = make_tracer(load_settings())
+if tracer is None:
+    sys.exit("Langfuse 키나 langfuse extra 가 없다.")
+client = tracer.client
 api = client.api
 connections = api.llm_connections.list().data
 match = [c for c in connections if JUDGE_MODEL in (c.custom_models or [])]

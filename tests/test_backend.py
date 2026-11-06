@@ -56,7 +56,7 @@ def test_echo_and_exit_code(shell_backend: WindowsShellBackend) -> None:
 
 def test_stderr_is_prefixed(shell_backend: WindowsShellBackend) -> None:
     result = shell_backend.execute(run_python(shell_backend.shell, '-c "import sys; sys.stderr.write(\'bad\\n\')"'))
-    assert "[stderr] bad" in result.output
+    assert "[stderr] bad" in result.output, result.output  # 가끔 실패했다. PS 진행률 CLIXML 이 섞였는지 본다
 
 
 def test_korean_output_is_not_garbled(shell_backend: WindowsShellBackend) -> None:

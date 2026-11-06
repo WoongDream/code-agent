@@ -372,6 +372,9 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
 
 ## 6. 검증 방법
 1. `uv run ruff check . && uv run pytest -q`: 모델 호출 없이 백엔드, 승인, 에이전트 배선을 검증한다.
+   - CI(2026-11-06, `.github/workflows/ci.yml`): windows-latest에서 uv 0.13.7로 `uv sync --frozen --all-extras` 뒤 ruff, pyright(src와 scripts), pytest를 돌린다.
+   - pyright 1.1.414(`pyright[nodejs]`, Node가 없어도 돈다)는 1단계 게이트다. main 기준 오류 17개(src 12, scripts 5)를 고쳐 0으로 했다. tests는 2단계에서 넣는다.
+   - 로컬에서는 공유 .venv를 건드리지 않게 `uvx --from "pyright[nodejs]==1.1.414" pyright --pythonpath <.venv의 python>`으로 돌렸다.
 2. 수동 E2E(실제 API 사용, 모델 호출 약 10~30회):
    ```
    uv run code-agent --workspace <buggy_repo 복사본>

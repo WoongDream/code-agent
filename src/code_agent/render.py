@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import difflib
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, ToolMessage
@@ -49,8 +50,8 @@ class Renderer:
             for block in message.content_blocks:
                 if block["type"] == "text" and block.get("text"):
                     self._write(block["text"])
-                elif block["type"] == "reasoning" and block.get("reasoning"):
-                    self._write(block["reasoning"], style="dim italic")
+                elif block["type"] == "reasoning" and (reasoning := block.get("reasoning")):
+                    self._write(reasoning, style="dim italic")
         elif isinstance(message, AIMessage) and message.id not in self._streamed and message.text:
             self._write(message.text)
 
@@ -91,7 +92,7 @@ class Renderer:
             self._mid_line = False
 
 
-def describe_call(call: dict) -> str:
+def describe_call(call: Mapping[str, Any]) -> str:
     name, args = call["name"], call.get("args") or {}
     if name == "execute":
         return f"$ {args.get('command', '')}"

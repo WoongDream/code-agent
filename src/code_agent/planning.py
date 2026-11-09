@@ -1,19 +1,27 @@
 """계획 모드. 조사(읽기 전용) → write_plan → plan-reviewer 검토 → 반영 → 사람 승인
 → 단계대로 구현 → 완료 조건 확인 보고.
 
-에이전트 state 에 두 키를 더한다(PlanModeMiddleware.state_schema).
+에이전트 state 에 세 키를 더한다(PlanModeMiddleware.state_schema). 체크포인트에 남아 --resume 해도
+이어진다.
 - plan_mode: /plan 으로 보낸 요청이면 참이다. 계획이 아직 없어도 쓰기를 막는다.
-- plan: {version, status, data, reviews, scope_changes}. 체크포인트에 남아 --resume 해도 이어진다.
+- plan: {version, status, data, reviews, request}.
   status 는 draft(작성) → reviewed(검토 받음) → revised(검토 뒤 고침) → approved(사람 승인) 다.
+  request 는 계획을 쓴 요청(사용자 메시지)의 id 다. 다른 요청에서 다시 쓰면 새 계획이다.
+- plan_scope_changes: 승인 뒤 계획 범위에 더한 파일 [{file, tool, version}].
+  덧붙이는 reducer 라 한 응답의 병렬 쓰기 둘이 모두 남는다(None 을 넣으면 비운다).
+  지금 계획과 버전이 같은 항목만 범위에 든다.
 
 PlanModeMiddleware 가 하는 일
 - 도구 write_plan 과 request_plan_approval 을 준다. request_plan_approval 은 HITL 대상이라 사람이
   승인해야 실행되고, 실행되면 status=approved 와 단계별 todos 를 한 번에 쓴다.
 - 쓰기 차단: plan_mode 이거나 승인되지 않은 계획이 있으면 파일 쓰기·수정·삭제와 읽기 전용이 아닌
   execute 를 오류 ToolMessage 로 돌려준다(deepagents _tool_exclusion.py 방식).
+- 한 응답 규칙: 계획 도구(write_plan, request_plan_approval, 검토)는 plan 을 읽고 써서 한 응답에
+  하나만 실행한다. 같은 응답의 쓰기와 write_todos 도 계획 도구 결과를 보기 전의 상태로 판정되거나
+  todos 를 함께 써서 실행하지 않는다(approval.ONE_PLAN_CALL, WAIT_FOR_PLAN).
 - 검토 기록: task(plan-reviewer) 결과를 plan.reviews 에 넣는다. 계획 하나에 MAX_REVIEWS 회까지다.
 - 범위 변경: 승인된 계획 밖 파일 쓰기는 approval.auto_decision 이 모든 모드에서 사람에게 묻고,
-  실행되면 scope_changes 에 남겨 계획 범위에 더한다.
+  실행되면 plan_scope_changes 에 남겨 계획 범위에 더한다.
   execute 로 바꾸는 파일(sed -i 등)은 추적하지 않는다.
 - 사건: plan_written, plan_reviewed, plan_approval, scope_change 를 custom 스트림으로 보낸다
   (트레이스와 작업 기록이 받는다).
@@ -50,7 +58,13 @@ from langchain.agents.middleware import (
 )
 from langchain.tools import ToolRuntime
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.messages.tool import ToolCall
 from langchain_core.tools import StructuredTool
 from langgraph.config import get_stream_writer
@@ -58,21 +72,33 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from code_agent.approval import (
+    AUTO_BLOCK,
     FILE_TOOLS,
+    ONE_PLAN_CALL,
     PLAN_APPROVAL_TOOL,
     PLAN_REVIEW_FIRST,
+    PLAN_REVIEWER,
+    PLAN_WRITE_TOOL,
+    REVISE_FIRST,
+    WAIT_FOR_PLAN,
     PlanContext,
+    count_plan_calls,
+    covers_workspace,
     in_plan,
+    is_plan_call,
     is_write_action,
     normalize_path,
 )
 from code_agent.caching import OpenRouterCacheMiddleware
 from code_agent.guards import DotenvGuardMiddleware
-from code_agent.stops import TruncationRecoveryMiddleware
+from code_agent.render import strip_controls
+from code_agent.stops import TruncationRecoveryMiddleware, is_recovery
 from code_agent.tool_text import TOOL_DESCRIPTIONS
 
-PLAN_TOOL = "write_plan"
-REVIEWER = "plan-reviewer"
+PLAN_TOOL = PLAN_WRITE_TOOL
+REVIEWER = PLAN_REVIEWER
+SCOPE_KEY = "plan_scope_changes"
+TODOS_TOOL = "write_todos"
 MAX_REVIEWS = 2  # 계획 하나(승인 전 고친 버전들)의 검토 횟수
 REVIEWER_MODEL_CALLS = 20  # 리뷰어 한 번의 예산
 REVIEWER_TOOL_CALLS = 60
@@ -171,18 +197,31 @@ class PlanApprovalArgs(BaseModel):
 
 
 def _latest(_old: Any, new: Any) -> Any:
-    """plan 의 reducer. 같은 단계에서 둘 이상 바꿔도(병렬 호출) 실패하지 않고 마지막 값을 쓴다."""
+    """plan 의 reducer. 같은 단계에서 둘 이상 바꿔도(병렬 호출) 실패하지 않고 마지막 값을 쓴다.
+
+    계획 도구는 한 응답에 하나만 실행하므로(ONE_PLAN_CALL) 겹치지 않는다. 그래도 터지지 않게 둔다.
+    """
     return new
+
+
+def _add_scope(old: list[dict[str, Any]] | None,
+               new: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """plan_scope_changes 의 reducer. 덧붙이고, None 이면 비운다.
+
+    한 응답에서 계획 밖 파일 둘을 병렬로 쓰면 둘 다 남는다(plan 을 통째로 바꾸면 하나가 사라졌다).
+    """
+    return [] if new is None else [*(old or []), *new]
 
 
 class PlanModeState(AgentState):
     """PlanModeMiddleware 가 더하는 state.
 
-    두 키 모두 입력으로 받는다(/plan 이 plan_mode 를 넣는다).
+    모두 입력으로 받는다(/plan 이 plan_mode 를 넣고, 새 계획·해제는 plan 과 범위 변경을 None 으로).
     """
 
     plan_mode: NotRequired[bool]
     plan: NotRequired[Annotated[dict[str, Any] | None, _latest]]
+    plan_scope_changes: NotRequired[Annotated[list[dict[str, Any]], _add_scope]]
 
 
 class _ReviewerState(AgentState):
@@ -197,14 +236,57 @@ def _plan_of(state: Any) -> dict[str, Any] | None:
     return plan if isinstance(plan, dict) else None
 
 
-def plan_files(plan: Mapping[str, Any] | None) -> frozenset[str]:
-    """계획 범위: 단계의 files 와 범위 변경(scope_changes)의 합집합(approval.normalize_path)."""
+def scope_changes_of(plan: Mapping[str, Any] | None,
+                     changes: Any) -> list[dict[str, Any]]:
+    """plan_scope_changes 중 지금 계획(같은 버전)에 더한 것. 이전 계획의 범위 변경은 뺀다."""
+    if not plan or not isinstance(changes, list):
+        return []
+    return [change for change in changes
+            if isinstance(change, dict) and change.get("version") == plan.get("version")]
+
+
+def plan_files(plan: Mapping[str, Any] | None, scope_changes: Any = ()) -> frozenset[str]:
+    """계획 범위: 단계의 files 와 지금 계획의 범위 변경(scope_changes_of)의 합집합.
+
+    경로는 approval.normalize_path 로 정규화한다. scope_changes 는 state 의 plan_scope_changes 다.
+    """
     if not plan:
         return frozenset()
     steps = (plan.get("data") or {}).get("steps") or []
     paths = [str(path) for step in steps for path in step.get("files") or []]
-    paths += [str(change.get("file", "")) for change in plan.get("scope_changes") or []]
+    paths += [str(change.get("file", ""))
+              for change in scope_changes_of(plan, list(scope_changes or []))]
     return frozenset(normalize_path(path) for path in paths if path.strip())
+
+
+def revise_pending(plan: Mapping[str, Any] | None) -> bool:
+    """마지막 검토가 revise 인데 그 뒤 계획을 고치지 않았는지(검토한 버전이 지금 버전)."""
+    reviews = (plan or {}).get("reviews") or []
+    last = reviews[-1] if reviews else None
+    return (plan is not None and isinstance(last, Mapping) and last.get("verdict") == "revise"
+            and last.get("version") == plan.get("version"))
+
+
+def request_id(messages: Any) -> str | None:
+    """지금 요청의 id: 자동 복구 안내가 아닌 마지막 사용자 메시지의 id."""
+    for message in reversed(messages if isinstance(messages, list) else []):
+        if isinstance(message, HumanMessage) and not is_recovery(message):
+            return message.id
+    return None
+
+
+def _last_ai(messages: Any, call_id: str | None = None) -> AIMessage | None:
+    """마지막 AI 메시지. call_id 를 주면 그 도구 호출을 낸 AI 메시지."""
+    for message in reversed(messages if isinstance(messages, list) else []):
+        if isinstance(message, AIMessage) and (
+                call_id is None or any(c.get("id") == call_id for c in message.tool_calls)):
+            return message
+    return None
+
+
+def plan_calls_in(message: BaseMessage | None) -> int:
+    """AI 메시지 하나에 든 계획 도구 호출 수(approval.count_plan_calls)."""
+    return count_plan_calls(message.tool_calls) if isinstance(message, AIMessage) else 0
 
 
 def is_reviewed(plan: Mapping[str, Any] | None) -> bool:
@@ -236,34 +318,42 @@ def block_message(plan_mode: bool, plan: Mapping[str, Any] | None) -> str:
 def plan_context(values: Mapping[str, Any]) -> PlanContext | None:
     """agent state 값으로 승인 결정용 계획 상태(approval.PlanContext)를 만든다.
 
+    결정할 호출들을 낸 응답은 interrupt 로 멈춘 동안의 마지막 AI 메시지다. 그 응답의 계획 도구
+    호출 수(plan_calls)로 한 응답 규칙을 사람에게 묻기 전에 적용한다.
+
     Args:
         values: agent.get_state(config).values.
 
     Returns:
-        계획 모드도 계획도 없으면 None.
+        계획 모드도 계획도 마지막 응답의 계획 도구 호출도 없으면 None.
     """
     plan, plan_mode = _plan_of(values), bool(values.get("plan_mode"))
-    if plan is None and not plan_mode:
+    plan_calls = plan_calls_in(_last_ai(values.get("messages")))
+    if plan is None and not plan_mode and not plan_calls:
         return None
     return PlanContext(block_message=block_message(plan_mode, plan), reviewed=is_reviewed(plan),
-                       approved=is_approved(plan), files=plan_files(plan))
+                       approved=is_approved(plan),
+                       files=plan_files(plan, values.get(SCOPE_KEY)),
+                       revise_pending=revise_pending(plan), plan_calls=plan_calls)
 
 
-def next_plan(previous: Mapping[str, Any] | None, data: dict[str, Any]) -> dict[str, Any]:
-    """write_plan 이 저장할 새 plan.
+def next_plan(previous: Mapping[str, Any] | None, data: dict[str, Any],
+              request: str | None = None) -> dict[str, Any]:
+    """write_plan 이 저장할 새 plan. request 는 지금 요청의 id(request_id)다.
 
-    승인 전 계획을 고치면 같은 계획의 다음 버전이다.
+    같은 요청에서 승인 전 계획을 고치면 같은 계획의 다음 버전이다.
     검토 기록을 이어 받고, 검토를 받았으면 revised 다.
-    계획이 없거나 승인된 계획을 다시 쓰면 새 계획이라 검토 횟수와 범위 변경을 새로 센다.
+    계획이 없거나, 승인된 계획을 다시 쓰거나, 다른 요청에서 쓰면 새 계획이라 검토를 새로 받는다.
+    다른 요청의 검토를 물려받으면 검토 없이 승인 요청까지 갈 수 있기 때문이다.
     버전은 thread 안에서 계속 올라 사건과 기록에서 계획을 구별한다.
     """
     version = int((previous or {}).get("version") or 0) + 1
-    if previous is None or is_approved(previous):
+    if previous is None or is_approved(previous) or previous.get("request") != request:
         return {"version": version, "status": "draft", "data": data, "reviews": [],
-                "scope_changes": []}
+                "request": request}
     reviews = list(previous.get("reviews") or [])
     return {"version": version, "status": "revised" if reviews else "draft", "data": data,
-            "reviews": reviews, "scope_changes": list(previous.get("scope_changes") or [])}
+            "reviews": reviews, "request": request}
 
 
 def parse_review(text: str) -> tuple[str, list[dict[str, str]]]:
@@ -285,8 +375,13 @@ def _bullets(title: str, items: Any) -> list[str]:
     return ["", f"## {title}", *(f"- {item}" for item in items)] if items else []
 
 
-def render_plan(plan: Mapping[str, Any]) -> str:
-    """계획 마크다운. 범위 변경과 검토 기록도 붙인다(승인 프롬프트, /plan, 리뷰어 system)."""
+def render_plan(plan: Mapping[str, Any], scope_changes: Any = ()) -> str:
+    """계획 마크다운. 범위 변경과 검토 기록도 붙인다(승인 프롬프트, /plan, 리뷰어 system).
+
+    scope_changes 는 state 의 plan_scope_changes 다(지금 계획의 것만 보인다).
+    모델이 쓴 글이라 터미널 제어 문자를 뺀다(render.strip_controls). 사람이 이 화면을 보고
+    승인하므로 화면을 지우거나 가리는 글이 섞이면 안 된다.
+    """
     data = plan.get("data") or {}
     status = str(plan.get("status", ""))
     lines = [f"# 계획 v{plan.get('version')} ({STATUS_LABEL.get(status, status)})", "",
@@ -303,7 +398,7 @@ def render_plan(plan: Mapping[str, Any]) -> str:
     lines += _bullets("위험", data.get("risks"))
     lines += _bullets("범위 변경 (승인 뒤 더한 파일)",
                       [f"`{c.get('file')}` ({c.get('tool')})"
-                       for c in plan.get("scope_changes") or []])
+                       for c in scope_changes_of(plan, list(scope_changes or []))])
     reviews = plan.get("reviews") or []
     if reviews:
         lines += ["", f"## 검토 ({len(reviews)}/{MAX_REVIEWS}회)"]
@@ -316,7 +411,7 @@ def render_plan(plan: Mapping[str, Any]) -> str:
         if review.get("verdict") == "unknown" and review.get("text"):
             # 형식을 읽지 못했으면 원문을 그대로 보인다
             lines += [f"  > {line}" for line in str(review["text"]).splitlines()[:20]]
-    return "\n".join(lines)
+    return strip_controls("\n".join(lines))
 
 
 def _emit(event: dict[str, Any]) -> None:
@@ -335,9 +430,25 @@ def _reply(runtime: ToolRuntime, name: str, text: str, *, error: bool = False,
 
 
 def _write_plan(runtime: ToolRuntime, **fields: Any) -> Command:
-    """write_plan: 계획을 저장한다(next_plan). 인자는 Plan 이다."""
+    """write_plan: 계획을 저장한다(next_plan). 인자는 Plan 이다.
+
+    작업 폴더 전체를 덮는 파일 항목(/, ., *, **)은 받지 않는다(계획 밖 재승인이 무의미해진다).
+    승인된 계획 뒤의 새 계획이면 이전 계획의 todos 를 같은 갱신에서 비운다.
+    """
     data = Plan.model_validate(fields).model_dump()
-    plan = next_plan(_plan_of(runtime.state), data)
+    broad = [path for step in data["steps"] for path in step["files"]
+             if path.strip() and covers_workspace(path)]
+    if broad:
+        return _reply(runtime, PLAN_TOOL,
+                      f"Error: 파일 항목 {', '.join(repr(p) for p in broad)} 은 작업 폴더 전체를 "
+                      "덮어 계획 범위가 되지 못한다. 계획을 저장하지 않았다. "
+                      "단계마다 바꿀 파일이나 폴더(/src/ 처럼 / 로 끝나게)를 구체적으로 적어 "
+                      "다시 불러라.", error=True)
+    previous = _plan_of(runtime.state)
+    plan = next_plan(previous, data, request_id(runtime.state.get("messages")))
+    update: dict[str, Any] = {"plan": plan}
+    if is_approved(previous):
+        update["todos"] = []  # 끝난 계획의 단계다. 새 계획은 승인되면 todos 를 새로 쓴다
     files = sorted(plan_files(plan))
     _emit({"type": "plan_written", "version": plan["version"], "files": files,
            "goal": data["goal"], "status": plan["status"]})
@@ -354,14 +465,15 @@ def _write_plan(runtime: ToolRuntime, **fields: Any) -> Command:
     text = (f"계획(v{plan['version']})을 저장했다"
             f"(단계 {len(data['steps'])}개, 파일 {len(files)}개). "
             f"승인 전까지 쓰기는 막힌다. 다음: {step}")
-    return _reply(runtime, PLAN_TOOL, text, plan=plan)
+    return _reply(runtime, PLAN_TOOL, text, **update)
 
 
 def _request_plan_approval(runtime: ToolRuntime, note: str = "") -> Command:
     """request_plan_approval: HITL 에서 사람이 승인해야 불린다.
 
-    note 는 승인 프롬프트(cli)가 사용자에게 보이는 인자라 여기서는 쓰지 않는다.
-    승인 결정이 검토를 확인하지만(approval.auto_decision) 다른 결정 함수로 돌 때를 위해 다시 본다.
+    note 는 승인 프롬프트(cli)가 사용자에게 보인다. 여기서는 반영하지 않은 revise 검토의
+    이유가 있는지만 본다. 승인 결정이 같은 것을 확인하지만(approval.auto_decision) 다른 결정
+    함수로 돌 때를 위해 다시 본다. 이미 승인된 계획이면 상태를 바꾸지 않고 그렇다고만 답한다.
     """
     plan = _plan_of(runtime.state)
     if plan is None:
@@ -369,9 +481,14 @@ def _request_plan_approval(runtime: ToolRuntime, note: str = "") -> Command:
                       "Error: 승인받을 계획이 없다. write_plan 으로 계획을 먼저 써라.", error=True)
     if is_approved(plan):
         return _reply(runtime, PLAN_APPROVAL_TOOL,
-                      f"계획(v{plan.get('version')})은 이미 승인됐다. 단계대로 진행하라.")
+                      f"이미 승인된 계획이다(v{plan.get('version')}). 상태는 바꾸지 않았다. "
+                      "단계대로 진행하라.")
     if not is_reviewed(plan):
-        return _reply(runtime, PLAN_APPROVAL_TOOL, f"Error: {PLAN_REVIEW_FIRST}", error=True)
+        return _reply(runtime, PLAN_APPROVAL_TOOL, f"Error: {AUTO_BLOCK}{PLAN_REVIEW_FIRST}",
+                      error=True)
+    if revise_pending(plan) and not note.strip():
+        return _reply(runtime, PLAN_APPROVAL_TOOL, f"Error: {AUTO_BLOCK}{REVISE_FIRST}",
+                      error=True)
     data = plan.get("data") or {}
     todos = [{"content": step.get("title", ""), "status": "pending"}
              for step in data.get("steps") or []]
@@ -392,6 +509,11 @@ def _request_plan_approval(runtime: ToolRuntime, note: str = "") -> Command:
 def _error(call: ToolCall, text: str) -> ToolMessage:
     return ToolMessage(content=f"Error: {text}", tool_call_id=call["id"] or "",
                        name=call["name"], status="error")
+
+
+def _blocked(call: ToolCall, text: str) -> ToolMessage:
+    """계획 규칙으로 막은 호출. 사용자가 거부한 것이 아니라고 밝힌다(approval.AUTO_BLOCK)."""
+    return _error(call, AUTO_BLOCK + text)
 
 
 def _result_message(result: ToolMessage | Command) -> ToolMessage | None:
@@ -442,27 +564,35 @@ class PlanModeMiddleware(AgentMiddleware):
     def wrap_tool_call(self, request: ToolCallRequest,
                        handler: Callable[[ToolCallRequest], ToolMessage | Command],
                        ) -> ToolMessage | Command:
-        """승인 전 쓰기를 막고, 리뷰어 결과와 계획 밖 파일 쓰기를 plan 에 남긴다."""
+        """승인 전 쓰기를 막고, 리뷰어 결과와 계획 밖 파일 쓰기를 state 에 남긴다.
+
+        먼저 이 호출을 낸 AI 메시지의 계획 도구 호출을 센다(한 응답 규칙, 모듈 docstring).
+        """
         call = request.tool_call
         name, args = call["name"], call.get("args") or {}
+        state = request.state if isinstance(request.state, Mapping) else {}
+        siblings = plan_calls_in(_last_ai(state.get("messages"), call.get("id")))
+        if siblings and is_plan_call(name, args):
+            if siblings > 1:
+                return _blocked(call, ONE_PLAN_CALL)
+        elif siblings and (is_write_action(name, args) or name == TODOS_TOOL):
+            return _blocked(call, WAIT_FOR_PLAN)
         if name == "task" and args.get("subagent_type") == REVIEWER:
             return self._review(request, handler)
-        state = request.state if isinstance(request.state, Mapping) else {}
         plan = _plan_of(state)
         if (blocked := block_message(bool(state.get("plan_mode")), plan)) and is_write_action(
                 name, args):
-            return _error(call, blocked)
+            return _blocked(call, blocked)
         path = str(args.get("file_path", ""))
         if (plan is not None and is_approved(plan) and name in FILE_TOOLS
-                and not in_plan(path, plan_files(plan))):
+                and not in_plan(path, plan_files(plan, state.get(SCOPE_KEY)))):
             # 여기까지 왔으면 사람이 승인했다(approval.auto_decision 이 모든 모드에서 묻는다)
             result = handler(request)
             if _failed(_result_message(result)):
                 return result
             change = {"file": path, "tool": name, "version": plan.get("version")}
             _emit({"type": "scope_change", **change})
-            return _with_update(result, {"plan": {
-                **plan, "scope_changes": [*(plan.get("scope_changes") or []), change]}})
+            return _with_update(result, {SCOPE_KEY: [change]})
         return handler(request)
 
     def _review(self, request: ToolCallRequest,
@@ -542,6 +672,8 @@ def plan_reviewer(model: BaseChatModel, backend: BackendProtocol, workspace: Pat
     - 요약(summarization): agent.summarization_middleware 로 리뷰어 모델에 맞춰 만든 것을 받는다
       (task3, 도구 인자 잘림 끔). agent.py 가 이 모듈을 쓰므로 거꾸로 import 하지 않는다.
     interrupt_on 은 비워 메인의 승인 설정을 물려받지 않는다(승인 대상 도구가 없다).
+    .env 가드는 개인 키·자격 증명 읽기도 묻지 않고 거부한다(ask_sensitive=False).
+    메인처럼 물으면 리뷰어 안에서 interrupt 가 나 검토 도중 사람을 멈춰 세운다. 검토에는 필요 없다.
 
     Args:
         model: 리뷰어 모델(settings.reviewer_model 로 만든 인스턴스).
@@ -561,7 +693,7 @@ def plan_reviewer(model: BaseChatModel, backend: BackendProtocol, workspace: Pat
         "middleware": [
             FilesystemMiddleware(backend=backend, tools=["ls", "read_file", "glob", "grep"],
                                  custom_tool_descriptions=TOOL_DESCRIPTIONS),
-            TruncationRecoveryMiddleware(), DotenvGuardMiddleware(workspace),
+            TruncationRecoveryMiddleware(), DotenvGuardMiddleware(workspace, ask_sensitive=False),
             OpenRouterCacheMiddleware(), PlanBriefMiddleware(),
             ModelCallLimitMiddleware(run_limit=REVIEWER_MODEL_CALLS, exit_behavior="end"),
             ToolCallLimitMiddleware(run_limit=REVIEWER_TOOL_CALLS, exit_behavior="end"),

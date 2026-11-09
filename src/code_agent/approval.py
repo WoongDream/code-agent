@@ -8,25 +8,30 @@
 계획 모드(planning.py)의 상태는 PlanContext 로 받는다. 계획 승인은 모든 모드에서 사람에게 묻고,
 승인된 계획 밖 파일 쓰기도 모든 모드에서 묻는다. 계획 범위 판정(normalize_path, in_plan)도
 승인 결정이 쓰므로 여기 둔다. planning 이 이 모듈을 쓰고 이 모듈은 planning 을 쓰지 않는다.
+계획 규칙으로 사람에게 묻지 않고 거부한 것은 AUTO_BLOCK 을 앞에 붙인다. HITL 은 거부를
+'User rejected …' 로 감싸 모델에 주므로, 사용자가 거부한 것으로 읽지 않게 하려는 것이다.
 """
 
 from __future__ import annotations
 
-import fnmatch
 import re
 import shlex
 import unicodedata
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 
-from code_agent.guards import SHORT_NAME, is_sensitive_path
+from code_agent.guards import SHORT_NAME, is_env_path, is_sensitive_path
 
 MODES = ("manual", "auto-edit", "yolo")
 FILE_TOOLS = frozenset({"write_file", "edit_file", "delete"})
 APPROVE = {"type": "approve"}
 REJECT_MESSAGE = ("사용자가 이 도구 호출을 거부했습니다. 같은 호출을 다시 시도하지 말고, "
                   "대안을 제시하거나 사용자에게 원하는 방향을 물어보세요.")
+PLAN_WRITE_TOOL = "write_plan"
 PLAN_APPROVAL_TOOL = "request_plan_approval"
+PLAN_REVIEWER = "plan-reviewer"
+AUTO_BLOCK = "자동 차단(사용자 거부 아님): "
 PLAN_REVIEW_FIRST = ("plan-reviewer 검토를 먼저 받아라. task(subagent_type=\"plan-reviewer\") 로 "
                      "계획을 검토받고 지적을 반영한 뒤 request_plan_approval 을 다시 불러라.")
 PLAN_REJECT_MESSAGE = ("사용자가 계획을 승인하지 않았다. 사용자 의견을 반영해 "
@@ -34,7 +39,23 @@ PLAN_REJECT_MESSAGE = ("사용자가 계획을 승인하지 않았다. 사용자
                        "요청하라. 의견이 없으면 무엇을 바꿀지 사용자에게 물어라.")
 OUT_OF_PLAN = ("계획에 없는 파일이다. 승인하면 계획 범위에 더한다"
                "(계획을 끝냈으면 /plan off 로 계획을 지운다).")
-_GLOB_CHARS = frozenset("*?[")
+# 계획 도구는 plan state 를 읽고 쓴다. 한 응답에서 함께 돌면 서로의 결과를 덮어쓴다
+ONE_PLAN_CALL = ("계획 도구(write_plan·request_plan_approval·plan-reviewer 검토)는 한 응답에 "
+                 "하나만 부른다. 이 응답의 계획 도구는 하나도 실행하지 않았다. "
+                 "하나씩 불러 결과를 본 뒤 다음 것을 불러라.")
+# 쓰기는 같은 응답의 계획 도구 결과(새 계획, 승인)를 보기 전의 상태로 판정된다
+WAIT_FOR_PLAN = ("같은 응답에 계획 도구(write_plan·request_plan_approval·plan-reviewer 검토) "
+                 "호출이 있어 이 호출을 실행하지 않았다. 계획 도구의 결과를 받은 뒤 다음 응답에서 "
+                 "다시 불러라.")
+REVISE_FIRST = ("마지막 plan-reviewer 검토가 revise 인데 그 뒤 계획을 고치지 않았다. "
+                "리뷰 지적을 write_plan 으로 반영하거나, 반영하지 않는 이유를 note 에 적어라.")
+ENV_OUT_OF_PLAN = ("계획 밖의 .env 쓰기다. .env 는 비밀값 파일이라 가드가 어차피 막으므로 묻지 "
+                   "않았다. 값이 필요하면 사용자에게 직접 고치라고 안내하라.")
+# 글롭 조각. **/ 는 0개 이상의 폴더, ** 는 / 를 넘는 아무 글자, * 와 ? 는 / 를 넘지 않는다
+_GLOB_TOKEN = re.compile(r"(\*\*/|\*\*|\*|\?)")
+_GLOB_REGEX = {"**/": "(?:.*/)?", "**": ".*", "*": "[^/]*", "?": "[^/]"}
+# 작업 폴더의 어느 파일과도 이름이 같을 수 없는 경로(NUL). 이것을 덮는 항목은 전체를 덮는다
+_ANY_PATHS = ("/\0", "/\0/\0")
 
 
 @dataclass(frozen=True)
@@ -46,12 +67,16 @@ class PlanContext:
         reviewed: plan-reviewer 검토를 받았는지(status reviewed·revised·approved).
         approved: 사람이 계획을 승인했는지.
         files: 계획 범위. normalize_path 로 정규화한 경로이고 폴더는 / 로 끝난다.
+        revise_pending: 마지막 검토가 revise 인데 그 뒤 계획을 고치지 않았는지(같은 버전).
+        plan_calls: 결정할 호출들을 낸 응답(마지막 AI 메시지)에 든 계획 도구 호출 수.
     """
 
     block_message: str = ""
     reviewed: bool = False
     approved: bool = False
     files: frozenset[str] = frozenset()
+    revise_pending: bool = False
+    plan_calls: int = 0
 
 # 모드와 관계없이 자동 승인하는 읽기 전용 명령.
 # 인터프리터·빌드 도구(python, bash, uv, node, make)는 넣지 않는다(dcode THREAT_MODEL T13).
@@ -178,28 +203,61 @@ def normalize_path(path: str) -> str:
     return normal.casefold()
 
 
-def in_plan(path: str, files: Iterable[str]) -> bool:
-    """path 가 계획 파일이거나, 계획 폴더(/ 로 끝남) 안이거나, 글롭(*, ?, [)과 맞는지.
+@lru_cache(maxsize=256)
+def _entry_regex(entry: str) -> re.Pattern[str]:
+    """계획 항목의 경로 정규식. 폴더 항목(/ 로 끝남)은 그 아래 모든 경로를 덮는다.
 
-    files 는 normalize_path 로 정규화한 항목이다.
+    글롭은 *, ?, ** 만 쓰고 조각(/) 단위다. [ ] 는 글자 그대로다(Next.js 의 [id] 폴더).
+    """
+    pattern = entry + "**" if entry.endswith("/") else entry
+    return re.compile("".join(_GLOB_REGEX.get(part) or re.escape(part)
+                              for part in _GLOB_TOKEN.split(pattern)))
+
+
+def in_plan(path: str, files: Iterable[str]) -> bool:
+    """path 가 계획 범위 안인지. files 는 normalize_path 로 정규화한 항목이다.
+
+    - 같은 경로면 맞다.
+    - / 로 끝나는 항목은 폴더다. 그 폴더와 안의 모든 경로가 맞는다
+      (/tests/ 는 /tests2/ 를 덮지 않는다).
+    - *, ?, ** 가 든 항목은 글롭이다. * 와 ? 는 / 를 넘지 않고 ** 는 넘는다
+      (/src/*.py 는 /src/a/b.py 를 덮지 않는다).
     """
     target = normalize_path(path)
-    for entry in files:
-        if _GLOB_CHARS & set(entry):
-            if fnmatch.fnmatchcase(target, entry):
-                return True
-        elif entry.endswith("/"):
-            if target.startswith(entry) or target + "/" == entry:
-                return True
-        elif target == entry:
-            return True
-    return False
+    return any(target == entry or _entry_regex(entry).fullmatch(
+        target + "/" if entry.endswith("/") else target) for entry in files)
 
 
-def is_write_action(name: str, args: dict) -> bool:
+def covers_workspace(entry: str) -> bool:
+    """작업 폴더 전체나 맨 위의 모든 파일을 덮는 계획 항목인지(/, ., *, ** 등).
+
+    그런 항목이면 계획 밖 쓰기 재승인이 의미가 없어 write_plan 이 받지 않는다.
+    """
+    normal = {normalize_path(entry)}
+    return any(in_plan(path, normal) for path in _ANY_PATHS)
+
+
+def is_write_action(name: str, args: Mapping) -> bool:
     """파일 쓰기·수정·삭제이거나 읽기 전용이 아닌 셸 명령인지(계획 승인 전에 막는 호출)."""
     return name in FILE_TOOLS or (name == "execute"
                                   and not is_read_only_command(str(args.get("command", ""))))
+
+
+def is_plan_call(name: str, args: Mapping) -> bool:
+    """plan state 를 읽고 쓰는 계획 도구 호출인지(write_plan, request_plan_approval, 검토)."""
+    return (name in (PLAN_WRITE_TOOL, PLAN_APPROVAL_TOOL)
+            or (name == "task" and args.get("subagent_type") == PLAN_REVIEWER))
+
+
+def count_plan_calls(tool_calls: Iterable[Mapping]) -> int:
+    """한 응답의 도구 호출 중 계획 도구 호출 수."""
+    return sum(1 for call in tool_calls
+               if is_plan_call(str(call.get("name", "")), call.get("args") or {}))
+
+
+def auto_reject(message: str) -> dict:
+    """계획 규칙으로 사람에게 묻지 않고 거부하는 결정. 사용자 거부가 아니라고 앞에 밝힌다."""
+    return {"type": "reject", "message": AUTO_BLOCK + message}
 
 
 def plan_reason(action: dict, plan: PlanContext | None) -> str:
@@ -214,11 +272,16 @@ def plan_reason(action: dict, plan: PlanContext | None) -> str:
 def auto_decision(action: dict, mode: str, plan: PlanContext | None = None) -> dict | None:
     """자동으로 정할 수 있으면 결정을, 사람에게 물어야 하면 None 을 돌려준다.
 
-    plan 이 있으면 모드보다 먼저 본다.
-    - 계획 승인 요청: 검토 전이면 묻지 않고 거부하고(PLAN_REVIEW_FIRST),
-      아니면 모든 모드에서 묻는다.
-    - 승인 전 쓰기: 어차피 PlanModeMiddleware 가 막으므로 사람에게 묻지 않고 그 이유로 거부한다.
+    plan 이 있으면 모드보다 먼저 본다. 아래 거부는 어차피 PlanModeMiddleware 가 막을 호출이라
+    사람에게 묻지 않는다(auto_reject).
+    - 같은 응답에 계획 도구가 있으면: 계획 도구가 둘 이상이면 계획 도구를 모두(ONE_PLAN_CALL),
+      쓰기는 계획 도구 결과를 본 뒤로(WAIT_FOR_PLAN) 거부한다.
+    - 계획 승인 요청: 검토 전이면 거부하고(PLAN_REVIEW_FIRST), 이미 승인된 계획이면 승인한다
+      (도구가 상태를 바꾸지 않고 답한다). revise 검토를 반영하지 않았고 note 도 없으면
+      거부하고(REVISE_FIRST), 아니면 모든 모드에서 묻는다.
+    - 승인 전 쓰기: 차단 이유로 거부한다.
     - 승인된 계획 밖 파일 쓰기: auto-edit·yolo 에서도 묻는다(plan_reason).
+      .env 는 가드가 막으므로 묻지 않고 거부한다.
 
     Args:
         action: HITL 승인 요청 하나({"name", "args", ...}).
@@ -229,14 +292,26 @@ def auto_decision(action: dict, mode: str, plan: PlanContext | None = None) -> d
         자동 결정({"type": "approve"} 또는 reject) 또는 사람에게 물어야 하면 None.
     """
     name, args = action["name"], action.get("args") or {}
+    if plan is not None and plan.plan_calls:
+        if is_plan_call(name, args):
+            if plan.plan_calls > 1:
+                return auto_reject(ONE_PLAN_CALL)
+        elif is_write_action(name, args):
+            return auto_reject(WAIT_FOR_PLAN)
     if name == PLAN_APPROVAL_TOOL:
         if plan is None or not plan.reviewed:
-            return {"type": "reject", "message": PLAN_REVIEW_FIRST}
+            return auto_reject(PLAN_REVIEW_FIRST)
+        if plan.approved:
+            return APPROVE
+        if plan.revise_pending and not str(args.get("note") or "").strip():
+            return auto_reject(REVISE_FIRST)
         return None
     if plan is not None:
         if plan.block_message and is_write_action(name, args):
-            return {"type": "reject", "message": plan.block_message}
+            return auto_reject(plan.block_message)
         if plan_reason(action, plan):
+            if is_env_path(str(args.get("file_path", ""))):
+                return auto_reject(ENV_OUT_OF_PLAN)
             return None
     if mode == "yolo":
         return APPROVE

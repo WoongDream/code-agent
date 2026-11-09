@@ -304,7 +304,9 @@ def test_composite_tracer_fans_out(tmp_path: Path) -> None:
     first, second = FakeTracer(), FakeTracer()
     composite = combine_tracers([None, first, second])
     assert isinstance(composite, CompositeTracer)
-    assert combine_tracers([None, first]) is first and combine_tracers([None]) is None
+    # 하나여도 묶는다(그 트레이서의 예외가 턴을 깨지 않게). 없으면 None
+    assert isinstance(combine_tracers([None, first]), CompositeTracer)
+    assert combine_tracers([None]) is None
     steps = [tool_call("execute", {"command": "uv run pytest"}), AIMessage(content="끝")]
     app, _, out, _ = make_app(tmp_path, steps, "돌려", "n", "", "/exit", tracer=composite)
     app.run()

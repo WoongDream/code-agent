@@ -39,8 +39,14 @@ from code_agent.approval import (
 from code_agent.backend import process_shell_env, resolve_shell, safe_which
 from code_agent.environment import probe, render
 from code_agent.localtrace import LocalTracer, run_dir, trace_view
-from code_agent.planning import PLAN_PREFIX, is_approved, plan_context, render_plan
-from code_agent.render import Renderer, describe_action, todos_markup
+from code_agent.planning import (
+    PLAN_PREFIX,
+    SCOPE_KEY,
+    is_approved,
+    plan_context,
+    render_plan,
+)
+from code_agent.render import Renderer, describe_action, strip_controls, todos_markup
 from code_agent.resume_compat import SqlitePromptStore
 from code_agent.settings import REPO_ROOT, Settings, load_settings
 from code_agent.stops import TurnStops
@@ -50,6 +56,7 @@ from code_agent.tracing import (
     combine_tracers,
     langfuse_installed,
     make_tracer,
+    tracer_notices,
 )
 from code_agent.usage import Usage, UsageCallback
 from code_agent.worklog import session_context
@@ -260,7 +267,7 @@ class App:
         elif name == "/plan":
             if not arg:
                 self.show_plan()
-            elif arg == "off":
+            elif arg.lower() == "off":
                 self.plan_off()
             else:
                 self.turn(arg, plan_mode=True)
@@ -307,10 +314,9 @@ class App:
         tags = [self.workspace.name, f"mode:{self.mode}", f"model:{self.settings.model}"]
         trace_context: Any = nullcontext()
         if self.tracer is not None:
-            previous = self.agent.get_state(self.config).values.get("messages", [])
             trace_context = self.tracer.turn(text, session_id=self.thread_id, tags=tags,
                                              workspace=self.workspace,
-                                             context=session_context(previous, self.workspace))
+                                             context=self._trace_context())
         with trace_context as trace:
             def decide(action_requests: list[dict]) -> list[dict]:
                 # 결정 시점의 계획(검토·승인 여부, 범위)으로 정한다.
@@ -336,9 +342,10 @@ class App:
             callbacks = [meter, *(trace.callbacks if trace is not None else [])]
             error, interrupted = None, False
             try:
+                inp = self._turn_input(text, plan_mode)
                 renderer.start()
-                run_turn(self.agent, self._turn_input(text, plan_mode),
-                         {**self.config, "callbacks": callbacks}, decide=decide, on_part=on_part)
+                run_turn(self.agent, inp, {**self.config, "callbacks": callbacks},
+                         decide=decide, on_part=on_part)
             except KeyboardInterrupt:
                 renderer.end_turn()
                 self.console.print("[yellow]중단했다.[/]")
@@ -356,22 +363,48 @@ class App:
             if trace is not None:
                 trace.end(output=renderer.last_text, usage=meter.usage, error=error,
                           warnings=warnings, retries=stops.recoveries, interrupted=interrupted)
+        for notice in tracer_notices(self.tracer):  # 로컬 트레이스 기록 실패 등(한 번만)
+            self.console.print(f"[dim]{escape(notice)}[/]", soft_wrap=True)
         if meter.usage.calls:  # 중단·오류로 끝난 턴도 쓴 만큼은 남긴다
             self.sessions.add_usage(self.thread_id, meter.usage)
             self.console.print(f"[dim]{escape(meter.usage.summary())}[/]")
 
-    def _turn_input(self, text: str, plan_mode: bool) -> dict[str, Any]:
-        """턴 입력. 계획 모드면 plan_mode 를 켜고 메시지 앞에 순서 안내를 붙인다.
+    def _trace_context(self) -> str:
+        """Langfuse 평가기에 줄 이전 턴 요약(worklog.session_context).
 
-        승인된 계획이 남아 있으면 지운다.
-        끝난 요청의 계획이라, 두면 새 요청의 쓰기가 막히지 않는다.
+        쓰는 트레이서가 있을 때만 state 를 읽는다(로컬 트레이스는 쓰지 않는다).
+        읽다가 실패해도 트레이스 맥락만 비우고 턴은 돈다.
         """
-        if not plan_mode:
-            return {"messages": [{"role": "user", "content": text}]}
-        inp: dict[str, Any] = {"messages": [{"role": "user", "content": PLAN_PREFIX + text}],
-                               "plan_mode": True}
-        if is_approved(self.agent.get_state(self.config).values.get("plan")):
-            inp["plan"] = None
+        if not getattr(self.tracer, "uses_context", True):
+            return ""
+        try:
+            previous = self.agent.get_state(self.config).values.get("messages", [])
+            return session_context(previous, self.workspace)
+        except Exception:  # noqa: BLE001 - 트레이스 맥락 때문에 턴을 멈추지 않는다
+            return ""
+
+    def _turn_input(self, text: str, plan_mode: bool) -> dict[str, Any]:
+        """턴 입력.
+
+        계획 모드면 plan_mode 를 켜고 메시지 앞에 순서 안내를 붙인다. 남은 계획은 승인 여부와
+        관계없이 지워 새 계획으로 시작한다. 이전 요청의 검토를 물려받으면 새 계획이 검토 없이
+        승인 요청까지 갈 수 있고, 승인된 계획을 두면 새 요청의 쓰기가 막히지 않는다.
+
+        보통 요청이면, 승인된 계획의 할 일이 모두 끝났을 때 계획을 지우고 흐린 안내를 보인다.
+        끝난 계획의 범위가 다음 요청의 쓰기마다 '계획에 없는 파일' 재승인을 묻지 않게 한다.
+        할 일이 남았으면 그대로 둔다(그 재승인 문구가 /plan off 를 알려 준다).
+        """
+        if plan_mode:
+            return {"messages": [{"role": "user", "content": PLAN_PREFIX + text}],
+                    "plan_mode": True, "plan": None, SCOPE_KEY: None}
+        inp: dict[str, Any] = {"messages": [{"role": "user", "content": text}]}
+        values = self.agent.get_state(self.config).values
+        plan, todos = values.get("plan"), values.get("todos") or []
+        if (is_approved(plan) and todos
+                and all(todo.get("status") == "completed" for todo in todos)):
+            inp.update({"plan": None, SCOPE_KEY: None, "plan_mode": False})
+            self.console.print(f"[dim]계획 v{plan.get('version')} 이 끝나 계획 범위를 "
+                               "해제했다.[/]")
         return inp
 
     def ask(self, action: dict, plan: PlanContext | None = None) -> dict:
@@ -391,10 +424,17 @@ class App:
         """계획 승인 요청. state 의 계획(단계·완료 조건)과 검토 의견을 보이고 y/n 을 받는다.
 
         거부 의견은 모델에 가는 거부 메시지(approval.PLAN_REJECT_MESSAGE) 끝에 붙는다.
+        마지막 검토의 VERDICT 를 읽지 못했으면(unknown) 노란 줄로 알린다(원문은 계획에 붙는다).
         """
-        plan = self.agent.get_state(self.config).values.get("plan")
-        self.console.print(Markdown(render_plan(plan)) if plan else "[red]계획이 없다.[/]")
-        if note := str((action.get("args") or {}).get("note") or "").strip():
+        values = self.agent.get_state(self.config).values
+        plan = values.get("plan")
+        self.console.print(Markdown(render_plan(plan, values.get(SCOPE_KEY))) if plan
+                           else "[red]계획이 없다.[/]")
+        reviews = (plan or {}).get("reviews") or []
+        if reviews and reviews[-1].get("verdict") == "unknown":
+            self.console.print("[yellow]리뷰 결과를 해석하지 못했다(원문 표시).[/]")
+        note = strip_controls(str((action.get("args") or {}).get("note") or "")).strip()
+        if note:
             self.console.print(f"[bold]에이전트 메모[/] {escape(note)}")
         self.console.print("[bold yellow]승인 요청: 이 계획대로 구현할까?[/] "
                            "승인하면 단계가 할 일이 되고 쓰기 차단이 풀린다.")
@@ -417,7 +457,7 @@ class App:
         values = self.agent.get_state(self.config).values
         plan = values.get("plan")
         if plan:
-            self.console.print(Markdown(render_plan(plan)))
+            self.console.print(Markdown(render_plan(plan, values.get(SCOPE_KEY))))
         elif values.get("plan_mode"):
             self.console.print("[dim]계획 없음. 계획 모드가 켜져 있어 계획부터 세운다.[/]")
         else:
@@ -432,7 +472,7 @@ class App:
         if not values.get("plan") and not values.get("plan_mode"):
             self.console.print("[dim]지울 계획이 없다.[/]")
             return
-        self.agent.update_state(self.config, {"plan_mode": False, "plan": None})
+        self.agent.update_state(self.config, {"plan_mode": False, "plan": None, SCOPE_KEY: None})
         self.console.print("계획 모드와 계획을 지웠다. 이후 쓰기는 승인 모드대로 처리한다.")
 
     def show_trace(self, arg: str) -> None:
@@ -591,9 +631,10 @@ def main(argv: list[str] | None = None) -> int:
     if settings.langfuse_enabled and not langfuse_installed():
         console.print("[dim]Langfuse 키가 있지만 패키지가 없어 트레이스를 끈다. "
                       "켜려면: uv sync --extra langfuse[/]")
-    # 로컬 트레이스는 Langfuse 와 상관없이 켠다(CODE_AGENT_LOCAL_TRACE=0 으로 끈다)
-    tracer = combine_tracers([make_tracer(settings),
-                              LocalTracer(settings.data_dir) if settings.local_trace else None])
+    # 로컬 트레이스는 Langfuse 와 상관없이 켠다(CODE_AGENT_LOCAL_TRACE=0 으로 끈다).
+    # 로컬을 앞에 둔다. 네트워크를 쓰는 Langfuse 보다 먼저 남고, 나중에 닫힌다
+    tracer = combine_tracers([LocalTracer(settings.data_dir) if settings.local_trace else None,
+                              make_tracer(settings)])
     # 시작에 성공한 뒤에만 세션을 남긴다
     thread_id = args.resume or sessions.create(workspace, env_text)
 

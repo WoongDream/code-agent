@@ -22,6 +22,7 @@ from code_agent import settings as settings_module
 from code_agent.agent import build_agent, run_turn, summarization_middleware
 from code_agent.approval import (
     APPROVE,
+    AUTO_BLOCK,
     OUT_OF_PLAN,
     PLAN_REVIEW_FIRST,
     PlanContext,
@@ -34,6 +35,7 @@ from code_agent.cli import App, Sessions
 from code_agent.planning import (
     MAX_REVIEWS,
     PLAN_PREFIX,
+    SCOPE_KEY,
     block_message,
     next_plan,
     parse_review,
@@ -168,8 +170,9 @@ def test_in_plan_matches_files_folders_and_globs(path: str, files: set[str],
 
 def test_plan_files_union_of_steps_and_scope_changes() -> None:
     plan = next_plan(None, PLAN_ARGS)
-    plan["scope_changes"] = [{"file": "/README.md", "tool": "edit_file", "version": 1}]
-    assert plan_files(plan) == {"/calc.py", "/tests/", "/readme.md"}
+    scope = [{"file": "/README.md", "tool": "edit_file", "version": 1},
+             {"file": "/old.py", "tool": "edit_file", "version": 0}]  # 옛 버전 것은 빼다
+    assert plan_files(plan, scope) == {"/calc.py", "/tests/", "/readme.md"}
 
 
 @pytest.mark.parametrize(("text", "verdict", "findings"), [
@@ -217,16 +220,16 @@ def test_plan_context_from_state() -> None:
 def test_auto_decision_plan_rules(mode: str) -> None:
     request = {"name": "request_plan_approval", "args": {}}
     # 검토 전 승인 요청은 묻지 않고 거부, 검토 뒤에는 모든 모드에서 묻는다
-    assert auto_decision(request, mode) == {"type": "reject", "message": PLAN_REVIEW_FIRST}
-    assert auto_decision(request, mode, PlanContext(reviewed=False)) == {
-        "type": "reject", "message": PLAN_REVIEW_FIRST}
+    review_first = {"type": "reject", "message": AUTO_BLOCK + PLAN_REVIEW_FIRST}
+    assert auto_decision(request, mode) == review_first
+    assert auto_decision(request, mode, PlanContext(reviewed=False)) == review_first
     assert auto_decision(request, mode, PlanContext(reviewed=True)) is None
     # 승인 전: 쓰기는 차단 문구로 거부, 읽기 전용 명령은 승인
     blocked = PlanContext(block_message="막힘")
     for name, args in [("write_file", {"file_path": "/a.py", "content": ""}),
                        ("execute", {"command": "echo x > a.txt"})]:
         assert auto_decision({"name": name, "args": args}, mode, blocked) == {
-            "type": "reject", "message": "막힘"}
+            "type": "reject", "message": AUTO_BLOCK + "막힘"}
     assert auto_decision({"name": "execute", "args": {"command": "ls"}}, mode, blocked) == APPROVE
     # 승인 뒤: 계획 밖 파일은 모든 모드에서 묻는다
     approved = PlanContext(reviewed=True, approved=True, files=frozenset({"/calc.py"}))
@@ -440,10 +443,11 @@ def test_out_of_plan_write_asks_and_records_scope_change(tmp_path: Path, mode: s
     assert script.prompts.count(TOOL_PROMPT) == 1  # /other.py 첫 쓰기만
     text = out.getvalue()
     assert OUT_OF_PLAN[:10] in text and "계획 범위에 더했다: /other.py" in text
-    plan = state_of(app)["plan"]
-    assert plan["scope_changes"] == [{"file": "/other.py", "tool": "write_file", "version": 1}]
+    values = state_of(app)
+    scope = values[SCOPE_KEY]
+    assert scope == [{"file": "/other.py", "tool": "write_file", "version": 1}]
     assert (app.workspace / "other.py").read_text(encoding="utf-8") == "y = 2\n"
-    assert "## 범위 변경" in render_plan(plan)
+    assert "## 범위 변경" in render_plan(values["plan"], scope)
 
 
 def test_rejected_out_of_plan_write_is_not_recorded(tmp_path: Path) -> None:
@@ -451,7 +455,7 @@ def test_rejected_out_of_plan_write_is_not_recorded(tmp_path: Path) -> None:
         tmp_path, [write_plan(), review_call(), approval_call(), write("/other.py"), DONE],
         "/mode yolo", "/plan calc.py 에 add 추가", "y", "n", "", reviewer_steps=[REVIEW_OK])
     app.run()
-    assert state_of(app)["plan"]["scope_changes"] == []
+    assert not state_of(app).get(SCOPE_KEY)
     assert not (app.workspace / "other.py").exists()
 
 
@@ -489,12 +493,12 @@ def test_new_plan_request_drops_finished_plan(tmp_path: Path) -> None:
 
 def test_custom_events_emitted(tmp_path: Path) -> None:
     h = PlanHarness(tmp_path, [write_plan(), review_call(), approval_call(), write("/other.py"),
-                               DONE], reviewer_steps=[REVIEW_REVISE])
+                               DONE], reviewer_steps=[REVIEW_OK])  # revise 면 반영 전 승인 거부
     h.run(plan_mode=True)
     [written] = h.events("plan_written")
     assert (written["version"], written["files"]) == (1, ["/calc.py", "/tests/"])
     [reviewed] = h.events("plan_reviewed")
-    assert reviewed["verdict"] == "revise" and len(reviewed["findings"]) == 1
+    assert reviewed["verdict"] == "ok" and len(reviewed["findings"]) == 1
     [approved] = h.events("plan_approval")
     assert (approved["version"], approved["steps"]) == (1, 2)
     [scope] = h.events("scope_change")

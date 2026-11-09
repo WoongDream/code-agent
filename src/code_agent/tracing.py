@@ -16,7 +16,13 @@
   루트의 event(이름 = type)로 남긴다. 로컬 트레이스(localtrace.py)도 같은 사건을 남긴다.
 
 LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY 가 둘 다 있고 langfuse extra 가 설치돼 있을 때만 켜진다.
-로컬 트레이스와 함께 쓸 때는 CompositeTracer 로 묶는다.
+로컬 트레이스와 함께 쓸 때는 CompositeTracer 로 묶는다(combine_tracers). CompositeTracer 는 자식
+트레이서 하나의 실패(열기, 알림, 끝내기, 종료)를 삼키고 나머지를 이어 간다. 트레이스 때문에 턴이나
+REPL 이 멈추면 안 되기 때문이다.
+
+트레이서는 선택 속성 두 개를 가질 수 있다(없어도 된다).
+- uses_context: turn(context=…) 의 이전 턴 요약을 쓰는지. 거짓이면 App 이 그것을 만들지 않는다.
+- notices(): 사용자에게 한 번 보일 알림(로컬 기록 실패 등). App 이 턴 뒤에 흐리게 찍는다.
 """
 
 from __future__ import annotations
@@ -24,11 +30,12 @@ from __future__ import annotations
 import importlib.util
 import json
 import time
-from collections.abc import Iterator, Sequence
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Protocol
+from types import TracebackType
+from typing import Any, Protocol, cast
 
 from code_agent.approval import reject_reason
 from code_agent.render import describe_call
@@ -93,65 +100,118 @@ def domain_event(data: Any) -> dict[str, Any] | None:
     return event
 
 
-def combine_tracers(tracers: Sequence[Tracer | None]) -> Tracer | None:
-    """None 을 뺀 트레이서들을 하나로 묶는다.
+def combine_tracers(tracers: Sequence[Tracer | None]) -> CompositeTracer | None:
+    """None 을 뺀 트레이서들을 CompositeTracer 하나로 묶는다. 없으면 None.
 
-    없으면 None, 하나면 그대로, 여럿이면 CompositeTracer 다.
+    하나여도 묶는다. 그 트레이서가 실패해도 턴과 REPL 이 멈추지 않게 하려는 것이다.
+    앞의 트레이서부터 열고 알린다(cli 는 로컬을 앞에 둔다).
     """
     found = [tracer for tracer in tracers if tracer is not None]
-    if not found:
-        return None
-    return found[0] if len(found) == 1 else CompositeTracer(found)
+    return CompositeTracer(found) if found else None
+
+
+def tracer_notices(tracer: Any) -> list[str]:
+    """트레이서가 사용자에게 한 번 보일 알림(notices()). 없거나 실패하면 빈 목록."""
+    notices: Any = getattr(tracer, "notices", None)
+    if not callable(notices):
+        return []
+    try:
+        # callable() 로 좁히면 반환이 object 가 되어 pyright 가 반복을 거부한다
+        return [str(notice) for notice in cast(Any, notices)()]
+    except Exception:  # noqa: BLE001 - 알림 때문에 REPL 을 멈추지 않는다
+        return []
+
+
+def _quiet_exit(manager: AbstractContextManager[Any]) -> Callable[..., bool]:
+    """자식 턴 컨텍스트를 닫는 함수. 닫다가 난 예외는 삼킨다(ExitStack.push 용)."""
+    def close(exc_type: type[BaseException] | None, exc: BaseException | None,
+              traceback: TracebackType | None) -> bool:
+        try:
+            return bool(manager.__exit__(exc_type, exc, traceback))
+        except Exception:  # noqa: BLE001 - 한 트레이서의 실패로 턴을 멈추지 않는다
+            return False
+    return close
 
 
 class CompositeTracer:
-    """여러 트레이서(Langfuse, 로컬)에 같은 턴을 나눠 준다.
+    """여러 트레이서(로컬, Langfuse)에 같은 턴을 나눠 준다.
 
-    App 은 지금처럼 트레이서 하나만 본다.
+    App 은 지금처럼 트레이서 하나만 본다. 자식 하나의 실패는 삼키고 나머지를 이어 간다.
     """
 
     def __init__(self, tracers: Sequence[Tracer]) -> None:
         self.tracers = list(tracers)
 
+    @property
+    def uses_context(self) -> bool:
+        """이전 턴 요약을 쓰는 자식이 있는지(속성이 없는 트레이서는 쓴다고 본다)."""
+        return any(getattr(tracer, "uses_context", True) for tracer in self.tracers)
+
     @contextmanager
     def turn(self, text: str, *, session_id: str, tags: list[str],
              workspace: Path | None = None, context: str = "") -> Iterator[CompositeTurn]:
-        """모든 트레이서의 턴을 열고, 그것들에 나눠 주는 CompositeTurn 을 내준다."""
+        """모든 트레이서의 턴을 열고, 그것들에 나눠 주는 CompositeTurn 을 내준다.
+
+        열다가 실패한 트레이서는 이번 턴에서 빠진다. 닫다가 난 예외도 삼킨다.
+        """
         with ExitStack() as stack:
-            turns = [stack.enter_context(tracer.turn(text, session_id=session_id, tags=tags,
-                                                     workspace=workspace, context=context))
-                     for tracer in self.tracers]
+            turns = []
+            for tracer in self.tracers:
+                try:
+                    manager = tracer.turn(text, session_id=session_id, tags=tags,
+                                          workspace=workspace, context=context)
+                    turn = manager.__enter__()
+                except Exception:  # noqa: BLE001 - 이 트레이서만 빠지고 턴은 돈다
+                    continue
+                stack.push(_quiet_exit(manager))
+                turns.append(turn)
             yield CompositeTurn(turns)
 
     def shutdown(self) -> None:
-        """모든 트레이서를 끝낸다."""
+        """모든 트레이서를 끝낸다. 하나가 실패해도 나머지는 끝낸다."""
         for tracer in self.tracers:
-            tracer.shutdown()
+            try:
+                tracer.shutdown()
+            except Exception:  # noqa: BLE001 - 종료 실패로 REPL 종료를 막지 않는다
+                continue
+
+    def notices(self) -> list[str]:
+        """자식 트레이서들의 한 번 보일 알림(tracer_notices)."""
+        return [notice for tracer in self.tracers for notice in tracer_notices(tracer)]
 
 
 class CompositeTurn:
-    """여러 TurnTrace 에 같은 알림을 나눠 준다. 콜백은 모두 모아 한 목록으로 내놓는다."""
+    """여러 TurnTrace 에 같은 알림을 나눠 준다. 콜백은 모두 모아 한 목록으로 내놓는다.
+
+    한 턴의 실패(예외)는 삼키고 다음 턴에 계속 넘긴다.
+    """
 
     def __init__(self, turns: Sequence[TurnTrace]) -> None:
         self.turns = list(turns)
-        self.callbacks = [callback for turn in self.turns for callback in turn.callbacks]
+        self.callbacks = [callback for turn in self.turns
+                          for callback in getattr(turn, "callbacks", None) or []]
+
+    def _each(self, notify: Callable[[TurnTrace], None]) -> None:
+        for turn in self.turns:
+            try:
+                notify(turn)
+            except Exception:  # noqa: BLE001 - 한 트레이서의 실패로 턴을 멈추지 않는다
+                continue
 
     def on_part(self, part: tuple) -> None:
         """스트림 조각을 모든 턴에 넘긴다."""
-        for turn in self.turns:
-            turn.on_part(part)
+        self._each(lambda turn: turn.on_part(part))
 
     def decision(self, action: dict, decision: dict, auto: bool) -> None:
         """승인 결정을 모든 턴에 넘긴다."""
-        for turn in self.turns:
-            turn.decision(action, decision, auto)
+        self._each(lambda turn: turn.decision(action, decision, auto))
 
     def end(self, *, output: str, usage: Usage, error: str | None = None,
             warnings: Sequence[str] = (), retries: int = 0, interrupted: bool = False) -> None:
         """모든 턴을 끝낸다."""
-        for turn in self.turns:
-            turn.end(output=output, usage=usage, error=error, warnings=warnings, retries=retries,
-                     interrupted=interrupted)
+        self._each(lambda turn: turn.end(output=output, usage=usage, error=error,
+                                         warnings=warnings, retries=retries,
+                                         interrupted=interrupted))
 
 
 def make_tracer(settings: Settings) -> LangfuseTracer | None:
@@ -168,6 +228,8 @@ def make_tracer(settings: Settings) -> LangfuseTracer | None:
 
 class LangfuseTracer:
     """Langfuse 클라이언트로 턴마다 루트 observation "turn" 을 만든다."""
+
+    uses_context = True  # 이전 턴 요약을 작업 기록의 맥락 절로 남긴다(평가기용)
 
     def __init__(self, client: Any, *, public_key: str) -> None:
         self.client = client

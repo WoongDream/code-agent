@@ -14,14 +14,24 @@
   가드가 막거나 사람이 거부한 호출은 실행되지 않아 도구 콜백이 오지 않기 때문이다.
 - 도구 출력 원문은 남기지 않고 한 줄 요약(worklog.summarize_result)만 남긴다.
   .env 를 언급한 셸 명령은 그 요약도 빼고 exit code 만 남긴다. 파일 도구의 .env 는 가드가 막는다.
-- 기록에 실패해도(디스크, 권한 등) 턴은 멈추지 않는다.
+  요약의 마지막 출력 줄이 'NAME=…'(환경 변수 대입 모양)이면 비밀값일 수 있어 exit code 만 남긴다
+  (cat .en? 처럼 '.env' 글자 없이 .env 를 읽은 명령).
+- metrics 의 retries 는 메인 에이전트의 잘림 자동 복구 횟수다(stops.TurnStops.recoveries).
+  서브에이전트의 복구는 sub 가 붙은 recovery 사건으로만 보인다.
+  SDK 가 안에서 하는 HTTP 재시도(max_retries)는 콜백에 오지 않아 보이지 않는다.
+- 기록에 실패해도(디스크, 권한 등) 턴은 멈추지 않는다. 프로세스에서 처음 난 실패는 App 이
+  턴 뒤에 흐린 한 줄로 한 번 알린다(LocalTracer.notices).
+- 강제 종료로 반만 쓴 줄이 있어도 이어 쓴다. 턴마다 파일에 처음 쓰기 전에 끝이 줄바꿈이 아니면
+  줄바꿈부터 써서 새 사건이 그 조각에 붙어 함께 깨지지 않게 한다.
 
-/trace 의 표(trace_view)도 여기서 만든다.
+/trace 의 표(trace_view)도 여기서 만든다. 사건의 글은 모두 rich Text 로 넣는다(마크업으로
+읽히면 '[/]' 같은 글이 표를 깨뜨린다).
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -55,6 +65,7 @@ MAX_REQUEST = 200  # turn_start 에 남기는 요청 앞부분 글자 수
 BASE_KEYS = ("ts", "turn", "type", "t")  # 모든 사건에 있는 필드
 _ENV_MENTION = re.compile(r"\.env", re.IGNORECASE)
 _EXIT_CODE = re.compile(r"exit code (\d+)|Exit code: (\d+)", re.IGNORECASE)
+_ASSIGNMENT = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=")  # SECRET=… (.env 한 줄 모양)
 _UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")
 
 
@@ -66,6 +77,8 @@ def run_dir(data_dir: Path, thread_id: str) -> Path:
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     """jsonl 의 객체 줄들. 없는 파일은 빈 목록이다.
 
+    줄은 LF 로만 나눈다. str.splitlines 는 U+2028·U+0085 같은 글자에서도 나눠, 그 글자가 든
+    사건(ensure_ascii=False 라 그대로 쓴다)을 깨뜨린다.
     깨진 줄(강제 종료로 반만 쓴 줄 등)은 건너뛴다.
     """
     try:
@@ -73,7 +86,7 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     except OSError:
         return []
     rows = []
-    for line in text.splitlines():
+    for line in text.split("\n"):
         try:
             row = json.loads(line)
         except ValueError:
@@ -83,16 +96,57 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def append_jsonl(path: Path, row: dict[str, Any]) -> None:
-    """한 줄을 덧붙인다. 줄 끝은 OS 와 상관없이 LF 다."""
-    with path.open("a", encoding="utf-8", newline="\n") as file:
-        file.write(json.dumps(row, ensure_ascii=False) + "\n")
+def _encode_line(row: dict[str, Any]) -> bytes:
+    """한 줄의 바이트.
+
+    짝 없는 서로게이트(\\udc80 등)는 UTF-8 로 쓸 수 없어 \\u 이스케이프로 쓴다.
+    """
+    try:
+        return (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8")
+    except UnicodeEncodeError:
+        return (json.dumps(row, ensure_ascii=True) + "\n").encode("ascii")
+
+
+def _ends_mid_line(path: Path) -> bool:
+    """파일이 줄바꿈 없이 끝나는지(강제 종료로 반만 쓴 줄). 없거나 빈 파일이면 거짓."""
+    try:
+        with path.open("rb") as file:
+            if file.seek(0, os.SEEK_END) == 0:
+                return False
+            file.seek(-1, os.SEEK_END)
+            return file.read(1) != b"\n"
+    except OSError:
+        return False
+
+
+def append_jsonl(path: Path, row: dict[str, Any], *, repair: bool = False) -> None:
+    """한 줄을 덧붙인다. 줄 끝은 OS 와 상관없이 LF 다.
+
+    repair 면 먼저 파일이 반만 쓴 줄로 끝나는지 보고, 그러면 줄바꿈부터 쓴다.
+    """
+    data = _encode_line(row)
+    if repair and _ends_mid_line(path):
+        data = b"\n" + data
+    with path.open("ab") as file:
+        file.write(data)
 
 
 def turn_numbers(events: Sequence[dict[str, Any]]) -> list[int]:
-    """trace.jsonl 사건들에 있는 턴 번호(turn_start 기준), 오름차순."""
-    return sorted({e["turn"] for e in events
-                   if e.get("type") == "turn_start" and isinstance(e.get("turn"), int)})
+    """trace.jsonl 사건들에 있는 턴 번호, 오름차순.
+
+    turn_start 가 깨져도 그 턴의 다른 사건으로 찾는다.
+    """
+    return sorted({e["turn"] for e in events if _is_turn(e.get("turn"))})
+
+
+def _is_turn(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def last_turn(folder: Path) -> int:
+    """thread 폴더에 남은 가장 큰 턴 번호(사건과 지표 모두에서). 없으면 0."""
+    rows = [*read_jsonl(folder / TRACE_FILE), *read_jsonl(folder / METRICS_FILE)]
+    return max((row["turn"] for row in rows if _is_turn(row.get("turn"))), default=0)
 
 
 def _now() -> str:
@@ -119,13 +173,25 @@ def _exit_code(message: ToolMessage) -> int | None:
     return int(next(g for g in match.groups() if g)) if match else None
 
 
+def _last_output_line(message: ToolMessage) -> str:
+    """execute 출력에서 종료 코드 줄을 뺀 마지막 줄(summarize_result 가 요약에 넣는 줄)."""
+    lines = [line.strip() for line in message.text.splitlines()
+             if line.strip() and not _EXIT_CODE.search(line)]
+    return lines[-1] if lines else ""
+
+
 def _summary(call: dict, message: ToolMessage, exit_code: int | None) -> str:
-    """도구 결과 한 줄 요약. 출력 원문은 남기지 않는다."""
+    """도구 결과 한 줄 요약. 출력 원문은 남기지 않는다.
+
+    execute 요약에는 출력의 마지막 줄이 들어가는데, 그 줄이 .env 의 값일 수 있다.
+    .env 를 언급한 명령이거나 마지막 줄이 'NAME=…' 모양이면 exit code 만 남긴다.
+    """
     command = str((call.get("args") or {}).get("command", ""))
-    if call.get("name") == "execute" and _ENV_MENTION.search(command):
-        # execute 요약에는 출력의 마지막 줄이 들어가는데, 그 줄이 .env 의 값일 수 있다
+    if call.get("name") == "execute" and (
+            _ENV_MENTION.search(command)
+            or (message.status != "error" and _ASSIGNMENT.match(_last_output_line(message)))):
         return (f"exit {exit_code}" if exit_code is not None
-                else "(.env 를 다룬 명령이라 출력 요약을 남기지 않았다)")
+                else "(비밀값일 수 있는 출력이라 요약을 남기지 않았다)")
     if message.name == "grep":  # 가드가 이미 지웠지만 한 번 더 거른다
         message = message.model_copy(update={"content": strip_env_matches(message.text)})
     return summarize_result(message)

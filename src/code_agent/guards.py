@@ -76,12 +76,14 @@ class DotenvGuardMiddleware(AgentMiddleware):
 
     workspace 를 주면 가상 경로를 실제 파일로 바꿔 긴 이름으로도 판정한다(8.3 이름 대책).
     대상이 없으면(새로 쓰기) 8.3 모양 이름(~숫자)은 보수적으로 막는다.
-    개인 키·자격 증명 파일 읽기는 승인 프롬프트로 묻는다.
+    개인 키·자격 증명 파일 읽기는 승인 프롬프트로 묻는다. ask_sensitive=False 면 묻지 않고
+    거부한다(plan-reviewer: 검토에 필요 없고, 서브에이전트 안에서 사람을 멈춰 세우지 않는다).
     """
 
-    def __init__(self, workspace: Path | None = None) -> None:
+    def __init__(self, workspace: Path | None = None, *, ask_sensitive: bool = True) -> None:
         super().__init__()
         self.workspace = workspace
+        self.ask_sensitive = ask_sensitive
 
     def _real_name(self, path: str) -> str | None:
         """작업 폴더 안 실제 파일의 긴 이름. 없거나 작업 폴더를 모르면 None."""
@@ -114,6 +116,7 @@ class DotenvGuardMiddleware(AgentMiddleware):
                        ) -> ToolMessage | Command:
         """.env 경로는 오류 ToolMessage 로 막고, 개인 키·자격 증명 읽기는 interrupt 로 묻는다.
 
+        ask_sensitive 가 거짓이면 개인 키·자격 증명 읽기도 묻지 않고 막는다.
         grep 결과에서는 .env 파일의 줄을 지운다.
         """
         call = request.tool_call
@@ -122,6 +125,10 @@ class DotenvGuardMiddleware(AgentMiddleware):
         if name in PATH_TOOLS and self.blocks(path):
             return ToolMessage(content=f"Error: 권한 거부 - {path} 는 비밀값 파일이라 "
                                        "읽거나 쓸 수 없습니다.",
+                               tool_call_id=call["id"], name=name, status="error")
+        if self.asks(name, path) and not self.ask_sensitive:
+            return ToolMessage(content=f"Error: 권한 거부 - {path} 는 개인 키·자격 증명일 수 "
+                                       "있는 파일이라 읽지 않습니다.",
                                tool_call_id=call["id"], name=name, status="error")
         if self.asks(name, path):
             # HITL 과 같은 모양이라 CLI 의 승인 흐름(run_turn → decide)이 그대로 처리하고,

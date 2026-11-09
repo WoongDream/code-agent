@@ -48,6 +48,28 @@ STATUS_CALL_CHARS = 60  # 상태 줄에 보이는 도구 호출 설명 길이
 _TODO_MARK = {"completed": "[green]✔[/]", "in_progress": "[yellow]▶[/]", "pending": "[dim]○[/]"}
 # 작성 중인 도구 인자(JSON 조각)에서 경로만 꺼낸다
 _FILE_PATH = re.compile(r'"file_path"\s*:\s*"([^"]*)"')
+# C0 제어 문자(줄바꿈·탭 제외), DEL, C1 제어 문자. ESC 와 C1 의 CSI·OSC 가 화면 지우기·창 제목
+# 바꾸기 같은 터미널 명령을 시작한다
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def strip_controls(text: str) -> str:
+    """모델이 쓴 글에서 터미널 제어 문자를 뺀다(줄바꿈·탭은 남긴다).
+
+    승인 프롬프트·계획처럼 사람이 보고 결정하는 화면을 모델이 지우거나 가리지 못하게 한다.
+    """
+    return _CONTROL.sub("", text)
+
+
+def _clean(value: Any) -> Any:
+    """도구 인자 안의 모든 글에서 제어 문자를 뺀 사본."""
+    if isinstance(value, str):
+        return strip_controls(value)
+    if isinstance(value, Mapping):
+        return {strip_controls(str(key)): _clean(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_clean(item) for item in value]
+    return value
 
 
 class StatusLine:
@@ -354,8 +376,14 @@ def rewrites_history(messages: list) -> bool:
 
 
 def describe_call(call: Mapping[str, Any]) -> str:
-    """도구 호출 한 줄 설명. execute 는 명령, 파일 도구는 경로, 그 밖은 인자 JSON 앞 100자."""
-    name, args = call["name"], call.get("args") or {}
+    """도구 호출 한 줄 설명. execute 는 명령, 파일 도구는 경로, 그 밖은 인자 JSON 앞 100자.
+
+    모델이 쓴 인자라 터미널 제어 문자는 뺀다.
+    """
+    return strip_controls(_describe_call(str(call["name"]), call.get("args") or {}))
+
+
+def _describe_call(name: str, args: Mapping[str, Any]) -> str:
     if name == "execute":
         return f"$ {args.get('command', '')}"
     if name in ("read_file", "write_file", "edit_file", "delete", "ls"):
@@ -384,11 +412,13 @@ def describe_action(action: dict, *, reason: str = "") -> RenderableType:
 
     execute 는 명령, edit_file 은 diff, write_file 은 경로·크기·앞부분.
     reason(계획에 없는 파일 등 모드와 관계없이 묻는 이유)이 있으면 제목 아래 노란 줄로 보인다.
+    인자는 모델이 쓴 것이라 터미널 제어 문자를 빼고 보인다(strip_controls).
     """
-    name, args = action["name"], action.get("args") or {}
+    raw = action.get("args") or {}
+    name, args = strip_controls(str(action["name"])), _clean(raw)
     title: RenderableType = Text(f"승인 요청: {name}", style="bold yellow")
     if reason:
-        title = Group(title, Text(reason, style="yellow"))
+        title = Group(title, Text(strip_controls(reason), style="yellow"))
     if name == "execute":
         return Group(title, Syntax(str(args.get("command", "")), "bash", word_wrap=True))
     if name == "edit_file":
@@ -402,8 +432,8 @@ def describe_action(action: dict, *, reason: str = "") -> RenderableType:
     if name == "write_file":
         content = str(args.get("content", ""))
         head = "\n".join(content.splitlines()[:20])
-        return Group(title,
-                     Text(f"{args.get('file_path', '')} ({len(content.encode('utf-8'))} bytes)"),
+        size = len(str(raw.get("content", "")).encode("utf-8", errors="replace"))  # 쓸 크기
+        return Group(title, Text(f"{args.get('file_path', '')} ({size} bytes)"),
                      Text(head, style="dim"))
     if name == "delete":
         return Group(title, Text(str(args.get("file_path", "")), style="red"))

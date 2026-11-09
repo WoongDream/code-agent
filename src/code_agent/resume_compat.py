@@ -271,7 +271,10 @@ class PromptFingerprintMiddleware(AgentMiddleware):
     사용자 middleware 목록에서 TodoList 와 ToolArgsMiddleware 뒤에 둔다.
     wrap_model_call 은 앞이 바깥쪽이라,
     우리 system 절(core 와 TodoList 가 붙인 것까지)과 모델이 받는 도구 목록을 본다.
-    그보다 안쪽(tail)인 메모리·스킬 절은 thread 마다 고정이라 괜찮다.
+    그보다 안쪽(tail)인 스킬·메모리 절은 system_parts(각 middleware 의 modify_request)를
+    요청 사본에 차례로 적용해 지문에 넣는다.
+    두 절은 thread 마다 고정이지만, 그 절이 생기기 전의 옛 thread 를 이어 가면 system 이
+    바뀌므로 그때도 이전해야 한다. deepagents 를 올려 그 문구가 바뀐 때도 같다.
     안내 이벤트는 기록이 바뀔 때만 나가므로 thread 마다 이전 한 번에 한 번이다.
 
     지문 저장소가 sqlite 오류(다른 프로세스가 sessions.db 를 잠근 경우 등)를 내도
@@ -283,9 +286,12 @@ class PromptFingerprintMiddleware(AgentMiddleware):
     - 경고(prompt_store_error 이벤트)는 이 agent 에서 한 번만 낸다.
     """
 
-    def __init__(self, store: PromptStore) -> None:
+    def __init__(self, store: PromptStore,
+                 system_parts: Sequence[Callable[[ModelRequest], ModelRequest]] = ()) -> None:
         super().__init__()
         self.store = store
+        # 안쪽 middleware 가 system 에 붙일 절. 지문 계산용 사본에만 적용한다
+        self.system_parts = tuple(system_parts)
         self._store_warned = False
 
     def wrap_model_call(self, request: ModelRequest,
@@ -309,7 +315,10 @@ class PromptFingerprintMiddleware(AgentMiddleware):
         except sqlite3.Error as e:
             self._store_error(e)
             return request
-        record, event = next_record(saved, fingerprint(request), state)
+        probe = request
+        for part in self.system_parts:
+            probe = part(probe)
+        record, event = next_record(saved, fingerprint(probe), state)
         if record is not saved:
             try:
                 self.store.put(thread_id, record)

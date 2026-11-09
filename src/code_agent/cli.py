@@ -24,6 +24,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.markup import escape
 from rich.syntax import Syntax
+from rich.text import Text
 
 from code_agent.agent import build_agent, run_turn
 from code_agent.approval import (
@@ -32,13 +33,27 @@ from code_agent.approval import (
     PLAN_APPROVAL_TOOL,
     PLAN_REJECT_MESSAGE,
     PlanContext,
+    ask_reason,
     decide_all,
-    plan_reason,
     reject,
 )
 from code_agent.backend import process_shell_env, resolve_shell, safe_which
 from code_agent.environment import probe, render
 from code_agent.localtrace import LocalTracer, run_dir, trace_view
+from code_agent.memory import (
+    MEMORY_FILE,
+    REMEMBER_DONE,
+    WARN_CHARS,
+    MemoryTrust,
+    content_sha256,
+    decode_memory,
+    library_logs,
+    loaded_chars,
+    memory_report,
+    pending_chars,
+    read_memory,
+    remember_prompt,
+)
 from code_agent.planning import PLAN_PREFIX, is_approved, plan_context, render_plan
 from code_agent.render import Renderer, describe_action, todos_markup
 from code_agent.resume_compat import SqlitePromptStore
@@ -68,12 +83,17 @@ HELP = """\
   /cost          이 세션의 모델 호출·토큰·비용 합계
   /trace \\[n]     마지막(또는 n번째) 턴의 타임라인(모델·도구·승인, 소요 시간, 상태)
   /trace errors  이 세션의 실패한 도구·오류·경고
+  /remember \\[메모]  이번 대화에서 확인된 규칙·사실을 메모리(AGENTS.md)에 적게 한다. \
+다음 /new 부터 반영된다
+  /memory        이 세션이 읽은 메모리 파일(글자 수, 그 뒤 바뀌었는지)과 스킬
   /thinking \\[on|off]  생각(reasoning) 원문 표시. 끄면(기본) 문단마다 앞부분만 짧은 메모로 보인다
   /exit          종료
 Ctrl+C 는 실행 중인 턴만 취소한다. \
 읽기 전용 셸 명령(git status, ls, cat 등)은 모드와 관계없이 자동 승인된다."""
 YOLO_WARNING = ("[bold red]yolo 모드: 파일 쓰기와 셸 명령을 묻지 않고 실행한다. "
                 "셸은 샌드박스가 아니다.[/]")
+
+MEMORY_PREVIEW_LINES = 15  # 신뢰를 물을 때 보일 AGENTS.md 앞부분
 
 ReadLine = Callable[[str], str]
 _USAGE_COLUMNS = [(f.name, "REAL" if f.type == "float" else "INTEGER") for f in fields(Usage)]
@@ -88,6 +108,9 @@ class Sessions:
     프롬프트 캐시와 Opus 5.5 의 보존된 thinking 이 깨지기 때문이다.
     code_agent_threads 에 열을 더하지 않고 표를 따로 둔다. 열을 더하면 아직 돌고 있는 옛 프로세스의
     'INSERT … VALUES (?, ?, ?)' 가 열 수가 맞지 않아 실패한다.
+
+    프로젝트 AGENTS.md 를 메모리로 읽을지 정한 결정도 남긴다(작업 폴더와 내용 해시마다,
+    code_agent_trusted_memory). 내용이 바뀌면 해시가 달라 다시 묻는다.
     """
 
     def __init__(self, conn: sqlite3.Connection) -> None:
@@ -100,6 +123,9 @@ class Sessions:
         conn.execute("CREATE TABLE IF NOT EXISTS code_agent_usage "
                      "(thread_id TEXT NOT NULL, at TEXT NOT NULL, "
                      f"{', '.join(f'{name} {kind} NOT NULL' for name, kind in _USAGE_COLUMNS)})")
+        conn.execute("CREATE TABLE IF NOT EXISTS code_agent_trusted_memory "
+                     "(workspace TEXT NOT NULL, sha256 TEXT NOT NULL, trusted INTEGER NOT NULL, "
+                     "decided_at TEXT NOT NULL, PRIMARY KEY (workspace, sha256))")
         conn.commit()
 
     def create(self, workspace: Path, env_text: str = "") -> str:
@@ -144,6 +170,25 @@ class Sessions:
             total += Usage(**dict(zip((name for name, _ in _USAGE_COLUMNS), row, strict=True)))
         return total, len(rows)
 
+    def memory_decision(self, workspace: Path, sha256: str) -> bool | None:
+        """이 작업 폴더의 이 내용(sha256)인 AGENTS.md 를 신뢰했는지. 정한 적이 없으면 None."""
+        row = self.conn.execute("SELECT trusted FROM code_agent_trusted_memory "
+                                "WHERE workspace = ? AND sha256 = ?",
+                                (str(workspace), sha256)).fetchone()
+        return bool(row[0]) if row else None
+
+    def trusted_before(self, workspace: Path) -> bool:
+        """이 작업 폴더의 AGENTS.md 를 (다른 내용일 때라도) 신뢰한 적이 있는지."""
+        return self.conn.execute("SELECT 1 FROM code_agent_trusted_memory "
+                                 "WHERE workspace = ? AND trusted = 1",
+                                 (str(workspace),)).fetchone() is not None
+
+    def decide_memory(self, workspace: Path, sha256: str, trusted: bool) -> None:
+        """프로젝트 AGENTS.md 를 메모리로 읽을지 정한 결정을 남긴다."""
+        self.conn.execute("INSERT OR REPLACE INTO code_agent_trusted_memory VALUES (?, ?, ?, ?)",
+                          (str(workspace), sha256, int(trusted), datetime.now(UTC).isoformat()))
+        self.conn.commit()
+
 
 class App:
     """터미널 REPL 하나. 입력을 슬래시 커맨드나 에이전트 턴으로 처리하고 결과를 그린다.
@@ -163,23 +208,34 @@ class App:
             /new 로 만드는 thread 에도 같은 것을 남긴다.
         fresh_agent: 환경을 다시 탐지해 (env_text, agent) 를 새로 만드는 함수.
             절이 없던 옛 thread 를 이어 온 프로세스에서 /new 가 쓴다.
+        memory_trust: agent 와 나눠 쓰는 프로젝트 AGENTS.md 신뢰(memory.MemoryTrust).
+            새 thread 를 시작할 때 사람에게 묻고 고친다. None 이면 새로 만든다(agent 를 주면 그
+            agent 는 이것을 보지 않는다).
+        interactive: 사람에게 y/N 을 물을 수 있는지. None 이면 입출력이 터미널인지로 정한다.
+            파이프 입력에서 물으면 첫 요청을 답으로 먹으므로 묻지 않는다.
     """
 
     def __init__(self, settings: Settings, workspace: Path, mode: str, sessions: Sessions,
                  thread_id: str, console: Console, read_line: ReadLine, *, agent=None,
                  tracer: Tracer | None = None, env_text: str = "",
-                 fresh_agent: Callable[[], tuple[str, Any]] | None = None) -> None:
+                 fresh_agent: Callable[[], tuple[str, Any]] | None = None,
+                 memory_trust: MemoryTrust | None = None,
+                 interactive: bool | None = None) -> None:
         self.settings, self.workspace, self.mode = settings, workspace, mode
         self.sessions, self.thread_id = sessions, thread_id
         self.console, self.read_line = console, read_line
         self.env_text = env_text
         self.fresh_agent = fresh_agent  # (env_text, agent): 환경을 다시 탐지해 새로 만든 agent
+        self.memory_trust = memory_trust if memory_trust is not None else MemoryTrust()
         self.agent = (agent if agent is not None
-                      else session_agent(settings, workspace, sessions, env_text))
+                      else session_agent(settings, workspace, sessions, env_text,
+                                         memory_trust=self.memory_trust))
         self.tracer = tracer
+        self.interactive = _interactive() if interactive is None else interactive
         # 파이프·테스트(StringIO)에서는 상태 줄을 그리지 않는다
         self.status_line = console.is_terminal and _interactive()
         self.full_thinking = False  # /thinking
+        self._refused_memory: set[str] = set()  # 이 프로세스에서 거절한 AGENTS.md 내용(sha256)
 
     @property
     def config(self) -> RunnableConfig:
@@ -203,11 +259,14 @@ class App:
                                    f"{escape(str(tracer.folder(self.thread_id)))} (/trace)[/]")
         if self.mode == "yolo":
             self.console.print(YOLO_WARNING)
-        try:
-            return self._loop()
-        finally:
-            if self.tracer is not None:
-                self.tracer.shutdown()  # 남은 트레이스를 보낸다
+        # deepagents 의 경고(없는 스킬 폴더 등)가 stderr 로 나가 상태 줄을 깨지 않게 파일로 보낸다
+        with library_logs(self.settings.data_dir):
+            try:
+                self.start_memory()
+                return self._loop()
+            finally:
+                if self.tracer is not None:
+                    self.tracer.shutdown()  # 남은 트레이스를 보낸다
 
     def _loop(self) -> int:
         while True:
@@ -248,6 +307,7 @@ class App:
                     return True
             self.thread_id = self.sessions.create(self.workspace, self.env_text)
             self.console.print(f"새 세션 {self.thread_id}")
+            self.start_memory()
         elif name == "/mode":
             if arg not in MODES:
                 self.console.print(f"[red]모드는 {', '.join(MODES)} 중 하나다. "
@@ -275,6 +335,11 @@ class App:
                                if turns else "[dim]이 세션에 기록된 사용량이 아직 없다.[/]")
         elif name == "/trace":
             self.show_trace(arg)
+        elif name == "/remember":
+            self.turn(remember_prompt(arg))
+            self.console.print(f"[dim]{REMEMBER_DONE}[/]")
+        elif name == "/memory":
+            self.show_memory()
         elif name == "/thinking":
             if arg not in ("", "on", "off"):
                 self.console.print(f"[red]{escape('/thinking [on|off]')}[/]")
@@ -378,11 +443,12 @@ class App:
         """승인 요청 하나를 보여 주고 y/n 을 받는다. 거부면 이유(선택)도 받아 모델에 넘긴다.
 
         계획 승인 요청은 계획과 검토 의견을 보인다(ask_plan).
-        승인된 계획 밖 파일 쓰기는 그 이유(approval.plan_reason)를 함께 보인다.
+        모드와 관계없이 묻는 이유(사용자 공통 메모리 쓰기, 승인된 계획 밖 파일 쓰기,
+        approval.ask_reason)가 있으면 함께 보인다.
         """
         if action["name"] == PLAN_APPROVAL_TOOL:
             return self.ask_plan(action)
-        self.console.print(describe_action(action, reason=plan_reason(action, plan)))
+        self.console.print(describe_action(action, reason=ask_reason(action, plan)))
         if self._yes("[y] 승인 / [n] 거부 › "):
             return APPROVE
         return reject(self.read_line("거부 이유(선택, Enter 로 건너뜀) › ").strip())
@@ -411,6 +477,79 @@ class App:
                 return True
             if answer in ("n", "no", "ㅜ"):
                 return False
+
+    def start_memory(self) -> None:
+        """thread 를 시작할 때(시작, /new) 메모리를 준비한다.
+
+        이미 메모리를 읽은 thread(--resume)는 그대로 쓴다(state 의 memory_contents). 아직 읽지 않은
+        thread 는 프로젝트 AGENTS.md 신뢰를 정한다(trust_project_memory).
+        첫 요청 때 읽힐 합계가 WARN_CHARS 를 넘으면 노란 줄로 알린다.
+        매 요청 system 에 들어가 캐시 읽기 비용이 늘기 때문이다.
+        """
+        values = self.agent.get_state(self.config).values
+        total = loaded_chars(values)
+        if total is None:
+            self.memory_trust.sha256 = self.trust_project_memory()
+            total = pending_chars(workspace=self.workspace, data_dir=self.settings.data_dir,
+                                  trust=self.memory_trust)
+        if total > WARN_CHARS:
+            self.console.print(f"[yellow]메모리(AGENTS.md)가 합쳐 {total:,}자다"
+                               f"({WARN_CHARS:,}자 초과). 매 요청 시스템 프롬프트에 들어가 "
+                               "비용이 는다. 줄이려면 /memory 로 위치를 확인하라.[/]")
+
+    def trust_project_memory(self) -> str | None:
+        """프로젝트 AGENTS.md 를 메모리로 읽을지 정해 읽어도 되는 내용의 sha256 을 돌려준다.
+
+        저장소가 심은 지시가 system 에 들어가지 않게, 처음 보는(또는 바뀐) 내용이면 y/N 을 묻는다
+        (S11). 신뢰한 결정은 sessions.db 에 남아 같은 내용이면 다시 묻지 않는다. 거절은 이 프로세스
+        동안만 기억하고 다음 실행 때 다시 묻는다. 대화형이 아니면 묻지 않고 읽지 않는다.
+
+        Returns:
+            읽어도 되는 AGENTS.md 내용의 sha256. 파일이 없거나 신뢰하지 않으면 None.
+        """
+        data = read_memory(self.workspace / MEMORY_FILE)
+        if data is None:
+            return None
+        sha = content_sha256(data)
+        if self.sessions.memory_decision(self.workspace, sha):
+            return sha
+        chars = len(decode_memory(data))
+        if sha in self._refused_memory:
+            self.console.print(f"[dim]프로젝트 AGENTS.md({chars:,}자)는 이번 실행에서 거절해 "
+                               "메모리로 읽지 않는다.[/]")
+            return None
+        if not self.interactive:
+            self.console.print(f"[dim]프로젝트 AGENTS.md({chars:,}자)는 신뢰를 확인하지 않아 "
+                               "메모리로 읽지 않는다(대화형으로 실행하면 묻는다).[/]")
+            return None
+        changed = ("내용이 바뀌었다. " if self.sessions.trusted_before(self.workspace) else "")
+        preview = "\n".join(decode_memory(data).splitlines()[:MEMORY_PREVIEW_LINES])
+        self.console.print(f"[bold yellow]{changed}이 프로젝트에 AGENTS.md 가 있다.[/] 메모리로 "
+                           "읽으면 매 요청 시스템 프롬프트에 들어가 에이전트가 지시로 참고한다.")
+        self.console.print(Text(preview, style="dim"))
+        trusted = self._yes_no(f"이 프로젝트 AGENTS.md({chars:,}자)를 메모리로 읽을까? [y/N] › ")
+        self.sessions.decide_memory(self.workspace, sha, trusted)
+        if not trusted:
+            self._refused_memory.add(sha)
+            self.console.print("[dim]읽지 않는다. 이 세션 메모리에서 뺐다.[/]")
+            return None
+        return sha
+
+    def _yes_no(self, prompt: str) -> bool:
+        """y 면 참. 그냥 Enter 나 n 이면 거짓(기본 No). 다른 입력이면 다시 묻는다."""
+        while True:
+            answer = self.read_line(prompt).strip().lower()
+            if answer in ("y", "yes", "ㅛ"):
+                return True
+            if answer in ("", "n", "no", "ㅜ"):
+                return False
+
+    def show_memory(self) -> None:
+        """/memory: 이 세션의 메모리 파일(위치, 읽은 글자 수, 그 뒤 바뀌었는지)과 스킬."""
+        values = self.agent.get_state(self.config).values
+        for line in memory_report(values, workspace=self.workspace,
+                                  data_dir=self.settings.data_dir, trust=self.memory_trust):
+            self.console.print(Text(line))
 
     def show_plan(self) -> None:
         """/plan: 현재 계획(단계·완료 조건·검토·범위 변경)과 상태를 보인다."""
@@ -580,11 +719,13 @@ def main(argv: list[str] | None = None) -> int:
             console.print("[dim]시작하지 않았다. 작업할 폴더를 -w 로 지정하라.[/]")
             return 2
 
+    # 프로젝트 AGENTS.md 신뢰. App 이 thread 를 시작할 때 정하고 agent 들이 나눠 본다
+    trust = MemoryTrust()
     try:
         # --resume 은 그 thread 에 저장한 절을 그대로 쓴다(다시 탐지하면 system 이 바뀔 수 있다)
         env_text = (sessions.env_text_of(args.resume) if args.resume
                     else detect_environment(settings.shell, workspace))
-        agent = session_agent(settings, workspace, sessions, env_text)
+        agent = session_agent(settings, workspace, sessions, env_text, memory_trust=trust)
     except (RuntimeError, ValueError) as e:  # API 키 미설정, 모델 이름 오류, Git Bash 없음 등
         console.print(f"[red]{escape(str(e))}[/]")
         return 2
@@ -599,23 +740,26 @@ def main(argv: list[str] | None = None) -> int:
 
     def fresh_agent() -> tuple[str, Any]:
         text = detect_environment(settings.shell, workspace)
-        return text, session_agent(settings, workspace, sessions, text)
+        return text, session_agent(settings, workspace, sessions, text, memory_trust=trust)
 
     app = App(settings, workspace, args.mode, sessions, thread_id, console,
               _line_reader(settings.data_dir / "history"), agent=agent, tracer=tracer,
-              env_text=env_text, fresh_agent=fresh_agent)
+              env_text=env_text, fresh_agent=fresh_agent, memory_trust=trust)
     return app.run()
 
 
-def session_agent(settings: Settings, workspace: Path, sessions: Sessions, env_text: str) -> Any:
+def session_agent(settings: Settings, workspace: Path, sessions: Sessions, env_text: str, *,
+                  memory_trust: MemoryTrust | None = None) -> Any:
     """sessions.db 에 체크포인트와 프롬프트 지문(resume_compat)을 남기는 agent.
 
     지문 저장소는 그래프 실행 중(모델 호출 직전)에 쓰고, 그때 SqliteSaver 는 앞 단계의 체크포인트를
     백그라운드에서 같은 연결로 저장할 수 있다. 그래서 두 쪽이 같은 잠금을 쓴다.
+    memory_trust 는 App 과 나눠 쓰는 프로젝트 AGENTS.md 신뢰다(build_agent).
     """
     saver = SqliteSaver(sessions.conn)
     return build_agent(settings, workspace, saver, env_text=env_text,
-                       prompt_store=SqlitePromptStore(sessions.conn, saver.lock))
+                       prompt_store=SqlitePromptStore(sessions.conn, saver.lock),
+                       memory_trust=memory_trust)
 
 
 def detect_environment(shell_preference: str, workspace: Path | None = None) -> str:

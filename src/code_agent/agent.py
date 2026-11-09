@@ -32,9 +32,18 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.types import Command
 
 from code_agent.approval import PLAN_APPROVAL_TOOL
-from code_agent.backend import WindowsShellBackend, make_backend
+from code_agent.backend import USER_MEMORY_ROUTE, WindowsShellBackend, make_backend
 from code_agent.caching import OpenRouterCacheMiddleware
 from code_agent.guards import DotenvGuardMiddleware
+from code_agent.memory import (
+    MEMORY_SOURCES,
+    SKILL_LABELS,
+    SKILL_SOURCES,
+    AgentMemoryMiddleware,
+    MemoryTrust,
+    QuietSkillsMiddleware,
+    memory_dir,
+)
 from code_agent.models import make_model
 from code_agent.planning import PlanModeMiddleware, plan_reviewer
 from code_agent.prompts import coding_prompt
@@ -106,11 +115,13 @@ def _register_harness_profile(model: BaseChatModel) -> None:
 def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpointSaver | None, *,
                 model: BaseChatModel | None = None, reviewer_model: BaseChatModel | None = None,
                 backend: CompositeBackend | None = None, env_text: str = "",
-                prompt_store: PromptStore | None = None):
+                prompt_store: PromptStore | None = None, memory_trust: MemoryTrust | None = None):
     """코딩 에이전트 그래프를 조립한다.
 
     승인 대상 도구(INTERRUPT_TOOLS)와 계획 승인 요청(request_plan_approval)은 항상 interrupt 한다.
     계획 모드(planning.PlanModeMiddleware)와 그 리뷰어 서브에이전트(plan-reviewer)를 붙인다.
+    메모리(사용자 공통·프로젝트 AGENTS.md)와 스킬 폴더를 잇는다(memory.py). thread 의 첫 요청 때
+    한 번 읽어 system 끝에 붙는다.
 
     Args:
         settings: 모델·셸·데이터 폴더·컨텍스트 상한 설정(settings.load_settings).
@@ -119,13 +130,19 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
         model: 쓸 모델. None 이면 settings 로 만든다(models.make_model). 시험은 대본 모델을 넣는다.
         reviewer_model: plan-reviewer 모델. None 이면 settings.reviewer_model 로 만들고,
             그것이 비었거나 메인과 같은 이름이면 메인 모델을 같이 쓴다.
-        backend: 파일·셸 백엔드. None 이면 make_backend 로 만든다.
+        backend: 파일·셸 백엔드. None 이면 make_backend 로 만든다(사용자 공통 메모리 라우트 포함).
         env_text: 시스템 프롬프트 끝의 '이 PC 의 도구' 절이다(prompts.coding_prompt).
         prompt_store: thread 별 프롬프트 지문 저장소다(resume_compat).
             없으면 이 agent 안에서만 기억한다.
+        memory_trust: 프로젝트 /AGENTS.md 를 메모리로 읽어도 되는 내용(memory.MemoryTrust).
+            App 이 thread 를 시작할 때 고친다. None 이면 프로젝트 AGENTS.md 를 읽지 않는다.
 
     Returns:
         컴파일된 deepagents 그래프. run_turn 으로 돌리고 get_state 로 상태를 읽는다.
+
+    Raises:
+        ValueError: backend 를 줬는데 사용자 공통 메모리 라우트(USER_MEMORY_ROUTE)가 없을 때.
+            없으면 그 경로가 작업 폴더로 가서 저장소 파일이 사용자 메모리로 읽힌다.
     """
     model = model if model is not None else make_model(settings)
     if reviewer_model is None:
@@ -138,7 +155,17 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
         _register_harness_profile(reviewer_model)
     if backend is None:
         backend = make_backend(workspace, artifacts_dir=settings.data_dir / "artifacts",
-                               shell=settings.shell)
+                               memory_dir=memory_dir(settings.data_dir), shell=settings.shell)
+    elif USER_MEMORY_ROUTE not in backend.routes:
+        raise ValueError(f"backend 에 사용자 공통 메모리 라우트({USER_MEMORY_ROUTE})가 없다. "
+                         "make_backend(memory_dir=...) 로 만든다.")
+    # 메모리·스킬은 deepagents 의 기본 것과 이름이 같아 그 자리(system 의 맨 끝)를 대신한다.
+    # 지문은 그 두 절도 본다(system_parts).
+    memory = AgentMemoryMiddleware(backend=backend, sources=MEMORY_SOURCES,
+                                   trust=memory_trust if memory_trust is not None
+                                   else MemoryTrust())
+    skills = QuietSkillsMiddleware(backend=backend,
+                                   sources=[(path, SKILL_LABELS[path]) for path in SKILL_SOURCES])
     # 잘림 복구는 맨 앞이어야 after_model 이 예산 미들웨어의 호출 집계 뒤에 돈다
     # (after_model 은 역순).
     # 요약은 이름이 같아 core 자리를 대신하므로 목록 위치와 상관없다.
@@ -149,9 +176,12 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
     store = prompt_store if prompt_store is not None else MemoryPromptStore()
     middleware: list[Middleware] = [
         TruncationRecoveryMiddleware(), TodoListMiddleware(system_prompt=TODO_PROMPT),
-        PlanModeMiddleware(), ToolArgsMiddleware(), PromptFingerprintMiddleware(store),
+        PlanModeMiddleware(), ToolArgsMiddleware(),
+        PromptFingerprintMiddleware(store, system_parts=(skills.modify_request,
+                                                         memory.modify_request)),
         DotenvGuardMiddleware(workspace), OpenRouterCacheMiddleware(),
-        *budget_middleware(), summarization_middleware(model, backend, settings.context_tokens)]
+        *budget_middleware(), summarization_middleware(model, backend, settings.context_tokens),
+        skills, memory]
     reviewer = plan_reviewer(reviewer_model, backend, workspace,
                              summarization=summarization_middleware(
                                  reviewer_model, backend, settings.context_tokens))
@@ -161,6 +191,8 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
         name="code-agent", model=model, backend=backend,
         system_prompt=coding_prompt(workspace=workspace, shell=shell, env_text=env_text),
         middleware=middleware, subagents=[reviewer],
+        # 기본 자리를 만들게 넘기고, 같은 이름의 우리 middleware 가 그것을 대신한다
+        memory=list(MEMORY_SOURCES), skills=list(SKILL_SOURCES),
         # 결정은 approve/reject 만 받는다. edit 은 고친 인자가 재검증 없이 실행된다.
         # 계획 승인은 사람이 하는 일이라 모드와 관계없이 묻는다(approval.auto_decision)
         interrupt_on={tool: {"allowed_decisions": ["approve", "reject"]}

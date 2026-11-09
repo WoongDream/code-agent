@@ -11,6 +11,7 @@ PlanModeMiddleware 가 하는 일
   승인해야 실행되고, 실행되면 status=approved 와 단계별 todos 를 한 번에 쓴다.
 - 쓰기 차단: plan_mode 이거나 승인되지 않은 계획이 있으면 파일 쓰기·수정·삭제와 읽기 전용이 아닌
   execute 를 오류 ToolMessage 로 돌려준다(deepagents _tool_exclusion.py 방식).
+  메모리 파일(approval.is_memory_file)은 코드 변경이 아니라서 차단과 범위 변경에서 뺀다.
 - 검토 기록: task(plan-reviewer) 결과를 plan.reviews 에 넣는다. 계획 하나에 MAX_REVIEWS 회까지다.
 - 범위 변경: 승인된 계획 밖 파일 쓰기는 approval.auto_decision 이 모든 모드에서 사람에게 묻고,
   실행되면 scope_changes 에 남겨 계획 범위에 더한다.
@@ -63,6 +64,7 @@ from code_agent.approval import (
     PLAN_REVIEW_FIRST,
     PlanContext,
     in_plan,
+    is_memory_file,
     is_write_action,
     normalize_path,
 )
@@ -453,8 +455,9 @@ class PlanModeMiddleware(AgentMiddleware):
                 name, args):
             return _error(call, blocked)
         path = str(args.get("file_path", ""))
+        # 메모리 파일은 코드 변경이 아니라서 차단(is_write_action)과 범위 변경에서 뺀다
         if (plan is not None and is_approved(plan) and name in FILE_TOOLS
-                and not in_plan(path, plan_files(plan))):
+                and not is_memory_file(path) and not in_plan(path, plan_files(plan))):
             # 여기까지 왔으면 사람이 승인했다(approval.auto_decision 이 모든 모드에서 묻는다)
             result = handler(request)
             if _failed(_result_message(result)):

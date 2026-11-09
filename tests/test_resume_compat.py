@@ -342,11 +342,13 @@ class LockedStore(MemoryPromptStore):
 
 
 def custom_events(agent, text: str, thread: str = "t") -> list[dict]:
+    """메모리 사건(memory_loaded 등, memory.py)을 뺀 custom 사건."""
     parts: list = []
     run_turn(agent, {"messages": [{"role": "user", "content": text}]},
              {"configurable": {"thread_id": thread}},
              decide=lambda requests: [APPROVE for _ in requests], on_part=parts.append)
-    return [d for _, mode, d in parts if mode == "custom"]
+    return [d for _, mode, d in parts
+            if mode == "custom" and not str(d.get("type", "")).startswith("memory_")]
 
 
 STORE_ERROR = {"type": "prompt_store_error", "error": "OperationalError: database is locked"}

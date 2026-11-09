@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>포켓몬 몸무게 맞히기</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="appbar">
+    <div class="appbar-inner">
+      <span class="ball" aria-hidden="true"></span>
+      <span class="appbar-title">포켓몬 몸무게 맞히기</span>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <!-- 대문 -->
+    <section id="screen-home" class="screen">
+      <div class="card hero">
+        <div class="hero-ball" aria-hidden="true"></div>
+        <h1>포켓몬 몸무게 맞히기</h1>
+        <p id="pool-count" class="pool-count"></p>
+        <p id="rule-text" class="rule-text"></p>
+      </div>
+
+      <form id="setup-form" class="card setup" novalidate>
+        <fieldset>
+          <legend>문제 수</legend>
+          <div class="picker" id="picker-questions"></div>
+          <p class="field-hint" id="hint-questions"></p>
+        </fieldset>
+        <fieldset>
+          <legend>문제당 시간</legend>
+          <div class="picker" id="picker-seconds"></div>
+          <p class="field-hint" id="hint-seconds"></p>
+        </fieldset>
+        <p id="setup-error" class="setup-error" role="alert"></p>
+        <button type="submit" id="start-btn" class="btn btn-primary btn-lg">시작하기</button>
+      </form>
+    </section>
+
+    <!-- 퀴즈 -->
+    <section id="screen-quiz" class="screen" hidden>
+      <div class="scoreboard card" id="scoreboard">
+        <div class="score-row">
+          <span class="score-item"><span id="sb-question">문제 1 / 10</span></span>
+          <span class="score-item score-correct"><span id="sb-correct">맞힌 문제 0 / 0</span></span>
+          <button type="button" id="quit-btn" class="btn btn-ghost btn-sm">그만두기</button>
+        </div>
+        <ol class="dots" id="sb-dots" aria-label="문제별 진행"></ol>
+        <div class="timer" id="timer">
+          <div class="timer-track"><div class="timer-bar" id="timer-bar"></div></div>
+          <span class="timer-text" id="timer-text" aria-live="off">준비 중</span>
+        </div>
+      </div>
+
+      <div class="quiz-grid">
+        <article class="card dex-head" id="dex-head">
+          <div class="art-wrap" id="art-wrap"></div>
+          <div class="dex-info">
+            <div class="dex-no" id="dex-no"></div>
+            <h2 class="dex-name"><span id="dex-name-ko"></span> <small id="dex-name-en"></small></h2>
+            <div class="dex-genus" id="dex-genus"></div>
+            <div class="types" id="dex-types"></div>
+            <dl class="facts">
+              <div class="fact" id="fact-height"><dt>키</dt><dd id="dex-height"></dd></div>
+              <div class="fact fact-weight"><dt>몸무게</dt><dd id="dex-weight">??? kg</dd></div>
+            </dl>
+          </div>
+        </article>
+
+        <aside class="card answer-panel" id="answer-panel">
+          <form id="answer-form" autocomplete="off" novalidate>
+            <label for="answer-input" class="answer-label">이 포켓몬의 몸무게는?</label>
+            <div class="answer-row">
+              <div class="answer-field">
+                <input id="answer-input" type="text" inputmode="decimal" maxlength="8" placeholder="예: 12.5" aria-describedby="answer-hint">
+                <span class="unit">kg</span>
+              </div>
+              <button type="submit" id="submit-btn" class="btn btn-primary" disabled>제출</button>
+            </div>
+            <p class="answer-hint" id="answer-hint">0보다 크고 10,000보다 작은 숫자, 소수 첫째 자리까지. Enter 로 제출.</p>
+          </form>
+          <div class="feedback" id="feedback" hidden></div>
+        </aside>
+
+        <section class="card dex-details" id="dex-details" aria-label="도감 정보"></section>
+      </div>
+    </section>
+
+    <!-- 결과 -->
+    <section id="screen-result" class="screen" hidden>
+      <div id="result-root"></div>
+      <div class="result-actions">
+        <button type="button" id="retry-btn" class="btn btn-primary btn-lg">같은 설정으로 다시</button>
+        <button type="button" id="home-btn" class="btn btn-ghost btn-lg">처음으로</button>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">데이터·이미지 출처: <a href="https://pokeapi.co/" target="_blank" rel="noopener">PokeAPI</a>. 포켓몬 관련 권리는 각 권리자에게 있습니다.</footer>
+
+  <script src="data/pokemon-data.js"></script>
+  <script src="rules.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

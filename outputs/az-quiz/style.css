@@ -1,0 +1,275 @@
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  --bg: #fff8e7;
+  --card: #ffffff;
+  --text: #2b2b2b;
+  --muted: #777;
+  --accent: #ff8a00;
+  --accent-dark: #e06f00;
+  --ok: #1e9e5a;
+  --ok-bg: #e5f7ec;
+  --bad: #e03131;
+  --bad-bg: #fde8e8;
+  --warn: #e03131;
+}
+
+body {
+  margin: 0;
+  font-family: "Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.top {
+  text-align: center;
+}
+
+.title {
+  margin: 8px 0 12px;
+  font-size: 2rem;
+  color: var(--accent-dark);
+}
+
+.time-select {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+}
+
+.time-label {
+  font-weight: bold;
+  margin-right: 4px;
+}
+
+.time-btn {
+  border: 2px solid var(--accent);
+  background: #fff;
+  color: var(--accent-dark);
+  border-radius: 999px;
+  padding: 6px 14px;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.time-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.time-note {
+  margin: 6px 0 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.stats {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0;
+  padding: 10px 14px;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+
+.stats-text {
+  margin: 0;
+  font-weight: bold;
+}
+
+.ghost-btn {
+  flex-shrink: 0;
+  border: 1px solid #bbb;
+  background: #fff;
+  border-radius: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+
+.card {
+  background: var(--card);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+}
+
+.tag {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: #fff1dc;
+  color: var(--accent-dark);
+  font-size: 0.85rem;
+}
+
+.question {
+  margin: 14px 0 20px;
+  font-size: 2rem;
+  line-height: 1.4;
+  word-break: keep-all;
+}
+
+.timer {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.timer-bar {
+  flex: 1;
+  height: 14px;
+  background: #eee;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.timer-fill {
+  height: 100%;
+  width: 100%;
+  background: var(--accent);
+  transition: width 0.1s linear, background-color 0.3s;
+}
+
+.timer-num {
+  min-width: 2.5em;
+  text-align: right;
+  font-size: 1.5rem;
+  font-weight: bold;
+  color: var(--accent-dark);
+}
+
+.timer.danger .timer-fill {
+  background: var(--warn);
+}
+
+.timer.danger .timer-num {
+  color: var(--warn);
+}
+
+.answer-form {
+  display: flex;
+  gap: 8px;
+}
+
+.answer-input {
+  flex: 1;
+  min-width: 0;
+  font-size: 1.2rem;
+  padding: 12px;
+  border: 2px solid #ddd;
+  border-radius: 10px;
+}
+
+.answer-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.submit-btn,
+.next-btn {
+  border: none;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 1.1rem;
+  font-weight: bold;
+  padding: 12px 20px;
+  cursor: pointer;
+}
+
+.submit-btn:disabled,
+.answer-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.feedback {
+  margin-top: 18px;
+  padding: 16px;
+  border-radius: 12px;
+  border: 2px solid transparent;
+}
+
+.feedback.ok {
+  background: var(--ok-bg);
+  border-color: var(--ok);
+}
+
+.feedback.bad {
+  background: var(--bad-bg);
+  border-color: var(--bad);
+}
+
+.verdict {
+  margin: 0 0 8px;
+  font-size: 1.8rem;
+  font-weight: bold;
+}
+
+.feedback.ok .verdict {
+  color: var(--ok);
+}
+
+.feedback.bad .verdict {
+  color: var(--bad);
+}
+
+.detail {
+  margin: 4px 0;
+  font-size: 1.05rem;
+}
+
+.explain {
+  color: #444;
+}
+
+.next-btn {
+  margin-top: 12px;
+  width: 100%;
+}
+
+@media (max-width: 480px) {
+  .app {
+    padding: 10px;
+  }
+
+  .title {
+    font-size: 1.6rem;
+  }
+
+  .stats {
+    flex-direction: column;
+    align-items: stretch;
+    text-align: center;
+  }
+
+  .card {
+    padding: 16px;
+  }
+
+  .question {
+    font-size: 1.5rem;
+  }
+
+  .answer-form {
+    flex-direction: column;
+  }
+
+  .time-btn {
+    padding: 6px 10px;
+  }
+}

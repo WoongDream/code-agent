@@ -10,6 +10,13 @@
 승인 결정이 쓰므로 여기 둔다. planning 이 이 모듈을 쓰고 이 모듈은 planning 을 쓰지 않는다.
 계획 규칙으로 사람에게 묻지 않고 거부한 것은 AUTO_BLOCK 을 앞에 붙인다. HITL 은 거부를
 'User rejected …' 로 감싸 모델에 주므로, 사용자가 거부한 것으로 읽지 않게 하려는 것이다.
+
+메모리 파일(memory.py)도 경로 판정을 여기 둔다.
+- 사용자 공통 메모리(/.code-agent-user/ 아래) 쓰기는 yolo 를 포함한 모든 모드에서 묻는다.
+  모든 프로젝트의 system 에 들어가 한 번 오염되면 계속 남기 때문이다(task8 결정 3).
+- 메모리 파일(사용자 공통과 프로젝트 /AGENTS.md)은 코드 변경이 아니라서 계획 승인 전 차단과
+  '계획에 없는 파일' 재승인에서 뺀다.
+  제 승인 규칙(사용자 공통은 항상 묻기, 프로젝트는 모드대로)은 따른다.
 """
 
 from __future__ import annotations
@@ -21,9 +28,13 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 
+from code_agent.backend import USER_MEMORY_ROUTE
 from code_agent.guards import SHORT_NAME, is_env_path, is_sensitive_path
 
 MODES = ("manual", "auto-edit", "yolo")
+PROJECT_MEMORY = "/AGENTS.md"  # 프로젝트 메모리. 작업 폴더 루트의 AGENTS.md 하나다
+USER_MEMORY_REASON = ("사용자 공통 메모리: 모든 프로젝트의 시스템 프롬프트에 들어간다. "
+                      "그래서 승인 모드와 관계없이 묻는다.")
 FILE_TOOLS = frozenset({"write_file", "edit_file", "delete"})
 APPROVE = {"type": "approve"}
 REJECT_MESSAGE = ("사용자가 이 도구 호출을 거부했습니다. 같은 호출을 다시 시도하지 말고, "
@@ -237,10 +248,33 @@ def covers_workspace(entry: str) -> bool:
     return any(in_plan(path, normal) for path in _ANY_PATHS)
 
 
+def is_user_memory(path: str) -> bool:
+    """사용자 공통 메모리(/.code-agent-user/ 아래) 경로인지.
+
+    normalize_path 로 비교해 역슬래시·'.'·빈 조각·대소문자 변형도 잡는다. 백엔드는 대소문자를
+    가려 라우팅하지만 더 넓게 잡으면 한 번 더 묻는 것뿐이라 안전한 쪽이다.
+    """
+    normal, route = normalize_path(path), USER_MEMORY_ROUTE.casefold()
+    return normal.startswith(route) or normal + "/" == route
+
+
+def is_memory_file(path: str) -> bool:
+    """메모리 파일(사용자 공통 메모리 폴더 또는 프로젝트 /AGENTS.md)인지."""
+    return is_user_memory(path) or normalize_path(path) == PROJECT_MEMORY.casefold()
+
+
+def _memory_write(name: str, args: Mapping) -> bool:
+    return name in FILE_TOOLS and is_memory_file(str(args.get("file_path", "")))
+
+
 def is_write_action(name: str, args: Mapping) -> bool:
-    """파일 쓰기·수정·삭제이거나 읽기 전용이 아닌 셸 명령인지(계획 승인 전에 막는 호출)."""
-    return name in FILE_TOOLS or (name == "execute"
-                                  and not is_read_only_command(str(args.get("command", ""))))
+    """파일 쓰기·수정·삭제이거나 읽기 전용이 아닌 셸 명령인지(계획 승인 전에 막는 호출).
+
+    메모리 파일 쓰기는 코드 변경이 아니라서 빼고, 계획 중에도 /remember 가 된다.
+    """
+    if name in FILE_TOOLS:
+        return not _memory_write(name, args)
+    return name == "execute" and not is_read_only_command(str(args.get("command", "")))
 
 
 def is_plan_call(name: str, args: Mapping) -> bool:
@@ -261,12 +295,27 @@ def auto_reject(message: str) -> dict:
 
 
 def plan_reason(action: dict, plan: PlanContext | None) -> str:
-    """사람에게 물을 때 보일 계획 관련 이유. 승인된 계획 밖 파일 쓰기면 OUT_OF_PLAN, 아니면 ''."""
+    """사람에게 물을 때 보일 계획 관련 이유. 승인된 계획 밖 파일 쓰기면 OUT_OF_PLAN, 아니면 ''.
+
+    메모리 파일은 계획 범위와 관계없다.
+    """
     name, args = action["name"], action.get("args") or {}
+    path = str(args.get("file_path", ""))
     if (plan is not None and plan.approved and name in FILE_TOOLS
-            and not in_plan(str(args.get("file_path", "")), plan.files)):
+            and not is_memory_file(path) and not in_plan(path, plan.files)):
         return OUT_OF_PLAN
     return ""
+
+
+def ask_reason(action: dict, plan: PlanContext | None = None) -> str:
+    """승인 프롬프트에 보일, 모드와 관계없이 묻는 이유.
+
+    사용자 공통 메모리 쓰기면 USER_MEMORY_REASON, 아니면 plan_reason.
+    """
+    name, args = action["name"], action.get("args") or {}
+    if name in FILE_TOOLS and is_user_memory(str(args.get("file_path", ""))):
+        return USER_MEMORY_REASON
+    return plan_reason(action, plan)
 
 
 def auto_decision(action: dict, mode: str, plan: PlanContext | None = None) -> dict | None:
@@ -282,6 +331,8 @@ def auto_decision(action: dict, mode: str, plan: PlanContext | None = None) -> d
     - 승인 전 쓰기: 차단 이유로 거부한다.
     - 승인된 계획 밖 파일 쓰기: auto-edit·yolo 에서도 묻는다(plan_reason).
       .env 는 가드가 막으므로 묻지 않고 거부한다.
+    - 메모리 파일 쓰기는 위 두 계획 규칙에서 빠진다(is_write_action, plan_reason).
+    사용자 공통 메모리(/.code-agent-user/) 쓰기는 yolo 를 포함한 모든 모드에서 묻는다.
 
     Args:
         action: HITL 승인 요청 하나({"name", "args", ...}).
@@ -313,6 +364,8 @@ def auto_decision(action: dict, mode: str, plan: PlanContext | None = None) -> d
             if is_env_path(str(args.get("file_path", ""))):
                 return auto_reject(ENV_OUT_OF_PLAN)
             return None
+    if name in FILE_TOOLS and is_user_memory(str(args.get("file_path", ""))):
+        return None
     if mode == "yolo":
         return APPROVE
     if name == "execute":

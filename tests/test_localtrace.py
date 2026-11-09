@@ -80,12 +80,14 @@ def test_one_turn_events_order_fields_and_metrics(tmp_path: Path) -> None:
     app.run()
 
     rows = events(app)
-    assert [e["type"] for e in rows] == ["turn_start", "llm", "tool", "llm", "turn_end"]
+    # memory_loaded 는 thread 의 첫 요청 때 메모리를 읽으며 낸다(memory.py, 모델 호출 전)
+    assert [e["type"] for e in rows] == ["turn_start", "memory_loaded", "llm", "tool", "llm",
+                                         "turn_end"]
     for event in rows:
         assert event["turn"] == 1
         assert datetime.fromisoformat(event["ts"]).tzinfo == UTC
         assert isinstance(event["t"], float) and event["t"] >= 0
-    start, first, tool, second, end = rows
+    start, _memory, first, tool, second, end = rows
     assert start["request"] == "a.txt 읽어 줘"  # 공백을 합친 앞 200자
     assert (start["mode"], start["model"], start["thread_id"]) == (
         "manual", app.settings.model, app.thread_id)
@@ -179,7 +181,7 @@ def test_custom_stream_event_lands_in_trace(tmp_path: Path) -> None:
     # 도메인 사건은 스트림으로 받은 때 남긴다. 콜백으로 쓰는 llm 과의 앞뒤는 정하지 않는다
     types = [e["type"] for e in rows]
     assert (types[0], types[-1]) == ("turn_start", "turn_end")
-    assert sorted(types[1:-1]) == ["llm", "plan_written"]
+    assert sorted(types[1:-1]) == ["llm", "memory_loaded", "plan_written"]
 
 
 def test_subagent_events_are_marked(tmp_path: Path) -> None:
@@ -242,7 +244,7 @@ def test_recovery_retries_and_duration_in_metrics(tmp_path: Path) -> None:
     app, _, _ = local_app(tmp_path, [truncated(), AIMessage(content="다 썼다")], "만들어",
                           "/exit")
     app.run()
-    rows = events(app)
+    rows = [e for e in events(app) if e["type"] != "memory_loaded"]
     assert [e["type"] for e in rows] == ["turn_start", "llm", "recovery", "llm", "warning",
                                          "turn_end"]
     first = rows[1]

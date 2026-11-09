@@ -11,6 +11,8 @@ Langfuse 의 observation 평가기는 같은 트레이스의 다른 observation(
 
 계획 모드의 사건(planning.py 의 custom 스트림: 작성·검토·승인·범위 변경)은 '계획' 절로 남긴다.
 평가기가 계획을 세우고 검토받고 승인받았는지 볼 수 있게 하려는 것이다.
+메모리 사건(memory.py: 읽은 AGENTS.md, 메모리 파일 쓰기)은 '메모리' 절로 남긴다.
+평가기가 에이전트가 어떤 메모리를 알고 시작했는지, 배운 것을 어디에 적었는지 볼 수 있게 한다.
 """
 
 from __future__ import annotations
@@ -172,16 +174,18 @@ class WorkLog:
         self.approvals: list[str] = []
         self.plan_events: list[str] = []  # 계획 사건 한 줄씩
         self.plan_status = ""  # 이 턴이 끝났을 때 계획 상태(STATUS_LABEL 값)와 버전
+        self.memory_events: list[str] = []  # 메모리 사건 한 줄씩
         self._by_call_id: dict[str, int] = {}
 
     def on_part(self, part: tuple[tuple[str, ...], str, Any]) -> None:
         """updates 조각에서 도구 호출(서브에이전트는 [sub])과 그 결과 요약을 모은다.
 
-        custom 조각에서는 계획 사건을 모은다.
+        custom 조각에서는 계획·메모리 사건을 모은다.
         """
         ns, mode, data = part
         if mode == "custom" and isinstance(data, dict):
             self._plan_event(data)
+            self._memory_event(data)
             return
         if mode != "updates":
             return
@@ -228,6 +232,24 @@ class WorkLog:
         self.plan_events.append(one_line(line))
         self.plan_status = f"{STATUS_LABEL.get(status, status)} (v{version})"
 
+    def _memory_event(self, event: dict) -> None:
+        """memory.py 의 사건 하나를 한 줄로 남긴다. 다른 사건은 무시한다."""
+        kind = event.get("type")
+        if kind == "memory_loaded":
+            files = [f for f in event.get("files") or [] if isinstance(f, dict)]
+            shown = ", ".join(f"{f.get('path')} {f.get('chars')}자" for f in files)
+            line = (f"이 세션 첫 요청에서 읽음: {shown} (합계 {event.get('total_chars')}자)"
+                    if files else "이 세션 첫 요청에서 읽음: 메모리 파일 없음")
+            untrusted = event.get("untrusted") or []
+            if untrusted:
+                line += f" · 신뢰하지 않아 읽지 않음: {', '.join(map(str, untrusted))}"
+        elif kind == "memory_write":
+            scope = "사용자 공통" if event.get("scope") == "user" else "프로젝트"
+            line = f"메모리 쓰기({scope}): {event.get('tool')} {event.get('path')}"
+        else:
+            return
+        self.memory_events.append(one_line(line))
+
     def decision(self, action: dict, decision: dict, auto: bool) -> None:
         """승인 결정 한 줄('호출 → 승인(자동)', 거부면 사용자 의견까지)을 남긴다."""
         verdict = "승인" if decision.get("type") == "approve" else "거부"
@@ -251,10 +273,13 @@ class WorkLog:
         plan = (["## 계획\n" + "\n".join([f"- 상태: {self.plan_status}",
                                          *(f"- {e}" for e in self.plan_events)])]
                 if self.plan_events else [])
+        memory = (["## 메모리\n" + "\n".join(f"- {e}" for e in self.memory_events)]
+                  if self.memory_events else [])
         sections = [
             f"## 최종 답변\n{answer.strip() or '(없음)'}",
             *(["## 경고\n" + "\n".join(f"- {w}" for w in warnings)] if warnings else []),
             *plan,
+            *memory,
             f"## 실행한 도구 ({len(self.steps)}개)\n" + ("\n".join(steps) or "(없음)"),
             "## 승인 결정\n" + ("\n".join(f"- {a}" for a in self.approvals) or "(없음)"),
             f"## 바뀐 파일\n{files}",

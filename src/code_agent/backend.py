@@ -19,12 +19,14 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from deepagents.backends import CompositeBackend, FilesystemBackend, LocalShellBackend
-from deepagents.backends.protocol import ExecuteResponse
+from deepagents.backends.protocol import BackendProtocol, ExecuteResponse
 
 from code_agent.environment import is_store_stub, trusted_tool, uv_python_find
 
 # 큰 도구 결과·대화 기록·blob 오프로드가 모두 이 아래로 간다
 ARTIFACTS_ROUTE = "/.code-agent-artifacts/"
+# 사용자 공통 메모리(<data_dir>/memory/). AGENTS.md 와 스킬 폴더를 둔다(memory.py)
+USER_MEMORY_ROUTE = "/.code-agent-user/"
 # *_API_KEY, LANGFUSE_PUBLIC_KEY 등
 SECRET_ENV = re.compile(r"_KEY$|TOKEN|SECRET|PASSWORD", re.IGNORECASE)
 # code-agent 자신의 venv. 물려주면 셸의 python 이 deepagents 가 깔린 도구 venv 가 되고
@@ -240,14 +242,23 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-def make_backend(workspace: Path, *, artifacts_dir: Path, shell: str = "") -> CompositeBackend:
+def make_backend(workspace: Path, *, artifacts_dir: Path, memory_dir: Path | None = None,
+                 shell: str = "") -> CompositeBackend:
     """오프로드를 ~/.code-agent/artifacts 로 보내 작업 폴더를 더럽히지 않는다.
 
     execute 는 항상 default 로 간다.
+    memory_dir 를 주면 USER_MEMORY_ROUTE 를 그 폴더(~/.code-agent/memory)로 잇는다. 데이터 폴더
+    전체는 잇지 않는다. sessions.db·입력 기록·.env 가 파일 도구에 드러나기 때문이다.
+    virtual_mode 라 '..'·'~' 로 그 폴더 밖에 닿지 못한다.
     """
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    routes: dict[str, BackendProtocol] = {
+        ARTIFACTS_ROUTE: FilesystemBackend(root_dir=artifacts_dir, virtual_mode=True)}
+    if memory_dir is not None:
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        routes[USER_MEMORY_ROUTE] = FilesystemBackend(root_dir=memory_dir, virtual_mode=True)
     return CompositeBackend(
         default=WindowsShellBackend(workspace, shell=shell),
-        routes={ARTIFACTS_ROUTE: FilesystemBackend(root_dir=artifacts_dir, virtual_mode=True)},
+        routes=routes,
         artifacts_root=ARTIFACTS_ROUTE.rstrip("/"),
     )

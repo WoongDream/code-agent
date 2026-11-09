@@ -19,6 +19,7 @@ PlanModeMiddleware 가 하는 일
 - 한 응답 규칙: 계획 도구(write_plan, request_plan_approval, 검토)는 plan 을 읽고 써서 한 응답에
   하나만 실행한다. 같은 응답의 쓰기와 write_todos 도 계획 도구 결과를 보기 전의 상태로 판정되거나
   todos 를 함께 써서 실행하지 않는다(approval.ONE_PLAN_CALL, WAIT_FOR_PLAN).
+- 메모리 파일(approval.is_memory_file)은 코드 변경이 아니라서 차단과 범위 변경에서 뺀다.
 - 검토 기록: task(plan-reviewer) 결과를 plan.reviews 에 넣는다. 계획 하나에 MAX_REVIEWS 회까지다.
 - 범위 변경: 승인된 계획 밖 파일 쓰기는 approval.auto_decision 이 모든 모드에서 사람에게 묻고,
   실행되면 plan_scope_changes 에 남겨 계획 범위에 더한다.
@@ -85,6 +86,7 @@ from code_agent.approval import (
     count_plan_calls,
     covers_workspace,
     in_plan,
+    is_memory_file,
     is_plan_call,
     is_write_action,
     normalize_path,
@@ -584,7 +586,9 @@ class PlanModeMiddleware(AgentMiddleware):
                 name, args):
             return _blocked(call, blocked)
         path = str(args.get("file_path", ""))
+        # 메모리 파일은 코드 변경이 아니라서 차단(is_write_action)과 범위 변경에서 뺀다
         if (plan is not None and is_approved(plan) and name in FILE_TOOLS
+                and not is_memory_file(path)
                 and not in_plan(path, plan_files(plan, state.get(SCOPE_KEY)))):
             # 여기까지 왔으면 사람이 승인했다(approval.auto_decision 이 모든 모드에서 묻는다)
             result = handler(request)

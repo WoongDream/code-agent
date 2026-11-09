@@ -93,11 +93,17 @@ class SqlitePromptStore:
     def put(self, thread_id: str, record: PromptRecord) -> None:
         fp = record.fingerprint
         with self.lock:
-            self.conn.execute("INSERT OR REPLACE INTO code_agent_thread_prompt (thread_id, system_sha, tools_sha, "
-                              "model, recorded_at, migrated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                              (thread_id, fp.system_sha, fp.tools_sha, fp.model, datetime.now(UTC).isoformat(),
-                               record.migrated_at))
-            self.conn.commit()
+            try:
+                self.conn.execute("INSERT OR REPLACE INTO code_agent_thread_prompt (thread_id, system_sha, "
+                                  "tools_sha, model, recorded_at, migrated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                                  (thread_id, fp.system_sha, fp.tools_sha, fp.model, datetime.now(UTC).isoformat(),
+                                   record.migrated_at))
+                self.conn.commit()
+            except sqlite3.Error:
+                # 잠금 실패로 열린 암묵 트랜잭션을 남기지 않는다. 같은 연결의 체크포인트 쓰기에 섞인다
+                if self.conn.in_transaction:
+                    self.conn.rollback()
+                raise
 
 
 def _sha(text: str) -> str:
@@ -105,10 +111,19 @@ def _sha(text: str) -> str:
 
 
 def _tool_schema(tool: Any) -> Any:
+    """지문에 넣을 도구 모양. 변환하지 못하면 JSON 으로 그대로 쓸 수 있는 dict(공급자 고유 도구 등)는 그대로 두고,
+    나머지는 이름과 type 만 쓴다. 객체를 문자열로 만들면 repr 의 메모리 주소 때문에 지문이 프로세스마다 달라진다."""
     try:
         return convert_to_openai_tool(tool)
-    except (TypeError, ValueError):  # 공급자 고유 도구 dict 등
+    except Exception:  # noqa: BLE001, S110 - 지문 때문에 턴이 실패하면 안 된다. 아래에서 대신 쓴다
+        pass
+    if isinstance(tool, dict):
+        try:
+            json.dumps(tool, sort_keys=True, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return {"name": str(tool.get("name")), "type": str(tool.get("type"))}
         return tool
+    return {"name": str(getattr(tool, "name", None)), "type": f"{type(tool).__module__}.{type(tool).__qualname__}"}
 
 
 def fingerprint(request: ModelRequest) -> Fingerprint:
@@ -205,11 +220,18 @@ class PromptFingerprintMiddleware(AgentMiddleware):
     절(core 와 TodoList 가 붙인 것까지)과 모델이 받는 도구 목록을 본다. 그보다 안쪽(tail)인 메모리·스킬 절은 thread 마다
     고정이라 괜찮다.
     안내 이벤트는 기록이 바뀔 때만 나가므로 thread 마다 이전 한 번에 한 번이다.
+
+    지문 저장소가 sqlite 오류(다른 프로세스가 sessions.db 를 잠근 경우 등)를 내도 턴을 실패시키지 않는다.
+    - 읽지 못하면 이전 여부를 알 수 없어 원래 요청 그대로 보낸다.
+    - 읽고 나서 쓰지 못하면 이번 요청에는 계산한 결과(옛 생각 빼기)를 그대로 적용하고, 다음 호출에서 다시 기록한다.
+      빼야 하는 옛 생각을 그대로 보내면 강제 계정은 400 이라 턴이 실패하기 때문이다.
+    - 경고(prompt_store_error 이벤트)는 이 agent 에서 한 번만 낸다.
     """
 
     def __init__(self, store: PromptStore) -> None:
         super().__init__()
         self.store = store
+        self._store_warned = False
 
     def wrap_model_call(self, request: ModelRequest,
                         handler: Callable[[ModelRequest], ModelResponse]) -> ModelResponse:
@@ -224,10 +246,17 @@ class PromptFingerprintMiddleware(AgentMiddleware):
         if thread_id is None:
             return request
         state: list[BaseMessage] = list(request.state.get("messages", []))
-        saved = self.store.get(thread_id)
+        try:
+            saved = self.store.get(thread_id)
+        except sqlite3.Error as e:
+            self._store_error(e)
+            return request
         record, event = next_record(saved, fingerprint(request), state)
         if record is not saved:
-            self.store.put(thread_id, record)
+            try:
+                self.store.put(thread_id, record)
+            except sqlite3.Error as e:
+                self._store_error(e)
         stripped = 0
         if record.migrated_at:
             messages, stripped = strip_reasoning(request.messages, state, [(0, record.migrated_at)])
@@ -236,3 +265,8 @@ class PromptFingerprintMiddleware(AgentMiddleware):
         if event is not None:
             _notify({"type": "prompt_migrated", "reason": event, "stripped": stripped})
         return request
+
+    def _store_error(self, error: sqlite3.Error) -> None:
+        if not self._store_warned:
+            self._store_warned = True
+            _notify({"type": "prompt_store_error", "error": f"{type(error).__name__}: {error}"})

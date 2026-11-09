@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sqlite3
 from contextlib import closing
 from pathlib import Path
@@ -282,6 +283,108 @@ def test_second_upgrade_moves_migrated_at(tmp_path: Path) -> None:
     assert not any(thinking(m) for m in model.calls[0])
 
 
+class LockedStore(MemoryPromptStore):
+    """다른 프로세스가 sessions.db 를 잠근 것처럼 읽기나 쓰기에서 sqlite 오류를 낸다."""
+
+    def __init__(self, fail: str, records: dict[str, PromptRecord] | None = None) -> None:
+        super().__init__()
+        self.fail = fail
+        self.records = records if records is not None else {}
+
+    def get(self, thread_id: str) -> PromptRecord | None:
+        if self.fail == "get":
+            raise sqlite3.OperationalError("database is locked")
+        return super().get(thread_id)
+
+    def put(self, thread_id: str, record: PromptRecord) -> None:
+        if self.fail == "put":
+            raise sqlite3.OperationalError("database is locked")
+        super().put(thread_id, record)
+
+
+def custom_events(agent, text: str, thread: str = "t") -> list[dict]:
+    parts: list = []
+    run_turn(agent, {"messages": [{"role": "user", "content": text}]}, {"configurable": {"thread_id": thread}},
+             decide=lambda requests: [APPROVE for _ in requests], on_part=parts.append)
+    return [d for _, mode, d in parts if mode == "custom"]
+
+
+STORE_ERROR = {"type": "prompt_store_error", "error": "OperationalError: database is locked"}
+
+
+def test_store_read_error_keeps_turn_going(tmp_path: Path) -> None:
+    """지문을 읽지 못하면(sessions.db 잠김) 턴을 실패시키지 않고 원래 요청 그대로 보낸다. 경고는 agent 에서 한 번."""
+    t = Thread(tmp_path)
+    first, _ = t.agent([said("첫 답")])
+    t.turn(first, "하나")
+    resumed, model = t.agent([said("둘째 답"), said("셋째 답")], env_text=ENV_B, store=LockedStore("get"))
+    assert custom_events(resumed, "둘") == [STORE_ERROR]
+    assert thinking(model.calls[0][2])  # [system, 하나, 첫 답, 둘]. 이전 여부를 몰라 원래 요청 그대로
+    assert custom_events(resumed, "셋") == []  # 경고는 한 번만
+    assert len(model.calls) == 2
+
+
+def test_store_write_error_still_strips_this_request(tmp_path: Path) -> None:
+    """읽은 뒤 쓰지 못하면 이번 요청에는 계산한 이전(옛 생각 빼기)을 적용한다. 빼야 할 생각을 보내면 400 이 날 수 있다."""
+    t = Thread(tmp_path)
+    first, _ = t.agent([said("첫 답")])
+    t.turn(first, "하나")
+    saved = t.store.get("t")
+    resumed, model = t.agent([said("둘째 답")], env_text=ENV_B, store=LockedStore("put", t.store.records))
+    events = custom_events(resumed, "둘")
+    assert STORE_ERROR in events and {"type": "prompt_migrated", "reason": "prompt", "stripped": 1} in events
+    assert not any(thinking(m) for m in model.calls[0])
+    assert t.store.get("t") == saved  # 기록은 그대로(다음 호출에서 다시 쓴다)
+
+
+def test_real_sqlite_lock(tmp_path: Path) -> None:
+    """다른 연결이 sessions.db 를 잠근 동안에도 턴은 돌고, 실패한 쓰기는 열린 트랜잭션을 남기지 않는다."""
+    db = tmp_path / "sessions.db"
+    with closing(sqlite3.connect(db, timeout=0.05, check_same_thread=False)) as conn, \
+            closing(sqlite3.connect(db, timeout=0.05)) as holder:
+        store = SqlitePromptStore(conn)
+        t = Thread(tmp_path)
+        agent, model = t.agent([said("첫 답"), said("둘째 답"), said("셋째 답")], store=store)
+        assert custom_events(agent, "하나") == []
+        recorded = store.get("t")
+        holder.execute("BEGIN EXCLUSIVE")  # 읽기도 막는다
+        assert custom_events(agent, "둘") == [STORE_ERROR] and len(model.calls) == 2
+        holder.rollback()
+        holder.execute("BEGIN IMMEDIATE")  # 읽기는 되고 쓰기만 막는다
+        with pytest.raises(sqlite3.OperationalError):
+            store.put("t", PromptRecord(Fingerprint("s", "t", "m")))
+        assert not conn.in_transaction  # 실패한 쓰기가 연 트랜잭션을 닫았다
+        holder.rollback()
+        assert custom_events(agent, "셋") == [] and store.get("t") == recorded  # 잠금이 풀리면 그대로 이어 간다
+
+
+def test_unconvertible_tool_fingerprint_is_stable(tmp_path: Path) -> None:
+    """변환할 수 없는 도구는 이름과 type 만 지문에 넣는다. repr 의 메모리 주소가 들어가면 프로세스마다 지문이 달라진다.
+
+    프로세스 둘에서 따로 계산해 비교한다(같은 프로세스 안에서도 객체 둘의 주소는 다르다).
+    """
+    import subprocess
+    import sys
+
+    from code_agent import resume_compat
+
+    script = (
+        "from langchain.agents.middleware import ModelRequest\n"
+        "from langchain_core.messages import SystemMessage\n"
+        "from code_agent.resume_compat import fingerprint\n"
+        "class Opaque:\n"
+        "    name = 'opaque'\n"
+        "tools = [Opaque(), {'type': 'web_search_20250305', 'name': 'web_search', 'extra': Opaque()},\n"
+        "         {'type': 'web_search_20250305', 'name': 'plain', 'max_uses': 3}]\n"
+        "print(fingerprint(ModelRequest(model=None, messages=[], system_message=SystemMessage('s'), tools=tools))"
+        ".tools_sha)\n"
+    )
+    env = {**os.environ, "PYTHONPATH": str(Path(resume_compat.__file__).parents[1])}
+    shas = {subprocess.run([sys.executable, "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True,
+                           check=True, timeout=60).stdout.strip() for _ in range(2)}
+    assert len(shas) == 1 and len(next(iter(shas))) == 64
+
+
 def test_cli_notice_once_and_langfuse_metadata(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """지문 기록이 없는 옛 thread 를 CLI 로 이어 가면 노란 안내가 세션에 한 번 나오고, turn metadata 에 prompt_migrated 가 남는다."""
     from test_cli import Script, make_app
@@ -316,3 +419,7 @@ def test_cli_notice_once_and_langfuse_metadata(tmp_path: Path, monkeypatch: pyte
     rendered = io.StringIO()
     Renderer(Console(file=rendered)).on_part(((), "custom", {"type": "prompt_migrated", "reason": "model"}))
     assert "다른 모델로 시작됐다" in rendered.getvalue()
+    rendered = io.StringIO()
+    Renderer(Console(file=rendered, width=300)).on_part(((), "custom", STORE_ERROR))
+    assert "프롬프트 지문 기록을 건너뛰고 이어 간다" in rendered.getvalue()
+    assert "OperationalError: database is locked" in rendered.getvalue()

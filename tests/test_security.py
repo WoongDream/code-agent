@@ -4,19 +4,55 @@
 """
 from __future__ import annotations
 
+import os
+import shutil
+import sqlite3
+import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from fakes import tool_call
+from fakes import ScriptedChatModel, tool_call
 from langchain_core.messages import AIMessage, ToolMessage
 from test_agent import Harness
-from test_cli import make_app
+from test_cli import ENV_A, make_app, run_main
 
 from code_agent.approval import APPROVE, is_read_only_command, reject
 from code_agent.guards import is_env_path
 
 SECRET = "DUMMY_SECRET_VALUE_1234"
+CWD_SEARCH = "NoDefaultCurrentDirectoryInExePath"
+
+
+def clear_cwd_search(monkeypatch: pytest.MonkeyPatch) -> None:
+    """변수를 지워 which 가 현재 폴더를 먼저 찾게 한다. 시험이 끝나면 원래 상태로 되돌린다.
+
+    delenv(raising=False) 만 쓰면 변수가 원래 없던 환경(CI)에서는 아무것도 기록하지 않아, cli.main 이 setdefault 로 넣은
+    "1" 이 뒤 시험까지 남는다. 그래서 setenv 로 원래 상태를 먼저 기록한다.
+    """
+    monkeypatch.setenv(CWD_SEARCH, "")
+    monkeypatch.delenv(CWD_SEARCH)
+
+
+@pytest.fixture(autouse=True)
+def close_connections(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """이 파일의 시험이 연 sqlite 연결(cli.main·make_app 의 sessions.db)을 시험이 끝나면 닫는다.
+
+    닫지 않으면 임시 폴더의 sessions.db 가 프로세스가 끝날 때까지 잠겨 있고, Python 3.13 은 ResourceWarning 을 낸다.
+    """
+    opened: list[sqlite3.Connection] = []
+    connect = sqlite3.connect
+
+    def tracking(*args, **kwargs) -> sqlite3.Connection:
+        conn = connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking)
+    yield
+    for conn in opened:
+        conn.close()
 
 
 # --- S1: 파일 도구 가드의 이름 변형 ---
@@ -95,6 +131,10 @@ def test_env_guard_short_name(tmp_path: Path) -> None:
     "cat \u202e.env", "cat a\u200b.txt",
     # S12 tail 이 끝나지 않음
     "tail -f log.txt", "tail -F log.txt", "tail --follow=name log.txt", "tail -fn5 log.txt",
+    # PR #8 리뷰: GNU 긴 옵션 약어(getopt_long 은 앞부분만 써도 받는다), PowerShell 매개변수 약어
+    "tail --f log.txt", "tail --fo log.txt", "tail --fol=name log.txt", "tail -n 5 --foll log.txt",
+    "wc --files0 list.txt", "wc --files0=list.txt", "wc --f=list.txt", "wc -l --fi list.txt",
+    "cat -Wait log.txt", "cat log.txt -wai", "cat -WAIT:1 log.txt",
     # 개인 키·자격 증명(사용자 결정: 묻기)
     "cat id_rsa", "cat sub/id_ed25519", "cat server.pem", "cat ID_RSA", "cat credentials.json",
     "cat .aws/credentials", "head .netrc", "git show HEAD:id_rsa",
@@ -106,7 +146,7 @@ def test_shell_bypasses_require_approval(command: str) -> None:
 @pytest.mark.parametrize("command", [
     "git diff --stat HEAD~1", "git log HEAD~3..HEAD", "git show HEAD:README.md", "cat id_rsa.pub",
     "tail -n 5 log.txt", "wc -l a.py", "head --lines=5 README.md", "cat 'docs/한글 문서.md'", "ls -la src",
-    "git log --format=%h -n 3",
+    "git log --format=%h -n 3", "tail --lines=5 log.txt", "wc --lines --words a.py", "cat -Tail 5 log.txt",
 ])
 def test_ordinary_reads_stay_auto_approved(command: str) -> None:
     """고친 뒤에도 평범한 읽기는 묻지 않는다(git 리비전의 ~·: 는 경로 규칙을 적용하지 않는다)."""
@@ -171,9 +211,7 @@ def planted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
     NoDefaultCurrentDirectoryInExePath 를 지우지 않으면 which 가 현재 폴더를 보지 않아 이 시험들은 무의미하다.
     """
-    import shutil
-
-    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)
+    clear_cwd_search(monkeypatch)
     monkeypatch.chdir(tmp_path)
     (tmp_path / "git.cmd").write_bytes(b"")
     (tmp_path / "bin").mkdir()
@@ -233,25 +271,31 @@ def test_cli_main_disables_current_folder_search(tmp_path: Path, monkeypatch: py
     from code_agent import cli
     from code_agent.settings import Settings
 
-    monkeypatch.delenv("NoDefaultCurrentDirectoryInExePath", raising=False)  # 지우지 않으면 시험이 무의미하다
+    clear_cwd_search(monkeypatch)  # 지우지 않으면 시험이 무의미하다
     monkeypatch.setattr(cli, "load_settings", lambda: Settings(data_dir=tmp_path / "data"))
     assert cli.main(["--resume", "nope"]) == 2  # 시작 단계에서 끝나도 변수는 맨 앞에서 정한다
-    assert cli.os.environ.get("NoDefaultCurrentDirectoryInExePath") == "1"
+    assert cli.os.environ.get(CWD_SEARCH) == "1"
 
 
 # --- O4: -w 를 빼먹어 code-agent 저장소(실제 키가 든 .env)에서 띄운 경우 ---
 
 @pytest.fixture
 def fake_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """REPO_ROOT 를 가짜 .env 가 든 임시 폴더로 바꾸고, 키 없는 설정으로 main 을 돌릴 수 있게 한다."""
+    """REPO_ROOT 를 가짜 .env 가 든 임시 폴더로 바꾸고, 키 없는 설정으로 main 을 돌릴 수 있게 한다.
+
+    main 이 setdefault 로 넣는 변수는 시험 뒤 원래 상태로 되돌리고, 이 PC 의 도구를 실제로 탐지하지 않는다(--version 실행과
+    프로세스 전체의 셸 환경 캐시를 시험 안에서 만들지 않는다).
+    """
     from code_agent import cli
     from code_agent.settings import Settings
 
     repo = tmp_path / "code-agent"
     repo.mkdir()
     (repo / ".env").write_text(f"OPENROUTER_API_KEY={SECRET}\n", encoding="utf-8")
+    monkeypatch.setenv(CWD_SEARCH, "1")
     monkeypatch.setattr(cli, "REPO_ROOT", repo)
     monkeypatch.setattr(cli, "load_settings", lambda: Settings(data_dir=tmp_path / "data"))
+    monkeypatch.setattr(cli, "detect_environment", lambda shell, workspace=None: ENV_A)
     return repo
 
 
@@ -288,3 +332,107 @@ def test_other_folder_no_repo_warning(fake_repo: Path, tmp_path: Path, monkeypat
     monkeypatch.setattr(cli, "_confirm", lambda prompt: pytest.fail("물을 일이 아니다"))
     cli.main(["-w", str(other)])
     assert "code-agent 저장소" not in capsys.readouterr().out
+
+
+# --- PR #8 리뷰 후속: 홈·드라이브 루트 예외, 작업 폴더 기준 탐지, PATH 의 상대 경로 항목 ---
+
+def fake_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+
+
+@windows_only
+@pytest.mark.parametrize("where", ["home", "home-parent"])
+def test_home_exemption_still_rejects_current_folder_hits(planted: Path, monkeypatch: pytest.MonkeyPatch,
+                                                          where: str) -> None:
+    """현재 폴더(작업 폴더)가 홈이거나 홈을 품은 폴더면 trusted_tool 은 그 폴더를 기준에서 뺀다(~/.local/bin 의 uv 를
+    살리려고). 그래도 which 가 현재 폴더에서 찾은 결과는 상대 경로(.\\git.CMD)라 버린다.
+
+    리뷰의 변이 시험: 상대 경로 검사를 지워도 기존 시험은 모두 통과했다. 그 사본에서는 이 시험이 심은 git·bash 를 고른다.
+    """
+    from code_agent.backend import find_git_bash
+    from code_agent.environment import trusted_tool
+
+    fake_home(monkeypatch, planted if where == "home" else planted / "user")
+    assert trusted_tool(shutil.which("git"), planted) is None and trusted_tool(shutil.which("git")) is None
+    assert outside(find_git_bash(planted), planted) and outside(find_git_bash(), planted)
+
+
+def test_home_and_root_workspace_keep_outside_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """작업 폴더·현재 폴더가 홈, 홈을 품은 폴더, 드라이브 루트면 그 안의 절대 경로 도구도 버리지 않는다. 상대 경로는 버린다."""
+    from code_agent.environment import trusted_tool
+
+    home = tmp_path / "home"
+    uv = home / ".local" / "bin" / "uv.exe"
+    uv.parent.mkdir(parents=True)
+    uv.write_bytes(b"x")
+    fake_home(monkeypatch, home)
+    root = Path(tmp_path.anchor)
+    for workspace in (home, tmp_path, root):
+        assert trusted_tool(str(uv), workspace) == str(uv)
+    assert trusted_tool(str(uv), home / ".local") is None  # 보통 폴더는 그 안을 버린다
+    monkeypatch.chdir(root)
+    assert trusted_tool(str(uv)) == str(uv)
+    assert trusted_tool("uv.exe", root) is None and trusted_tool(r".\uv.exe", home) is None
+
+
+@pytest.mark.parametrize("where", ["home", "home-unresolved", "root", "project"])
+def test_broad_workspace_warns_but_starts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                          capsys: pytest.CaptureFixture[str], where: str) -> None:
+    """작업 폴더가 홈이나 드라이브 루트면 파일 도구가 그 전체에 닿는다고 경고하되, 막지는 않는다.
+
+    home-unresolved 는 Path.home() 이 resolve 전 모양(정션·8.3 이름 등)일 때다. 작업 폴더는 resolve 해서 비교하므로
+    홈도 resolve 해야 경고가 빠지지 않는다. 드라이브 루트는 읽기만 한다(세션·오프로드는 임시 폴더의 data 로 간다).
+    """
+    from code_agent import cli
+
+    (tmp_path / "x").mkdir()
+    home = tmp_path / "home"
+    (home / "proj").mkdir(parents=True)
+    fake_home(monkeypatch, tmp_path / "x" / ".." / "home" if where == "home-unresolved" else home)
+    monkeypatch.setattr(cli, "REPO_ROOT", tmp_path / "no-repo")
+    workspace = {"root": Path(tmp_path.anchor), "project": home / "proj"}.get(where, home)
+    assert run_main(tmp_path, monkeypatch, ["-w", str(workspace)], "/exit", detected=ENV_A,
+                    model=ScriptedChatModel(steps=[])) == 0
+    out = " ".join(capsys.readouterr().out.split())  # 긴 경로 때문에 줄바꿈될 수 있다
+    warned = "파일 도구가 이 폴더 전체에 접근한다" in out
+    assert warned == (where != "project")
+
+
+def test_shell_env_does_not_run_workspace_uv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """-w 로 다른 폴더에서 저장소를 열고 저장소 안 폴더가 PATH 에 있어도, 셸 환경을 만들며 그 안의 uv 를 실행하지 않는다.
+
+    심은 uv.exe 는 빈 파일이고 실행하지 않는다(subprocess.run 은 기록만 한다).
+    """
+    from code_agent import environment
+    from code_agent.backend import shell_env
+
+    repo = tmp_path / "repo"
+    (repo / "bin").mkdir(parents=True)
+    (repo / "bin" / "uv.exe").write_bytes(b"")
+    monkeypatch.chdir(tmp_path)
+    ran: list[str] = []
+    monkeypatch.setattr(environment.subprocess, "run", lambda args, **kwargs: ran.append(args[0])
+                        or subprocess.CompletedProcess(args, 1, stdout="", stderr=""))
+    shell_env({"PATH": str(repo / "bin")}, workspace=repo, tool_scripts=str(tmp_path / "none"))
+    assert ran == []
+
+
+@pytest.mark.skipif(sys.platform == "win32" and shutil.which("git") is None, reason="Git Bash 없음")
+def test_relative_path_entry_cannot_run_planted_command(tmp_path: Path) -> None:
+    """PATH 에 상대 경로 항목(bin)이 있으면 셸은 그것을 작업 폴더 기준으로 풀어 저장소에 심은 명령을 실행했다.
+
+    심은 명령은 문자열만 출력하는 sh 스크립트다.
+    """
+    from code_agent.backend import WindowsShellBackend, find_git_bash, shell_env
+
+    if sys.platform == "win32" and find_git_bash() is None:
+        pytest.skip("Git Bash 없음")
+    repo = tmp_path / "repo"
+    (repo / "bin").mkdir(parents=True)
+    planted_cmd = repo / "bin" / "zz-planted"
+    planted_cmd.write_text("#!/bin/sh\necho PLANTED\n", encoding="ascii", newline="\n")
+    planted_cmd.chmod(0o755)
+    base = {**os.environ, "PATH": os.pathsep.join(["bin", os.environ.get("PATH", "")])}
+    shell = WindowsShellBackend(repo, shell="bash", env=shell_env(base, workspace=repo))
+    result = shell.execute("zz-planted")
+    assert "PLANTED" not in result.output and result.exit_code != 0

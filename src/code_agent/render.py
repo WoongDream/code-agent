@@ -120,6 +120,8 @@ class Renderer:
         # 이번 모델 호출에서 작성 중인 도구 호출: index → [이름, 인자 조각]
         self._writing: dict[int, list[str]] = {}
         self._pending: dict[str, str] = {}  # 결과를 기다리는 도구 호출 id → 설명
+        self._sub_queue: list[str] = []  # 아직 ns 와 짝짓지 않은 task 호출의 서브에이전트 이름
+        self._sub_names: dict[str, str] = {}  # ns 첫 조각 → 서브에이전트 이름
 
     def start(self) -> None:
         """턴 시작. 첫 모델 응답을 기다린다."""
@@ -140,13 +142,21 @@ class Renderer:
         self.pause()
 
     def on_part(self, part: tuple[tuple[str, ...], str, Any]) -> None:
-        """스트림 조각 (ns, mode, data) 하나를 그린다. ns 가 있으면 서브에이전트의 것이다."""
+        """스트림 조각 (ns, mode, data) 하나를 그린다. ns 가 있으면 서브에이전트의 것이다.
+
+        서브에이전트의 토큰과 생각은 찍지 않고 상태 줄에 '<이름> 작업 중' 으로만 보인다.
+        메인 답변·상태 줄 글자 수와 섞이지 않게 하려는 것이다. 결과는 task 의 도구 결과로 보인다.
+        """
         ns, mode, data = part
-        prefix = "[magenta][sub][/] " if ns else ""
+        label = self._sub_label(ns) if ns else ""
+        prefix = f"[magenta]{escape(f'[{label}]')}[/] " if ns else ""
         if mode == "messages":
             message, meta = data
             if meta.get("langgraph_node") == "model":
-                self._ai_text(message)
+                if ns:
+                    self._show(f"{label} 작업 중")
+                else:
+                    self._ai_text(message)
         elif mode == "updates":
             for node, update in data.items():
                 if isinstance(update, dict):
@@ -160,6 +170,19 @@ class Renderer:
                        "프롬프트 지문 기록을 건너뛰고 이어 간다"
                        "(다른 프로세스가 잠갔을 수 있다): "
                        f"{escape(str(data.get('error', '')))}[/]")
+        elif (mode == "custom" and isinstance(data, dict)
+              and data.get("type") == "scope_change"):
+            self._line(f"[yellow]계획 범위에 더했다: {escape(str(data.get('file', '')))}[/]")
+
+    def _sub_label(self, ns: tuple[str, ...]) -> str:
+        """ns 의 서브에이전트 이름(task 의 subagent_type).
+
+        ns 는 'tools:<langgraph 작업 id>' 라 task 호출 id 와 바로 짝지을 수 없다.
+        그래서 처음 보는 ns 를 기다리는 task 호출에 호출 순서대로 붙인다.
+        """
+        if ns[0] not in self._sub_names:
+            self._sub_names[ns[0]] = self._sub_queue.pop(0) if self._sub_queue else "sub"
+        return self._sub_names[ns[0]]
 
     def _ai_text(self, message: BaseMessage) -> None:
         """스트리밍 모델은 청크로, 스트리밍하지 않는 모델(대본 모델 등)은 완성된 메시지로 온다."""
@@ -195,6 +218,8 @@ class Renderer:
                 for call in message.tool_calls:
                     self._line(f"{prefix}[cyan]●[/] {escape(describe_call(call))}")
                     self._pending[call["id"] or ""] = describe_call(call)
+                    if not prefix and call["name"] == "task":
+                        self._sub_queue.append(str(call["args"].get("subagent_type") or "sub"))
                 if held := message.response_metadata.get("code_agent_held_call"):
                     self._line(f"{prefix}[yellow]{escape(str(held))} 호출은 {HELD_ERROR}.[/]")
                 if message.tool_calls:
@@ -337,8 +362,12 @@ def describe_call(call: Mapping[str, Any]) -> str:
         return f"{name} {args.get('file_path') or args.get('path') or '/'}"
     if name in ("glob", "grep"):
         return f"{name} {args.get('pattern', '')!r} {args.get('path') or ''}".rstrip()
-    if name == "write_todos":
-        return "write_todos"
+    if name in ("write_todos", "request_plan_approval"):
+        return name
+    if name in ("task", "write_plan"):
+        what = " ".join(str(args.get("description") or args.get("goal") or "").split())
+        head = f"task({args.get('subagent_type', '')})" if name == "task" else name
+        return f"{head} {what[:100]}{'…' if len(what) > 100 else ''}".rstrip()
     summary = json.dumps(args, ensure_ascii=False)
     return f"{name} {summary[:100]}{'…' if len(summary) > 100 else ''}"
 
@@ -350,13 +379,16 @@ def todos_markup(todos: list[dict]) -> str:
     return "[bold]할 일[/]\n" + "\n".join(rows) if rows else "[dim]할 일 없음[/]"
 
 
-def describe_action(action: dict) -> RenderableType:
+def describe_action(action: dict, *, reason: str = "") -> RenderableType:
     """승인 프롬프트에 보일 내용.
 
     execute 는 명령, edit_file 은 diff, write_file 은 경로·크기·앞부분.
+    reason(계획에 없는 파일 등 모드와 관계없이 묻는 이유)이 있으면 제목 아래 노란 줄로 보인다.
     """
     name, args = action["name"], action.get("args") or {}
-    title = Text(f"승인 요청: {name}", style="bold yellow")
+    title: RenderableType = Text(f"승인 요청: {name}", style="bold yellow")
+    if reason:
+        title = Group(title, Text(reason, style="yellow"))
     if name == "execute":
         return Group(title, Syntax(str(args.get("command", "")), "bash", word_wrap=True))
     if name == "edit_file":

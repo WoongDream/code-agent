@@ -33,6 +33,8 @@ class Settings:
     """실행 설정. 키 필드는 repr 에서 빼 로그·예외 메시지에 찍히지 않게 한다."""
 
     model: str = DEFAULT_MODEL
+    # 계획 리뷰어(plan-reviewer) 모델. 비우면 model 을 쓴다(사용자 결정 2: Opus 5.5)
+    reviewer_model: str = ""
     effort: str = DEFAULT_EFFORT
     shell: str = ""  # 비우면 Git Bash, 없으면 PowerShell
     context_tokens: int = DEFAULT_CONTEXT_TOKENS
@@ -88,6 +90,7 @@ def load_settings(data_dir: Path = DATA_DIR) -> Settings:
                          f"{raw!r}")
     return Settings(
         model=get("CODE_AGENT_MODEL") or DEFAULT_MODEL,
+        reviewer_model=get("CODE_AGENT_REVIEWER_MODEL"),
         effort=effort,
         shell=shell,
         context_tokens=int(raw) if raw else DEFAULT_CONTEXT_TOKENS,

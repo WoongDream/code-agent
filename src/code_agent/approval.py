@@ -4,14 +4,20 @@
 결정은 approve 와 reject 만 쓴다. edit 은 고친 인자가 재검증 없이 바로 실행되기 때문이다
 (pjt Day08 05).
 모델을 부르지 않는 순수 함수라 경계를 단위 시험으로 확인한다.
+
+계획 모드(planning.py)의 상태는 PlanContext 로 받는다. 계획 승인은 모든 모드에서 사람에게 묻고,
+승인된 계획 밖 파일 쓰기도 모든 모드에서 묻는다. 계획 범위 판정(normalize_path, in_plan)도
+승인 결정이 쓰므로 여기 둔다. planning 이 이 모듈을 쓰고 이 모듈은 planning 을 쓰지 않는다.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import shlex
 import unicodedata
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 
 from code_agent.guards import SHORT_NAME, is_sensitive_path
 
@@ -20,6 +26,32 @@ FILE_TOOLS = frozenset({"write_file", "edit_file", "delete"})
 APPROVE = {"type": "approve"}
 REJECT_MESSAGE = ("사용자가 이 도구 호출을 거부했습니다. 같은 호출을 다시 시도하지 말고, "
                   "대안을 제시하거나 사용자에게 원하는 방향을 물어보세요.")
+PLAN_APPROVAL_TOOL = "request_plan_approval"
+PLAN_REVIEW_FIRST = ("plan-reviewer 검토를 먼저 받아라. task(subagent_type=\"plan-reviewer\") 로 "
+                     "계획을 검토받고 지적을 반영한 뒤 request_plan_approval 을 다시 불러라.")
+PLAN_REJECT_MESSAGE = ("사용자가 계획을 승인하지 않았다. 사용자 의견을 반영해 "
+                       "write_plan 으로 계획을 고치고 request_plan_approval 로 다시 승인을 "
+                       "요청하라. 의견이 없으면 무엇을 바꿀지 사용자에게 물어라.")
+OUT_OF_PLAN = ("계획에 없는 파일이다. 승인하면 계획 범위에 더한다"
+               "(계획을 끝냈으면 /plan off 로 계획을 지운다).")
+_GLOB_CHARS = frozenset("*?[")
+
+
+@dataclass(frozen=True)
+class PlanContext:
+    """승인 결정에 쓰는 계획 상태. planning.plan_context 가 agent state 로 만든다.
+
+    Attributes:
+        block_message: 비어 있지 않으면 계획 승인 전이라 쓰기를 막는다. 모델에 돌려줄 이유 문구다.
+        reviewed: plan-reviewer 검토를 받았는지(status reviewed·revised·approved).
+        approved: 사람이 계획을 승인했는지.
+        files: 계획 범위. normalize_path 로 정규화한 경로이고 폴더는 / 로 끝난다.
+    """
+
+    block_message: str = ""
+    reviewed: bool = False
+    approved: bool = False
+    files: frozenset[str] = frozenset()
 
 # 모드와 관계없이 자동 승인하는 읽기 전용 명령.
 # 인터프리터·빌드 도구(python, bash, uv, node, make)는 넣지 않는다(dcode THREAT_MODEL T13).
@@ -132,9 +164,80 @@ def touches_git_dir(path: str) -> bool:
     return ".git" in path.replace("\\", "/").split("/")
 
 
-def auto_decision(action: dict, mode: str) -> dict | None:
-    """자동으로 정할 수 있으면 결정을, 사람에게 물어야 하면 None 을 돌려준다."""
+def normalize_path(path: str) -> str:
+    """계획 범위를 비교할 가상 경로.
+
+    역슬래시를 / 로 바꾸고, 앞에 / 를 붙이고, 빈 조각과 '.' 을 빼고, 대소문자를 접는다(Windows 는
+    대소문자를 가리지 않는다). 폴더 표시인 끝의 / 는 남긴다. 예: 'Src/./A.py' → '/src/a.py'.
+    """
+    text = path.strip().replace("\\", "/")
+    parts = [part for part in text.split("/") if part not in ("", ".")]
+    normal = "/" + "/".join(parts)
+    if parts and text.endswith("/"):
+        normal += "/"
+    return normal.casefold()
+
+
+def in_plan(path: str, files: Iterable[str]) -> bool:
+    """path 가 계획 파일이거나, 계획 폴더(/ 로 끝남) 안이거나, 글롭(*, ?, [)과 맞는지.
+
+    files 는 normalize_path 로 정규화한 항목이다.
+    """
+    target = normalize_path(path)
+    for entry in files:
+        if _GLOB_CHARS & set(entry):
+            if fnmatch.fnmatchcase(target, entry):
+                return True
+        elif entry.endswith("/"):
+            if target.startswith(entry) or target + "/" == entry:
+                return True
+        elif target == entry:
+            return True
+    return False
+
+
+def is_write_action(name: str, args: dict) -> bool:
+    """파일 쓰기·수정·삭제이거나 읽기 전용이 아닌 셸 명령인지(계획 승인 전에 막는 호출)."""
+    return name in FILE_TOOLS or (name == "execute"
+                                  and not is_read_only_command(str(args.get("command", ""))))
+
+
+def plan_reason(action: dict, plan: PlanContext | None) -> str:
+    """사람에게 물을 때 보일 계획 관련 이유. 승인된 계획 밖 파일 쓰기면 OUT_OF_PLAN, 아니면 ''."""
     name, args = action["name"], action.get("args") or {}
+    if (plan is not None and plan.approved and name in FILE_TOOLS
+            and not in_plan(str(args.get("file_path", "")), plan.files)):
+        return OUT_OF_PLAN
+    return ""
+
+
+def auto_decision(action: dict, mode: str, plan: PlanContext | None = None) -> dict | None:
+    """자동으로 정할 수 있으면 결정을, 사람에게 물어야 하면 None 을 돌려준다.
+
+    plan 이 있으면 모드보다 먼저 본다.
+    - 계획 승인 요청: 검토 전이면 묻지 않고 거부하고(PLAN_REVIEW_FIRST),
+      아니면 모든 모드에서 묻는다.
+    - 승인 전 쓰기: 어차피 PlanModeMiddleware 가 막으므로 사람에게 묻지 않고 그 이유로 거부한다.
+    - 승인된 계획 밖 파일 쓰기: auto-edit·yolo 에서도 묻는다(plan_reason).
+
+    Args:
+        action: HITL 승인 요청 하나({"name", "args", ...}).
+        mode: 승인 모드(MODES).
+        plan: 결정 시점의 계획 상태(planning.plan_context). 계획 모드를 안 쓰면 None.
+
+    Returns:
+        자동 결정({"type": "approve"} 또는 reject) 또는 사람에게 물어야 하면 None.
+    """
+    name, args = action["name"], action.get("args") or {}
+    if name == PLAN_APPROVAL_TOOL:
+        if plan is None or not plan.reviewed:
+            return {"type": "reject", "message": PLAN_REVIEW_FIRST}
+        return None
+    if plan is not None:
+        if plan.block_message and is_write_action(name, args):
+            return {"type": "reject", "message": plan.block_message}
+        if plan_reason(action, plan):
+            return None
     if mode == "yolo":
         return APPROVE
     if name == "execute":
@@ -146,7 +249,8 @@ def auto_decision(action: dict, mode: str) -> dict | None:
 
 
 def decide_all(action_requests: Iterable[dict], mode: str, ask: Callable[[dict], dict],
-               on_decision: Callable[[dict, dict, bool], None] | None = None) -> list[dict]:
+               on_decision: Callable[[dict, dict, bool], None] | None = None, *,
+               plan: PlanContext | None = None) -> list[dict]:
     """요청 순서 그대로 결정을 만든다. HITL 미들웨어는 결정을 순서로 도구 호출과 짝짓는다.
 
     on_decision(action, decision, auto) 는 결정마다 불린다.
@@ -157,6 +261,7 @@ def decide_all(action_requests: Iterable[dict], mode: str, ask: Callable[[dict],
         mode: 승인 모드(MODES: manual, auto-edit, yolo).
         ask: 자동으로 정하지 못한 요청을 사람에게 물어 결정을 돌려준다.
         on_decision: 결정마다 (action, decision, auto) 로 불린다. None 이면 부르지 않는다.
+        plan: 결정 시점의 계획 상태(auto_decision). 계획 모드를 안 쓰면 None.
 
     Returns:
         요청과 같은 순서의 결정 목록. 각 결정은 {"type": "approve"} 또는
@@ -169,7 +274,7 @@ def decide_all(action_requests: Iterable[dict], mode: str, ask: Callable[[dict],
         raise ValueError(f"승인 모드는 {', '.join(MODES)} 중 하나여야 합니다: {mode!r}")
     decisions = []
     for action in action_requests:
-        decision = auto_decision(action, mode)
+        decision = auto_decision(action, mode, plan)
         auto = decision is not None
         if decision is None:
             decision = ask(action)
@@ -182,9 +287,13 @@ def decide_all(action_requests: Iterable[dict], mode: str, ask: Callable[[dict],
 _REASON_PREFIX = " 사용자 의견: "
 
 
-def reject(reason: str = "") -> dict:
-    """거부 결정. reason 이 있으면 모델에 가는 거부 메시지 끝에 사용자 의견으로 붙인다."""
-    message = f"{REJECT_MESSAGE}{_REASON_PREFIX}{reason}" if reason else REJECT_MESSAGE
+def reject(reason: str = "", *, base: str = REJECT_MESSAGE) -> dict:
+    """거부 결정. reason 이 있으면 모델에 가는 거부 메시지 끝에 사용자 의견으로 붙인다.
+
+    base 는 거부 메시지 본문이다.
+    계획 거부는 PLAN_REJECT_MESSAGE(계획을 고쳐 다시 요청하라)를 쓴다.
+    """
+    message = f"{base}{_REASON_PREFIX}{reason}" if reason else base
     return {"type": "reject", "message": message}
 
 

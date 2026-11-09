@@ -21,14 +21,25 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.markup import escape
 from rich.syntax import Syntax
 
 from code_agent.agent import build_agent, run_turn
-from code_agent.approval import APPROVE, MODES, decide_all, reject
+from code_agent.approval import (
+    APPROVE,
+    MODES,
+    PLAN_APPROVAL_TOOL,
+    PLAN_REJECT_MESSAGE,
+    PlanContext,
+    decide_all,
+    plan_reason,
+    reject,
+)
 from code_agent.backend import process_shell_env, resolve_shell, safe_which
 from code_agent.environment import probe, render
 from code_agent.localtrace import LocalTracer, run_dir, trace_view
+from code_agent.planning import PLAN_PREFIX, is_approved, plan_context, render_plan
 from code_agent.render import Renderer, describe_action, todos_markup
 from code_agent.resume_compat import SqlitePromptStore
 from code_agent.settings import REPO_ROOT, Settings, load_settings
@@ -49,6 +60,9 @@ HELP = """\
   /new           새 세션(대화) 시작
   /mode <모드>   승인 모드 변경: manual(전부 묻기) | auto-edit(파일 쓰기 자동, 셸은 묻기) \
 | yolo(전부 자동)
+  /plan <요청>   계획 모드로 요청: 조사 → 계획 → 리뷰어 검토 → 승인 → 구현. \
+승인 전에는 쓰기가 막힌다
+  /plan          현재 계획·상태·검토·범위 변경.  /plan off: 계획 모드와 계획을 지운다
   /diff          작업 폴더의 git diff
   /todos         현재 할 일 목록
   /cost          이 세션의 모델 호출·토큰·비용 합계
@@ -243,6 +257,13 @@ class App:
                 self.console.print(f"승인 모드 → {arg}")
                 if arg == "yolo":
                     self.console.print(YOLO_WARNING)
+        elif name == "/plan":
+            if not arg:
+                self.show_plan()
+            elif arg == "off":
+                self.plan_off()
+            else:
+                self.turn(arg, plan_mode=True)
         elif name == "/diff":
             self.show_diff()
         elif name == "/todos":
@@ -265,7 +286,7 @@ class App:
             self.console.print(f"[red]알 수 없는 커맨드: {escape(name)}[/] (/help)")
         return True
 
-    def turn(self, text: str) -> None:
+    def turn(self, text: str, *, plan_mode: bool = False) -> None:
         """사용자 메시지 하나로 에이전트 턴을 돌린다.
 
         스트림 조각을 화면·멈춤 감지·트레이스에 나눠 주고, 승인 요청은 모드에 따라 정하거나 묻는다.
@@ -273,6 +294,8 @@ class App:
 
         Args:
             text: 사용자가 입력한 요청.
+            plan_mode: 계획 모드(/plan <요청>)로 보낼지. 참이면 입력에 plan_mode 를 넣고
+                메시지 앞에 순서 안내(planning.PLAN_PREFIX)를 붙인다.
 
         Returns:
             None. 턴의 사용량은 sessions.db 에 남기고 한 줄로 보인다.
@@ -289,13 +312,18 @@ class App:
                                              workspace=self.workspace,
                                              context=session_context(previous, self.workspace))
         with trace_context as trace:
-            def ask(action: dict) -> dict:
-                renderer.pause()  # 상태 줄이 승인 프롬프트와 입력 화면을 깨지 않게 멈춘다
-                return self.ask(action)
-
             def decide(action_requests: list[dict]) -> list[dict]:
+                # 결정 시점의 계획(검토·승인 여부, 범위)으로 정한다.
+                # interrupt 로 멈춘 동안이라 state 가 최신이다
+                plan = plan_context(self.agent.get_state(self.config).values)
+
+                def ask(action: dict) -> dict:
+                    renderer.pause()  # 상태 줄이 승인 프롬프트와 입력 화면을 깨지 않게 멈춘다
+                    return self.ask(action, plan)
+
                 decisions = decide_all(action_requests, self.mode, ask,
-                                       on_decision=trace.decision if trace is not None else None)
+                                       on_decision=trace.decision if trace is not None else None,
+                                       plan=plan)
                 renderer.resume()
                 return decisions
 
@@ -309,7 +337,7 @@ class App:
             error, interrupted = None, False
             try:
                 renderer.start()
-                run_turn(self.agent, {"messages": [{"role": "user", "content": text}]},
+                run_turn(self.agent, self._turn_input(text, plan_mode),
                          {**self.config, "callbacks": callbacks}, decide=decide, on_part=on_part)
             except KeyboardInterrupt:
                 renderer.end_turn()
@@ -332,15 +360,80 @@ class App:
             self.sessions.add_usage(self.thread_id, meter.usage)
             self.console.print(f"[dim]{escape(meter.usage.summary())}[/]")
 
-    def ask(self, action: dict) -> dict:
-        """승인 요청 하나를 보여 주고 y/n 을 받는다. 거부면 이유(선택)도 받아 모델에 넘긴다."""
-        self.console.print(describe_action(action))
+    def _turn_input(self, text: str, plan_mode: bool) -> dict[str, Any]:
+        """턴 입력. 계획 모드면 plan_mode 를 켜고 메시지 앞에 순서 안내를 붙인다.
+
+        승인된 계획이 남아 있으면 지운다.
+        끝난 요청의 계획이라, 두면 새 요청의 쓰기가 막히지 않는다.
+        """
+        if not plan_mode:
+            return {"messages": [{"role": "user", "content": text}]}
+        inp: dict[str, Any] = {"messages": [{"role": "user", "content": PLAN_PREFIX + text}],
+                               "plan_mode": True}
+        if is_approved(self.agent.get_state(self.config).values.get("plan")):
+            inp["plan"] = None
+        return inp
+
+    def ask(self, action: dict, plan: PlanContext | None = None) -> dict:
+        """승인 요청 하나를 보여 주고 y/n 을 받는다. 거부면 이유(선택)도 받아 모델에 넘긴다.
+
+        계획 승인 요청은 계획과 검토 의견을 보인다(ask_plan).
+        승인된 계획 밖 파일 쓰기는 그 이유(approval.plan_reason)를 함께 보인다.
+        """
+        if action["name"] == PLAN_APPROVAL_TOOL:
+            return self.ask_plan(action)
+        self.console.print(describe_action(action, reason=plan_reason(action, plan)))
+        if self._yes("[y] 승인 / [n] 거부 › "):
+            return APPROVE
+        return reject(self.read_line("거부 이유(선택, Enter 로 건너뜀) › ").strip())
+
+    def ask_plan(self, action: dict) -> dict:
+        """계획 승인 요청. state 의 계획(단계·완료 조건)과 검토 의견을 보이고 y/n 을 받는다.
+
+        거부 의견은 모델에 가는 거부 메시지(approval.PLAN_REJECT_MESSAGE) 끝에 붙는다.
+        """
+        plan = self.agent.get_state(self.config).values.get("plan")
+        self.console.print(Markdown(render_plan(plan)) if plan else "[red]계획이 없다.[/]")
+        if note := str((action.get("args") or {}).get("note") or "").strip():
+            self.console.print(f"[bold]에이전트 메모[/] {escape(note)}")
+        self.console.print("[bold yellow]승인 요청: 이 계획대로 구현할까?[/] "
+                           "승인하면 단계가 할 일이 되고 쓰기 차단이 풀린다.")
+        if self._yes("[y] 승인 / [n] 거부(의견) › "):
+            return APPROVE
+        return reject(self.read_line("거부 의견(선택, Enter 로 건너뜀) › ").strip(),
+                      base=PLAN_REJECT_MESSAGE)
+
+    def _yes(self, prompt: str) -> bool:
+        """y 면 참, n 이면 거짓. 다른 입력이면 다시 묻는다."""
         while True:
-            answer = self.read_line("[y] 승인 / [n] 거부 › ").strip().lower()
+            answer = self.read_line(prompt).strip().lower()
             if answer in ("y", "yes", "ㅛ"):
-                return APPROVE
+                return True
             if answer in ("n", "no", "ㅜ"):
-                return reject(self.read_line("거부 이유(선택, Enter 로 건너뜀) › ").strip())
+                return False
+
+    def show_plan(self) -> None:
+        """/plan: 현재 계획(단계·완료 조건·검토·범위 변경)과 상태를 보인다."""
+        values = self.agent.get_state(self.config).values
+        plan = values.get("plan")
+        if plan:
+            self.console.print(Markdown(render_plan(plan)))
+        elif values.get("plan_mode"):
+            self.console.print("[dim]계획 없음. 계획 모드가 켜져 있어 계획부터 세운다.[/]")
+        else:
+            self.console.print("[dim]계획 없음.[/]")
+
+    def plan_off(self) -> None:
+        """/plan off: 계획 모드와 계획을 지운다(체크포인트에 남는다).
+
+        이후 쓰기는 승인 모드대로 처리한다.
+        """
+        values = self.agent.get_state(self.config).values
+        if not values.get("plan") and not values.get("plan_mode"):
+            self.console.print("[dim]지울 계획이 없다.[/]")
+            return
+        self.agent.update_state(self.config, {"plan_mode": False, "plan": None})
+        self.console.print("계획 모드와 계획을 지웠다. 이후 쓰기는 승인 모드대로 처리한다.")
 
     def show_trace(self, arg: str) -> None:
         """이 세션의 로컬 트레이스를 보인다(/trace [n|errors], localtrace.trace_view)."""

@@ -8,6 +8,9 @@ Langfuse 의 observation 평가기는 같은 트레이스의 다른 observation(
 평가기는 시스템 프롬프트와 이전 턴도 보지 못한다.
 그래서 에이전트가 턴 전에 이미 알고 있던 것(작업 폴더, 같은 세션의 이전 턴 요약)을 맥락 절로 함께
 남긴다. 없으면 맞는 말도 '근거 없는 주장'으로 감점된다.
+
+계획 모드의 사건(planning.py 의 custom 스트림: 작성·검토·승인·범위 변경)은 '계획' 절로 남긴다.
+평가기가 계획을 세우고 검토받고 승인받았는지 볼 수 있게 하려는 것이다.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import difflib
 import os
 import re
+from collections import Counter
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -23,6 +27,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 
 from code_agent.approval import reject_reason
 from code_agent.guards import is_env_path
+from code_agent.planning import STATUS_LABEL
 from code_agent.render import describe_call
 from code_agent.stops import is_recovery
 
@@ -165,11 +170,19 @@ class WorkLog:
     def __init__(self) -> None:
         self.steps: list[list[str]] = []  # [호출 요약, 결과 요약]
         self.approvals: list[str] = []
+        self.plan_events: list[str] = []  # 계획 사건 한 줄씩
+        self.plan_status = ""  # 이 턴이 끝났을 때 계획 상태(STATUS_LABEL 값)와 버전
         self._by_call_id: dict[str, int] = {}
 
     def on_part(self, part: tuple[tuple[str, ...], str, Any]) -> None:
-        """updates 조각에서 도구 호출(서브에이전트는 [sub])과 그 결과 요약을 모은다."""
+        """updates 조각에서 도구 호출(서브에이전트는 [sub])과 그 결과 요약을 모은다.
+
+        custom 조각에서는 계획 사건을 모은다.
+        """
         ns, mode, data = part
+        if mode == "custom" and isinstance(data, dict):
+            self._plan_event(data)
+            return
         if mode != "updates":
             return
         prefix = "[sub] " if ns else ""
@@ -184,6 +197,36 @@ class WorkLog:
                     index = self._by_call_id.get(message.tool_call_id)
                     if index is not None:
                         self.steps[index][1] = summarize_result(message)
+
+    def _plan_event(self, event: dict) -> None:
+        """planning.py 의 사건 하나를 한 줄로 남기고 계획 상태를 갱신한다. 다른 사건은 무시한다."""
+        kind, version = event.get("type"), event.get("version")
+        if kind == "plan_written":
+            files = [str(path) for path in event.get("files") or []]
+            more = len(files) - MAX_CONTEXT_FILES
+            shown = ", ".join(files[:MAX_CONTEXT_FILES]) + (f" 외 {more}개" if more > 0 else "")
+            line = (f"v{version} 작성: {event.get('goal', '')} · 파일 {len(files)}개"
+                    + (f" ({shown})" if files else ""))
+            status = str(event.get("status", "draft"))
+        elif kind == "plan_reviewed":
+            findings = event.get("findings")
+            items = findings if isinstance(findings, list) else []
+            counts = Counter(str(f.get("severity")) for f in items if isinstance(f, dict))
+            detail = ", ".join(f"{s} {counts[s]}" for s in ("high", "medium", "low") if counts[s])
+            total = len(items) if isinstance(findings, list) else findings
+            line = (f"v{version} 검토(plan-reviewer): {event.get('verdict')} "
+                    f"(지적 {total}개{': ' + detail if detail else ''})")
+            status = "reviewed"
+        elif kind == "plan_approval":
+            line = f"v{version} 사용자 승인: 단계 {event.get('steps')}개를 할 일로 넣음"
+            status = "approved"
+        elif kind == "scope_change":
+            line = f"범위 변경(사용자 승인): {event.get('file')} ({event.get('tool')})"
+            status = "approved"
+        else:
+            return
+        self.plan_events.append(one_line(line))
+        self.plan_status = f"{STATUS_LABEL.get(status, status)} (v{version})"
 
     def decision(self, action: dict, decision: dict, auto: bool) -> None:
         """승인 결정 한 줄('호출 → 승인(자동)', 거부면 사용자 의견까지)을 남긴다."""
@@ -205,9 +248,13 @@ class WorkLog:
             steps.append(f"... (도구 호출 {len(self.steps)}개 중 {MAX_STEPS}개까지)")
         files = ("(작업 폴더가 커서 확인하지 않았다)" if changes is None
                  else "\n".join(f"- {c}" for c in changes) or "(없음)")
+        plan = (["## 계획\n" + "\n".join([f"- 상태: {self.plan_status}",
+                                         *(f"- {e}" for e in self.plan_events)])]
+                if self.plan_events else [])
         sections = [
             f"## 최종 답변\n{answer.strip() or '(없음)'}",
             *(["## 경고\n" + "\n".join(f"- {w}" for w in warnings)] if warnings else []),
+            *plan,
             f"## 실행한 도구 ({len(self.steps)}개)\n" + ("\n".join(steps) or "(없음)"),
             "## 승인 결정\n" + ("\n".join(f"- {a}" for a in self.approvals) or "(없음)"),
             f"## 바뀐 파일\n{files}",

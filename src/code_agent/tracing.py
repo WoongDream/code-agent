@@ -11,15 +11,21 @@
   작업 기록에 경고 절을 둔다.
 - UsageCallback 합계(OpenRouter 실제 비용 포함)는 루트 metadata 에 남긴다. 핸들러는 토큰만 넘기고
   비용은 Langfuse 가 모델 정의로 계산하므로, OpenRouter 모델 이름에는 가격 정의를 등록해야 한다.
+  턴 소요 시간(duration_s)과 자동 복구 횟수(retries)도 metadata 에 둔다.
+- 그래프가 get_stream_writer 로 보내는 도메인 사건({"type": 이름, ...}, 예: plan_written)은
+  루트의 event(이름 = type)로 남긴다. 로컬 트레이스(localtrace.py)도 같은 사건을 남긴다.
 
 LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY 가 둘 다 있고 langfuse extra 가 설치돼 있을 때만 켜진다.
+로컬 트레이스와 함께 쓸 때는 CompositeTracer 로 묶는다.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
+import time
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Protocol
@@ -45,8 +51,12 @@ class TurnTrace(Protocol):
         """승인 결정 하나를 남긴다. auto 는 사람에게 묻지 않고 정했는지다."""
 
     def end(self, *, output: str, usage: Usage, error: str | None = None,
-            warnings: Sequence[str] = ()) -> None:
-        """턴을 끝내고 최종 답변·사용량·오류·경고를 남긴다."""
+            warnings: Sequence[str] = (), retries: int = 0, interrupted: bool = False) -> None:
+        """턴을 끝내고 최종 답변·사용량·오류·경고를 남긴다.
+
+        retries 는 자동 복구로 모델을 다시 부른 횟수(stops.TurnStops.recoveries),
+        interrupted 는 사용자가 Ctrl+C 로 끊었는지다(그때 error 도 함께 온다).
+        """
 
 
 class Tracer(Protocol):
@@ -63,6 +73,85 @@ class Tracer(Protocol):
 def langfuse_installed() -> bool:
     """langfuse extra 가 설치돼 있는지."""
     return importlib.util.find_spec("langfuse") is not None
+
+
+def domain_event(data: Any) -> dict[str, Any] | None:
+    """custom 스트림 조각이 도메인 사건이면 JSON 으로 쓸 수 있는 필드만 담은 사본, 아니면 None.
+
+    계획·메모리·자기 개선 같은 기능은 get_stream_writer()({"type": 이름, ...}) 로 사건을 보내고,
+    두 트레이서(Langfuse, 로컬)가 이 사본을 남긴다.
+    직렬화되지 않는 필드는 뺀다(기록이 깨지지 않게).
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("type"), str) or not data["type"]:
+        return None
+    event: dict[str, Any] = {}
+    for key, value in data.items():
+        try:
+            event[str(key)] = json.loads(json.dumps(value, ensure_ascii=False))  # 깊은 사본
+        except (TypeError, ValueError):
+            continue
+    return event
+
+
+def combine_tracers(tracers: Sequence[Tracer | None]) -> Tracer | None:
+    """None 을 뺀 트레이서들을 하나로 묶는다.
+
+    없으면 None, 하나면 그대로, 여럿이면 CompositeTracer 다.
+    """
+    found = [tracer for tracer in tracers if tracer is not None]
+    if not found:
+        return None
+    return found[0] if len(found) == 1 else CompositeTracer(found)
+
+
+class CompositeTracer:
+    """여러 트레이서(Langfuse, 로컬)에 같은 턴을 나눠 준다.
+
+    App 은 지금처럼 트레이서 하나만 본다.
+    """
+
+    def __init__(self, tracers: Sequence[Tracer]) -> None:
+        self.tracers = list(tracers)
+
+    @contextmanager
+    def turn(self, text: str, *, session_id: str, tags: list[str],
+             workspace: Path | None = None, context: str = "") -> Iterator[CompositeTurn]:
+        """모든 트레이서의 턴을 열고, 그것들에 나눠 주는 CompositeTurn 을 내준다."""
+        with ExitStack() as stack:
+            turns = [stack.enter_context(tracer.turn(text, session_id=session_id, tags=tags,
+                                                     workspace=workspace, context=context))
+                     for tracer in self.tracers]
+            yield CompositeTurn(turns)
+
+    def shutdown(self) -> None:
+        """모든 트레이서를 끝낸다."""
+        for tracer in self.tracers:
+            tracer.shutdown()
+
+
+class CompositeTurn:
+    """여러 TurnTrace 에 같은 알림을 나눠 준다. 콜백은 모두 모아 한 목록으로 내놓는다."""
+
+    def __init__(self, turns: Sequence[TurnTrace]) -> None:
+        self.turns = list(turns)
+        self.callbacks = [callback for turn in self.turns for callback in turn.callbacks]
+
+    def on_part(self, part: tuple) -> None:
+        """스트림 조각을 모든 턴에 넘긴다."""
+        for turn in self.turns:
+            turn.on_part(part)
+
+    def decision(self, action: dict, decision: dict, auto: bool) -> None:
+        """승인 결정을 모든 턴에 넘긴다."""
+        for turn in self.turns:
+            turn.decision(action, decision, auto)
+
+    def end(self, *, output: str, usage: Usage, error: str | None = None,
+            warnings: Sequence[str] = (), retries: int = 0, interrupted: bool = False) -> None:
+        """모든 턴을 끝낸다."""
+        for turn in self.turns:
+            turn.end(output=output, usage=usage, error=error, warnings=warnings, retries=retries,
+                     interrupted=interrupted)
 
 
 def make_tracer(settings: Settings) -> LangfuseTracer | None:
@@ -116,6 +205,7 @@ class LangfuseTurn:
                  context: str = "") -> None:
         self.root = root
         self.callbacks = [handler]  # 턴 안의 모든 stream 호출(재개 포함)에 같은 인스턴스를 쓴다
+        self.started = time.perf_counter()
         self.workspace = workspace
         self.before = snapshot(workspace) if workspace is not None else None
         # 작업 폴더와 이전 턴 요약. 평가기는 시스템 프롬프트와 이전 턴을 보지 못한다
@@ -125,12 +215,19 @@ class LangfuseTurn:
         self.prompt_migrated = False
 
     def on_part(self, part: tuple) -> None:
-        """스트림 조각을 작업 기록에 넣고, resume 이전(prompt_migrated) 알림을 기억한다."""
+        """스트림 조각을 작업 기록에 넣는다.
+
+        도메인 사건은 루트의 event 로 남기고, resume 이전(prompt_migrated) 알림은 기억한다.
+        """
         self.worklog.on_part(part)
         _ns, mode, data = part
-        if mode == "custom" and isinstance(data, dict) and data.get("type") == "prompt_migrated":
+        if mode != "custom" or (event := domain_event(data)) is None:
+            return
+        name = event.pop("type")
+        self.root.create_event(name=name, input=event or None, level="DEFAULT")
+        if name == "prompt_migrated":
             # 모델만 바뀐 것은 빼지 않는다
-            self.prompt_migrated = self.prompt_migrated or data.get("reason") == "prompt"
+            self.prompt_migrated = self.prompt_migrated or event.get("reason") == "prompt"
 
     def decision(self, action: dict, decision: dict, auto: bool) -> None:
         """승인 결정을 작업 기록과 루트의 event(approval:<도구>)로 남긴다."""
@@ -145,11 +242,12 @@ class LangfuseTurn:
         )
 
     def end(self, *, output: str, usage: Usage, error: str | None = None,
-            warnings: Sequence[str] = ()) -> None:
+            warnings: Sequence[str] = (), retries: int = 0, interrupted: bool = False) -> None:
         """output 은 최종 답변이다. 루트 출력에는 판단 근거가 되는 작업 기록 전체를 남긴다.
 
         warnings(잘린 응답, 예산 상한 도달)가 있으면 오류가 없을 때
         WARNING 수준과 status_message 로 표시한다.
+        metadata 에는 사용량과 함께 소요 시간(duration_s)과 자동 복구 횟수(retries)를 둔다.
         """
         changes: list[str] | None
         if self.workspace is None:
@@ -158,9 +256,13 @@ class LangfuseTurn:
             changes, diff = None, ""  # 파일이 너무 많아 스냅샷을 건너뛰었다
         else:
             changes, diff = diff_snapshots(self.before, after)
-        metadata: dict[str, Any] = {"usage": asdict(usage)}
+        metadata: dict[str, Any] = {
+            "usage": asdict(usage), "retries": retries,
+            "duration_s": round(time.perf_counter() - self.started, 3)}
         if self.prompt_migrated:
             metadata["prompt_migrated"] = True
+        if interrupted:
+            metadata["interrupted"] = True
         fields: dict[str, Any] = {
             "output": self.worklog.render(answer=output, changes=changes, diff=diff,
                                           context=self.context, warnings=warnings),

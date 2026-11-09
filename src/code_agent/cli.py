@@ -28,11 +28,18 @@ from code_agent.agent import build_agent, run_turn
 from code_agent.approval import APPROVE, MODES, decide_all, reject
 from code_agent.backend import process_shell_env, resolve_shell, safe_which
 from code_agent.environment import probe, render
+from code_agent.localtrace import LocalTracer, run_dir, trace_view
 from code_agent.render import Renderer, describe_action, todos_markup
 from code_agent.resume_compat import SqlitePromptStore
 from code_agent.settings import REPO_ROOT, Settings, load_settings
 from code_agent.stops import TurnStops
-from code_agent.tracing import Tracer, langfuse_installed, make_tracer
+from code_agent.tracing import (
+    CompositeTracer,
+    Tracer,
+    combine_tracers,
+    langfuse_installed,
+    make_tracer,
+)
 from code_agent.usage import Usage, UsageCallback
 from code_agent.worklog import session_context
 
@@ -45,6 +52,8 @@ HELP = """\
   /diff          작업 폴더의 git diff
   /todos         현재 할 일 목록
   /cost          이 세션의 모델 호출·토큰·비용 합계
+  /trace \\[n]     마지막(또는 n번째) 턴의 타임라인(모델·도구·승인, 소요 시간, 상태)
+  /trace errors  이 세션의 실패한 도구·오류·경고
   /thinking \\[on|off]  생각(reasoning) 원문 표시. 끄면(기본) 문단마다 앞부분만 짧은 메모로 보인다
   /exit          종료
 Ctrl+C 는 실행 중인 턴만 취소한다. \
@@ -134,7 +143,8 @@ class App:
         console: 출력할 rich 콘솔.
         read_line: 프롬프트를 받아 한 줄을 읽는 함수(input 또는 prompt_toolkit).
         agent: 쓸 그래프. None 이면 session_agent 로 만든다. 시험은 대본 모델 그래프를 넣는다.
-        tracer: Langfuse 트레이서. None 이면 트레이스를 남기지 않는다.
+        tracer: 트레이서(Langfuse·로컬, 둘이면 CompositeTracer).
+            None 이면 트레이스를 남기지 않는다.
         env_text: agent 의 시스템 프롬프트에 들어간 '이 PC 의 도구' 절이다.
             /new 로 만드는 thread 에도 같은 것을 남긴다.
         fresh_agent: 환경을 다시 탐지해 (env_text, agent) 를 새로 만드는 함수.
@@ -168,9 +178,15 @@ class App:
                            f"[cyan]{escape(str(self.workspace))}[/]\n"
                            f"모델 {escape(self.settings.model)} · 승인 모드 {self.mode} · "
                            f"세션 {self.thread_id}  [dim](/help)[/]")
-        if self.tracer is not None:
+        tracers = (self.tracer.tracers if isinstance(self.tracer, CompositeTracer)
+                   else [self.tracer] if self.tracer is not None else [])
+        if any(not isinstance(tracer, LocalTracer) for tracer in tracers):
             self.console.print("[dim]Langfuse 트레이스 켜짐 → "
                                f"{escape(self.settings.langfuse_base_url)}[/]")
+        for tracer in tracers:
+            if isinstance(tracer, LocalTracer):
+                self.console.print(f"[dim]로컬 트레이스 → "
+                                   f"{escape(str(tracer.folder(self.thread_id)))} (/trace)[/]")
         if self.mode == "yolo":
             self.console.print(YOLO_WARNING)
         try:
@@ -236,6 +252,8 @@ class App:
             total, turns = self.sessions.usage_of(self.thread_id)
             self.console.print(f"세션 {self.thread_id} · 턴 {turns}개 · {escape(total.summary())}"
                                if turns else "[dim]이 세션에 기록된 사용량이 아직 없다.[/]")
+        elif name == "/trace":
+            self.show_trace(arg)
         elif name == "/thinking":
             if arg not in ("", "on", "off"):
                 self.console.print(f"[red]{escape('/thinking [on|off]')}[/]")
@@ -288,7 +306,7 @@ class App:
                     trace.on_part(part)  # 작업 기록(도구 실행과 결과 요약)
 
             callbacks = [meter, *(trace.callbacks if trace is not None else [])]
-            error = None
+            error, interrupted = None, False
             try:
                 renderer.start()
                 run_turn(self.agent, {"messages": [{"role": "user", "content": text}]},
@@ -296,7 +314,7 @@ class App:
             except KeyboardInterrupt:
                 renderer.end_turn()
                 self.console.print("[yellow]중단했다.[/]")
-                error = "사용자가 중단"
+                error, interrupted = "사용자가 중단", True
             except Exception as e:  # noqa: BLE001 - 한 턴의 실패로 REPL 을 끝내지 않는다
                 renderer.end_turn()
                 self.console.print(f"[red]오류: {type(e).__name__}: {escape(str(e))}[/]")
@@ -309,7 +327,7 @@ class App:
                 self.console.print(f"[yellow]{escape(warning)}[/]", soft_wrap=True)
             if trace is not None:
                 trace.end(output=renderer.last_text, usage=meter.usage, error=error,
-                          warnings=warnings)
+                          warnings=warnings, retries=stops.recoveries, interrupted=interrupted)
         if meter.usage.calls:  # 중단·오류로 끝난 턴도 쓴 만큼은 남긴다
             self.sessions.add_usage(self.thread_id, meter.usage)
             self.console.print(f"[dim]{escape(meter.usage.summary())}[/]")
@@ -323,6 +341,17 @@ class App:
                 return APPROVE
             if answer in ("n", "no", "ㅜ"):
                 return reject(self.read_line("거부 이유(선택, Enter 로 건너뜀) › ").strip())
+
+    def show_trace(self, arg: str) -> None:
+        """이 세션의 로컬 트레이스를 보인다(/trace [n|errors], localtrace.trace_view)."""
+        view = trace_view(run_dir(self.settings.data_dir, self.thread_id), arg)
+        if view is not None:
+            self.console.print(view)
+        elif not self.settings.local_trace:
+            self.console.print("[dim]로컬 트레이스가 꺼져 있다(CODE_AGENT_LOCAL_TRACE=0).[/]")
+        else:
+            self.console.print("[dim]이 세션의 로컬 트레이스가 아직 없다. 턴을 마치면 생긴다"
+                               "(로컬 트레이스가 생기기 전에 시작한 세션의 옛 턴은 없다).[/]")
 
     def show_diff(self) -> None:
         """작업 폴더의 git diff 를 보인다(/diff)."""
@@ -469,7 +498,9 @@ def main(argv: list[str] | None = None) -> int:
     if settings.langfuse_enabled and not langfuse_installed():
         console.print("[dim]Langfuse 키가 있지만 패키지가 없어 트레이스를 끈다. "
                       "켜려면: uv sync --extra langfuse[/]")
-    tracer = make_tracer(settings)
+    # 로컬 트레이스는 Langfuse 와 상관없이 켠다(CODE_AGENT_LOCAL_TRACE=0 으로 끈다)
+    tracer = combine_tracers([make_tracer(settings),
+                              LocalTracer(settings.data_dir) if settings.local_trace else None])
     # 시작에 성공한 뒤에만 세션을 남긴다
     thread_id = args.resume or sessions.create(workspace, env_text)
 

@@ -48,8 +48,9 @@ class FakeTurn:
         self.decisions.append((action["args"].get("command", ""), decision["type"], auto,
                                reject_reason(decision)))
 
-    def end(self, *, output, usage, error=None, warnings=()) -> None:
-        self.ended = {"output": output, "usage": usage, "error": error, "warnings": list(warnings)}
+    def end(self, *, output, usage, error=None, warnings=(), retries=0, interrupted=False) -> None:
+        self.ended = {"output": output, "usage": usage, "error": error, "warnings": list(warnings),
+                      "retries": retries, "interrupted": interrupted}
 
 
 class FakeTracer:
@@ -118,6 +119,7 @@ def test_interrupted_turn_is_marked(tmp_path: Path) -> None:
                             "/exit", tracer=tracer)
     app.run()
     assert tracer.turns[0].ended["error"] == "사용자가 중단"
+    assert tracer.turns[0].ended["interrupted"] is True
     assert tracer.turns[0].ended["usage"].calls == 1
 
 

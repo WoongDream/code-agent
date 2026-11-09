@@ -470,9 +470,13 @@ def test_cli_notice_once_and_langfuse_metadata(tmp_path: Path,
     class Root:
         def __init__(self) -> None:
             self.fields: dict = {}
+            self.events: list[dict] = []
 
         def update(self, **fields) -> None:
             self.fields = fields
+
+        def create_event(self, **fields) -> None:
+            self.events.append(fields)
 
     for event, expected in (({"reason": "prompt", "stripped": 1}, True),
                             ({"reason": "model", "stripped": 0}, None)):
@@ -481,6 +485,8 @@ def test_cli_notice_once_and_langfuse_metadata(tmp_path: Path,
         turn.on_part(((), "custom", {"type": "prompt_migrated", **event}))
         turn.end(output="끝", usage=Usage())
         assert root.fields["metadata"].get("prompt_migrated") is expected
+        # 도메인 사건이라 루트의 event 로도 남는다
+        assert root.events == [{"name": "prompt_migrated", "input": event, "level": "DEFAULT"}]
     rendered = io.StringIO()
     Renderer(Console(file=rendered)).on_part(((), "custom",
                                               {"type": "prompt_migrated", "reason": "model"}))

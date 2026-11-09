@@ -191,17 +191,22 @@ ENV_A = ("\n# 이 PC 의 도구 (세션 시작 때 확인했다)\n- 있음: pyth
 
 
 def run_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], *answers: str,
-             detected: str | None, model: ScriptedChatModel) -> int:
-    """main() 을 키·네트워크 없이 돌린다. detected 가 None 이면 환경 탐지가 불리면 안 된다."""
+             detected: str | None, model: ScriptedChatModel,
+             settings: Settings | None = None) -> int:
+    """main() 을 키·네트워크 없이 돌린다. detected 가 None 이면 환경 탐지가 불리면 안 된다.
+
+    settings 를 주지 않으면 Settings(data_dir=tmp_path / "data") 를 쓴다.
+    """
     from code_agent import cli
 
     def detect(shell: str, workspace: Path | None = None) -> str:
         assert detected is not None, "--resume 인데 환경을 다시 탐지했다"
         return detected
 
+    loaded = settings if settings is not None else Settings(data_dir=tmp_path / "data")
     # main 은 이 변수를 setdefault 로 넣는다. 원래 없던 환경(CI)에서도 시험 뒤 원래 상태로 되돌린다
     monkeypatch.setenv("NoDefaultCurrentDirectoryInExePath", "1")
-    monkeypatch.setattr(cli, "load_settings", lambda: Settings(data_dir=tmp_path / "data"))
+    monkeypatch.setattr(cli, "load_settings", lambda: loaded)
     monkeypatch.setattr(cli, "detect_environment", detect)
     monkeypatch.setattr(cli, "make_tracer", lambda settings: None)
     monkeypatch.setattr(cli, "_line_reader", lambda history: Script(*answers))

@@ -1,0 +1,151 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Segoe UI", "Malgun Gothic", sans-serif;
+  background: #eef1f5;
+  color: #222;
+  display: flex;
+  justify-content: center;
+}
+
+.game {
+  padding: 24px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 28px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+}
+
+.toolbar select {
+  font-size: 15px;
+  padding: 4px 6px;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 8px 16px;
+  background: #fff;
+  border: 1px solid #c8ced6;
+  border-radius: 8px;
+}
+
+.counter {
+  font-size: 15px;
+}
+
+.counter span {
+  display: inline-block;
+  min-width: 3ch;
+  padding: 2px 6px;
+  font-family: Consolas, monospace;
+  font-size: 18px;
+  font-weight: bold;
+  text-align: right;
+  color: #d10000;
+  background: #111;
+  border-radius: 4px;
+}
+
+#new-game {
+  font-size: 15px;
+  padding: 6px 14px;
+  border: 1px solid #8a94a3;
+  border-radius: 6px;
+  background: #f7f8fa;
+  cursor: pointer;
+}
+
+#new-game:hover {
+  background: #e3e7ec;
+}
+
+.message {
+  margin: 0;
+  min-height: 1.5em;
+  font-size: 18px;
+  font-weight: bold;
+}
+
+.message.win {
+  color: #1a7f2e;
+}
+
+.message.lose {
+  color: #c62828;
+}
+
+.board-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.board {
+  display: grid;
+  grid-template-columns: repeat(var(--cols, 9), 28px);
+  grid-auto-rows: 28px;
+  gap: 1px;
+  padding: 1px;
+  background: #8a94a3;
+  border: 3px solid #6b7480;
+  user-select: none;
+}
+
+.cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  font-weight: bold;
+  line-height: 1;
+  background: #c3cad3;
+  cursor: pointer;
+}
+
+.cell:hover {
+  background: #d4dae1;
+}
+
+.cell.open {
+  background: #f4f5f7;
+  cursor: default;
+}
+
+.cell.mine {
+  background: #f4f5f7;
+}
+
+.cell.exploded {
+  background: #e53935;
+}
+
+.board.ended .cell {
+  cursor: default;
+}
+
+/* 숫자 색상 1~8 */
+.cell.n1 { color: #1e40ff; }
+.cell.n2 { color: #1b8a2f; }
+.cell.n3 { color: #e02424; }
+.cell.n4 { color: #1a1a8c; }
+.cell.n5 { color: #8b1a1a; }
+.cell.n6 { color: #0f8b8d; }
+.cell.n7 { color: #222222; }
+.cell.n8 { color: #7a7a7a; }

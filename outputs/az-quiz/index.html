@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>아재 퀴즈</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="top">
+      <h1 class="title">아재 퀴즈</h1>
+      <div class="time-select" role="group" aria-label="제한 시간">
+        <span class="time-label">제한 시간</span>
+        <button type="button" class="time-btn" data-sec="10">10초</button>
+        <button type="button" class="time-btn" data-sec="20">20초</button>
+        <button type="button" class="time-btn" data-sec="30">30초</button>
+        <button type="button" class="time-btn" data-sec="60">60초</button>
+      </div>
+      <p id="timeNote" class="time-note" hidden>바꾼 시간은 다음 문제부터 적용돼요</p>
+    </header>
+
+    <section class="stats">
+      <p id="stats" class="stats-text" aria-live="polite">푼 문제 0개 중 0개 정답 (정답률 0%)</p>
+      <button type="button" id="resetBtn" class="ghost-btn">처음부터</button>
+    </section>
+
+    <section class="card">
+      <span id="category" class="tag"></span>
+      <h2 id="question" class="question"></h2>
+
+      <div class="timer" aria-label="남은 시간">
+        <div class="timer-bar"><div id="timerFill" class="timer-fill"></div></div>
+        <span id="timerNum" class="timer-num">20</span>
+      </div>
+
+      <form id="answerForm" class="answer-form" autocomplete="off">
+        <input id="answerInput" class="answer-input" type="text" placeholder="정답을 입력하세요" aria-label="정답 입력">
+        <button id="submitBtn" class="submit-btn" type="submit">제출</button>
+      </form>
+
+      <div id="feedback" class="feedback" hidden aria-live="assertive">
+        <p id="verdict" class="verdict"></p>
+        <p id="answerLine" class="detail"></p>
+        <p id="explainLine" class="detail explain"></p>
+        <button id="nextBtn" class="next-btn" type="button">다음 문제 (Enter)</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="quizzes.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

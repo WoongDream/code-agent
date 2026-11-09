@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fakes import ScriptedChatModel, tool_call
@@ -187,6 +188,8 @@ def run_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], *
         assert detected is not None, "--resume 인데 환경을 다시 탐지했다"
         return detected
 
+    # main 은 이 변수를 setdefault 로 넣는다. 원래 없던 환경(CI)에서도 시험 뒤 원래 상태로 되돌린다
+    monkeypatch.setenv("NoDefaultCurrentDirectoryInExePath", "1")
     monkeypatch.setattr(cli, "load_settings", lambda: Settings(data_dir=tmp_path / "data"))
     monkeypatch.setattr(cli, "detect_environment", detect)
     monkeypatch.setattr(cli, "make_tracer", lambda settings: None)
@@ -244,6 +247,24 @@ def test_new_after_old_thread_redetects(tmp_path: Path) -> None:
     app.run()
     assert app.sessions.env_text_of(app.thread_id) == ENV_A
     assert ENV_A in model.calls[0][0].text
+
+
+@pytest.mark.parametrize("error", [RuntimeError("Git Bash(bash.exe)를 찾지 못했습니다."), ValueError("모델 이름 오류"),
+                                   KeyboardInterrupt()])
+def test_new_keeps_session_when_redetect_fails(tmp_path: Path, error: BaseException) -> None:
+    """/new 의 재탐지·agent 생성이 실패해도 REPL 이 끝나지 않고, 지금 세션(thread·agent)으로 이어 간다(PR #8 리뷰 6)."""
+    app, model, out, _ = make_app(tmp_path, [AIMessage(content="이어서 답")], "/new", "계속", "/exit")
+    first, agent = app.thread_id, app.agent
+
+    def fail() -> tuple[str, Any]:
+        raise error
+
+    app.fresh_agent = fail
+    assert app.run() == 0
+    assert (app.thread_id, app.agent, app.env_text) == (first, agent, "")
+    assert f"새 세션을 시작하지 못했다: {type(error).__name__}" in out.getvalue()
+    assert [m.text for m in model.calls[0] if isinstance(m, HumanMessage)] == ["계속"]  # 다음 입력은 지금 세션에서 돈다
+    assert app.sessions.conn.execute("SELECT COUNT(*) FROM code_agent_threads").fetchone() == (1,)
 
 
 def test_old_process_can_still_insert_threads(tmp_path: Path) -> None:

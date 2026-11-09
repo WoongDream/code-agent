@@ -8,6 +8,8 @@
 - ls: 'almost ALWAYS' 때문에 빌드 세션 셋 모두 첫 호출이 ls / 였다.
 - grep: 오프로드 경로가 우리 artifacts 경로와 다르다.
 - glob: 예시로 .env 를 든다(비밀 파일 정책과 맞지 않는다).
+- task: 기본 설명은 '여러 서브에이전트를 동시에 띄워라', 'general-purpose 를 써라'고 한다.
+  우리 서브에이전트는 plan-reviewer 뿐이고(GP 는 끈다), 동시에 부르면 같은 계획을 두 번 검토한다.
 override 는 도구 설명만 바꾼다. execute 의 command 인자 설명('in the sandbox environment')은
 ToolArgsMiddleware 가 모델에 가는 요청의 도구 목록에서 고친다.
 도구 설명과 할 일 절은 deepagents 의 다른 글과 같이 영어로 둔다.
@@ -52,8 +54,21 @@ GREP_DESCRIPTION = GREP_TOOL_DESCRIPTION.replace("(`/large_tool_results/` by def
 GLOB_DESCRIPTION = GLOB_TOOL_DESCRIPTION.replace("(use `.env`, or `.github/**/*.yml`)",
                                                  "(e.g. `.github/**/*.yml`)")
 
+# {available_agents} 는 deepagents 가 서브에이전트 이름과 설명 목록으로 채운다
+TASK_DESCRIPTION = """\
+Launch a subagent that works in its own context and returns one final report.
+
+Available agent types:
+{available_agents}
+
+Usage notes:
+- The subagent sees only the description you give it, plus what its entry above says it \
+receives, so put the needed context there and say what it should return.
+- Call one subagent at a time and wait for its report.
+- The report is not shown to the user; relay what matters yourself."""
+
 TOOL_DESCRIPTIONS = {"execute": EXECUTE_DESCRIPTION, "ls": LS_DESCRIPTION,
-                     "grep": GREP_DESCRIPTION, "glob": GLOB_DESCRIPTION}
+                     "grep": GREP_DESCRIPTION, "glob": GLOB_DESCRIPTION, "task": TASK_DESCRIPTION}
 
 
 class ExecuteArgs(ExecuteSchema):
@@ -95,11 +110,15 @@ def _own_args(request: ModelRequest) -> ModelRequest:
 
 # langchain TodoListMiddleware 기본 절의 'Finishing a task'
 # (마지막 write_todos 뒤 별도 메시지로 답하라) 때문에 할 일을 끝냄으로 바꾸기만 하는 호출이
-# 한 번 더 생겼다(az-quiz [47], 문맥 120K 에 $0.03~0.59)
+# 한 번 더 생겼다(az-quiz [47], 문맥 120K 에 $0.03~0.59).
+# '작은 작업은 건너뛴다'는 write_todos 에만 해당한다.
+# system 의 '계획' 절(write_plan)과 섞이지 않게 한다
 TODO_PROMPT = """\
 ## write_todos
-Use write_todos for work with several distinct steps the user would want to track; \
-skip it for small tasks. Update it when the plan changes or a step finishes, \
+Use write_todos for work with several distinct steps the user would want to track. \
+A small task needs no todo list; this applies to write_todos only, not to the planning rules \
+under 계획. When a plan is approved, its steps become the todo list. \
+Update it when a step starts or finishes or the work changes, \
 together with the next tool call in the same response rather than as a call of its own. \
 Do not make a separate call just to mark the last items complete: \
 finish with the final answer, which should start with the result the user asked for."""

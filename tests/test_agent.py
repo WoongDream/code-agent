@@ -51,7 +51,11 @@ def test_exposed_tools(tmp_path: Path) -> None:
     h.run()
     assert set(h.model.bound_tool_names) == {
         "ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute",
-        "write_todos"}
+        "write_todos", "write_plan", "request_plan_approval", "task"}
+    # 서브에이전트는 plan-reviewer 뿐이다(general-purpose 는 끈다)
+    [task] = [t["function"] for t in h.model.bound_tools if t["function"]["name"] == "task"]
+    assert "- plan-reviewer:" in task["description"]
+    assert "general-purpose" not in task["description"]
 
 
 def test_system_prompt_has_runtime_info(tmp_path: Path) -> None:

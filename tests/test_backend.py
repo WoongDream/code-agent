@@ -19,7 +19,8 @@ from code_agent.backend import (
 )
 
 SHELLS = ["bash", "powershell"] if sys.platform == "win32" else ["bash"]
-needs_bash = pytest.mark.skipif(sys.platform == "win32" and find_git_bash() is None, reason="Git Bash 없음")
+needs_bash = pytest.mark.skipif(sys.platform == "win32" and find_git_bash() is None,
+                                reason="Git Bash 없음")
 
 
 def run_python(shell: str, script: str) -> str:
@@ -30,7 +31,8 @@ def run_python(shell: str, script: str) -> str:
 
 def alive(pid: int) -> bool:
     if sys.platform == "win32":  # tasklist 출력은 OEM 코드페이지라 바이트로 비교한다
-        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, check=False).stdout
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True,
+                             check=False).stdout
         return str(pid).encode() in out
     try:
         import os
@@ -56,8 +58,10 @@ def test_echo_and_exit_code(shell_backend: WindowsShellBackend) -> None:
 
 
 def test_stderr_is_prefixed(shell_backend: WindowsShellBackend) -> None:
-    result = shell_backend.execute(run_python(shell_backend.shell, '-c "import sys; sys.stderr.write(\'bad\\n\')"'))
-    assert "[stderr] bad" in result.output, result.output  # 가끔 실패했다. PS 진행률 CLIXML 이 섞였는지 본다
+    result = shell_backend.execute(
+        run_python(shell_backend.shell, '-c "import sys; sys.stderr.write(\'bad\\n\')"'))
+    # 가끔 실패했다. PS 진행률 CLIXML 이 섞였는지 본다
+    assert "[stderr] bad" in result.output, result.output
 
 
 def test_korean_output_is_not_garbled(shell_backend: WindowsShellBackend) -> None:
@@ -73,7 +77,10 @@ def test_runs_in_workspace(shell_backend: WindowsShellBackend) -> None:
 
 
 def test_timeout_kills_process_tree(shell_backend: WindowsShellBackend) -> None:
-    """손자 프로세스까지 끝나야 한다. 기본 구현은 손자가 쥔 파이프가 닫힐 때까지(여기선 60초) 돌아오지 않는다."""
+    """손자 프로세스까지 끝나야 한다.
+
+    기본 구현은 손자가 쥔 파이프가 닫힐 때까지(여기선 60초) 돌아오지 않는다.
+    """
     Path(shell_backend.cwd, "spawn.py").write_text(
         "import subprocess, sys, time\n"
         "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
@@ -99,18 +106,23 @@ def test_oem_codepage_output_is_decoded(shell_backend: WindowsShellBackend) -> N
 
 
 def test_shell_env_drops_secrets() -> None:
-    secrets = {"ANTHROPIC_API_KEY", "GITHUB_TOKEN", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "OPENROUTER_API_KEY",
-               "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "gpg_key"}
-    env = shell_env({"PATH": "p", "SYSTEMROOT": "s", "LANGFUSE_BASE_URL": "u", **dict.fromkeys(secrets, "x")},
+    secrets = {"ANTHROPIC_API_KEY", "GITHUB_TOKEN", "DB_PASSWORD", "AWS_SECRET_ACCESS_KEY",
+               "OPENROUTER_API_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "gpg_key"}
+    env = shell_env({"PATH": "p", "SYSTEMROOT": "s", "LANGFUSE_BASE_URL": "u",
+                     **dict.fromkeys(secrets, "x")},
                     find_python=lambda env, workspace: None)
     assert {"PATH", "SYSTEMROOT", "LANGFUSE_BASE_URL"} <= env.keys()
     assert not secrets & env.keys()
 
 
 def test_shell_env_drops_tool_venv(tmp_path: Path) -> None:
-    """code-agent 자신의 venv 를 셸에 물려주지 않는다. 물려주면 셸의 python·pip 이 deepagents 가 깔린 도구 venv 가 된다."""
+    """code-agent 자신의 venv 를 셸에 물려주지 않는다.
+
+    물려주면 셸의 python·pip 이 deepagents 가 깔린 도구 venv 가 된다.
+    """
     scripts, other = tmp_path / ".venv" / "Scripts", tmp_path / "bin"
-    base = {"PATH": os.pathsep.join([str(scripts), str(other)]), "VIRTUAL_ENV": str(tmp_path / ".venv"),
+    base = {"PATH": os.pathsep.join([str(scripts), str(other)]),
+            "VIRTUAL_ENV": str(tmp_path / ".venv"),
             "UV": "uv.exe", "UV_RUN_RECURSION_DEPTH": "1", "PYTHONHOME": "x", "SYSTEMROOT": "s"}
     env = shell_env(base, tool_scripts=str(scripts), find_python=lambda env, workspace: None)
     assert not {"VIRTUAL_ENV", "UV", "UV_RUN_RECURSION_DEPTH", "PYTHONHOME"} & env.keys()
@@ -132,15 +144,20 @@ def test_shell_env_prepends_uv_python_when_stub(tmp_path: Path) -> None:
 
 
 def test_shell_env_without_uv(tmp_path: Path) -> None:
-    """uv 가 없으면(uv python find 실패) PATH 를 더하지 않고 예외도 없다. 프롬프트에는 python 이 없음으로 나온다."""
+    """uv 가 없으면(uv python find 실패) PATH 를 더하지 않고 예외도 없다.
+
+    프롬프트에는 python 이 없음으로 나온다.
+    """
     env = shell_env({"PATH": str(tmp_path)}, tool_scripts=str(tmp_path / "none"))
     assert env["PATH"] == str(tmp_path)
 
 
-def test_shell_env_keeps_activated_project_venv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_shell_env_keeps_activated_project_venv(tmp_path: Path,
+                                                monkeypatch: pytest.MonkeyPatch) -> None:
     """대상 프로젝트의 venv 를 켜고 그 폴더에서 띄우면 셸의 python 은 그 venv 다(PR #8 리뷰 1).
 
-    고치기 전에는 '현재 폴더 안'이라 버려서 uv 인터프리터를 PATH 맨 앞에 붙여 프로젝트 venv 를 가렸다.
+    고치기 전에는 '현재 폴더 안'이라 버려서
+    uv 인터프리터를 PATH 맨 앞에 붙여 프로젝트 venv 를 가렸다.
     """
     project = tmp_path / "proj"
     venv_scripts = project / ".venv" / "Scripts"
@@ -148,30 +165,40 @@ def test_shell_env_keeps_activated_project_venv(tmp_path: Path, monkeypatch: pyt
     (venv_scripts / "python.exe").write_bytes(b"x")
     monkeypatch.chdir(project)
     asked: list[Path | None] = []
-    env = shell_env({"PATH": os.pathsep.join([str(venv_scripts), str(tmp_path / "bin")])}, workspace=project,
-                    tool_scripts=str(tmp_path / "none"),
-                    find_python=lambda env, workspace: asked.append(workspace) or str(tmp_path / "uv" / "python.exe"))
+    env = shell_env({"PATH": os.pathsep.join([str(venv_scripts), str(tmp_path / "bin")])},
+                    workspace=project, tool_scripts=str(tmp_path / "none"),
+                    find_python=lambda env, workspace: (asked.append(workspace)
+                                                        or str(tmp_path / "uv" / "python.exe")))
     assert env["PATH"].split(os.pathsep) == [str(venv_scripts), str(tmp_path / "bin")]
     assert asked == []
 
 
 def test_shell_env_drops_relative_path_entries(tmp_path: Path) -> None:
-    """상대 경로 항목은 셸의 현재 폴더(작업 폴더) 기준으로 풀린다. 저장소에 심은 실행 파일이 자동 승인 명령으로 불리지 않게 뺀다."""
-    absolute, quoted = str(tmp_path / "a"), f'"{tmp_path / "b c"}"'  # Windows PATH 는 따옴표로 감싼 항목도 받는다
+    """상대 경로 항목은 셸의 현재 폴더(작업 폴더) 기준으로 풀린다.
+
+    저장소에 심은 실행 파일이 자동 승인 명령으로 불리지 않게 뺀다.
+    """
+    # Windows PATH 는 따옴표로 감싼 항목도 받는다
+    absolute, quoted = str(tmp_path / "a"), f'"{tmp_path / "b c"}"'
     base = {"PATH": os.pathsep.join([".", "bin", "", absolute, "node_modules/.bin", quoted, ".."])}
-    env = shell_env(base, tool_scripts=str(tmp_path / "none"), find_python=lambda env, workspace: None)
+    env = shell_env(base, tool_scripts=str(tmp_path / "none"),
+                    find_python=lambda env, workspace: None)
     assert env["PATH"].split(os.pathsep) == [absolute, quoted]
 
 
 def test_shell_env_passes_workspace_to_find_python(tmp_path: Path) -> None:
     asked: list[Path | None] = []
-    shell_env({"PATH": str(tmp_path)}, workspace=tmp_path / "ws", tool_scripts=str(tmp_path / "none"),
+    shell_env({"PATH": str(tmp_path)}, workspace=tmp_path / "ws",
+              tool_scripts=str(tmp_path / "none"),
               find_python=lambda env, workspace: asked.append(workspace))
     assert asked == [tmp_path / "ws"]
 
 
-def test_shell_backend_and_detection_share_workspace_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """셸 백엔드와 환경 탐지(cli.detect_environment)는 같은 작업 폴더 기준 환경을 쓰고, 작업 폴더마다 한 번만 만든다."""
+def test_shell_backend_and_detection_share_workspace_env(tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    """셸 백엔드와 환경 탐지(cli.detect_environment)는 같은 작업 폴더 기준 환경을 쓰고,
+    작업 폴더마다 한 번만 만든다.
+    """
     from code_agent import backend
 
     made: list[Path | None] = []
@@ -184,7 +211,8 @@ def test_shell_backend_and_detection_share_workspace_env(tmp_path: Path, monkeyp
     workspace = tmp_path / "ws"
     workspace.mkdir()
     shell = WindowsShellBackend(workspace, shell=SHELLS[-1])
-    assert backend.process_shell_env(tmp_path / "ws" / ".." / "ws") == shell._env == {"PATH": "env1"}
+    assert (backend.process_shell_env(tmp_path / "ws" / ".." / "ws") == shell._env
+            == {"PATH": "env1"})
     assert made == [workspace.resolve()]
 
 
@@ -203,7 +231,8 @@ def test_shell_cannot_see_api_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert "missing" in result.output
 
 
-@pytest.mark.parametrize("path", ["/../outside.txt", "../outside.txt", "C:/Windows/win.ini", "/C:/Windows/win.ini"])
+@pytest.mark.parametrize("path", ["/../outside.txt", "../outside.txt", "C:/Windows/win.ini",
+                                  "/C:/Windows/win.ini"])
 def test_file_tools_stay_in_workspace(tmp_path: Path, path: str) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -229,9 +258,11 @@ def test_offload_goes_to_artifacts_not_workspace(tmp_path: Path) -> None:
 def test_powershell_progress_suppressed(tmp_path: Path) -> None:
     """진행률 출력이 CLIXML 로 stderr 에 섞이지 않는다($ProgressPreference).
 
-    이 PC 에서는 설정이 없어도 CLIXML 이 재현되지 않았다(Write-Progress, 모듈 가져오기 모두). 그래서 수정의 증거가 아니라
-    출력 모양을 지키는 안전망이다. 다른 환경(CI 러너 등)에서 섞이면 이 시험이 잡는다.
+    이 PC 에서는 설정이 없어도 CLIXML 이 재현되지 않았다(Write-Progress, 모듈 가져오기 모두).
+    그래서 수정의 증거가 아니라 출력 모양을 지키는 안전망이다.
+    다른 환경(CI 러너 등)에서 섞이면 이 시험이 잡는다.
     """
     backend = WindowsShellBackend(tmp_path, shell="powershell", timeout=60)
-    result = backend.execute("Write-Progress -Activity x -Status y; [Console]::Error.WriteLine('bad')")
+    result = backend.execute(
+        "Write-Progress -Activity x -Status y; [Console]::Error.WriteLine('bad')")
     assert "CLIXML" not in result.output and "[stderr] bad" in result.output, result.output

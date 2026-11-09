@@ -40,8 +40,8 @@ class Script:
 
 
 def make_app(tmp_path: Path, steps: list, *answers: str, workspace: Path | None = None,
-             mode: str = "manual", tracer=None,
-             model: ScriptedChatModel | None = None) -> tuple[App, ScriptedChatModel, io.StringIO, Script]:
+             mode: str = "manual", tracer=None, model: ScriptedChatModel | None = None,
+             ) -> tuple[App, ScriptedChatModel, io.StringIO, Script]:
     """model 을 주면 steps 대신 그 모델(예: StreamingChatModel)을 쓴다."""
     if workspace is None:
         workspace = tmp_path / "ws"
@@ -57,7 +57,8 @@ def make_app(tmp_path: Path, steps: list, *answers: str, workspace: Path | None 
 
 
 def edit_step(path: str = "/app.py") -> AIMessage:
-    return tool_call("edit_file", {"file_path": path, "old_string": "1 + 1", "new_string": "1 + 2"})
+    return tool_call("edit_file", {"file_path": path, "old_string": "1 + 1",
+                                   "new_string": "1 + 2"})
 
 
 def test_manual_mode_asks_and_reject_keeps_file(tmp_path: Path) -> None:
@@ -86,10 +87,11 @@ def test_auto_edit_mode_skips_file_approval(tmp_path: Path) -> None:
 
 
 def test_slash_commands(tmp_path: Path) -> None:
-    todos = tool_call("write_todos", {"todos": [{"content": "테스트 읽기", "status": "in_progress"}]})
+    todos = tool_call("write_todos",
+                      {"todos": [{"content": "테스트 읽기", "status": "in_progress"}]})
     app, _, out, _ = make_app(tmp_path, [todos, AIMessage(content="계획 세움")],
-                              "/help", "/mode nope", "/mode yolo", "계획 세워", "/todos", "/diff", "/what", "/new",
-                              "/exit")
+                              "/help", "/mode nope", "/mode yolo", "계획 세워", "/todos", "/diff",
+                              "/what", "/new", "/exit")
     first = app.thread_id
     app.run()
     text = out.getvalue()
@@ -119,14 +121,17 @@ def test_session_persists_across_apps(tmp_path: Path) -> None:
 
 def test_usage_line_and_cost_command(tmp_path: Path) -> None:
     """턴마다 사용량 한 줄을 보이고, /cost 는 sessions.db 에 쌓인 턴 합계를 보인다."""
-    steps = [ai("하나", inp=1000, out=10, cost=0.01), ai("둘", inp=2000, out=20, cache_read=900, cost=0.002)]
-    app, _, out, _ = make_app(tmp_path, steps, "/cost", "첫 질문", "두 번째 질문", "/cost", "/exit")
+    steps = [ai("하나", inp=1000, out=10, cost=0.01),
+             ai("둘", inp=2000, out=20, cache_read=900, cost=0.002)]
+    app, _, out, _ = make_app(tmp_path, steps, "/cost", "첫 질문", "두 번째 질문", "/cost",
+                              "/exit")
     app.run()
     text = out.getvalue()
     assert "이 세션에 기록된 사용량이 아직 없다" in text
     assert "모델 1회 · 입력 1,000 · 출력 10 · $0.0100" in text
     assert "모델 1회 · 입력 2,000 (캐시 읽기 900 · 쓰기 0) · 출력 20 · $0.0020" in text
-    assert f"세션 {app.thread_id} · 턴 2개 · 모델 2회 · 입력 3,000 (캐시 읽기 900 · 쓰기 0) · 출력 30 · $0.0120" in text
+    assert (f"세션 {app.thread_id} · 턴 2개 · 모델 2회 · 입력 3,000 (캐시 읽기 900 · 쓰기 0) · "
+            "출력 30 · $0.0120") in text
     total, turns = app.sessions.usage_of(app.thread_id)
     assert (turns, total.calls, total.output_tokens) == (2, 2, 30)
 
@@ -134,7 +139,8 @@ def test_usage_line_and_cost_command(tmp_path: Path) -> None:
 def test_interrupted_turn_still_records_usage(tmp_path: Path) -> None:
     """승인 프롬프트에서 Ctrl+C 로 턴을 끊어도 이미 쓴 모델 호출은 남는다."""
     step = ai(inp=500, out=5, cost=0.004, tool_calls=[
-        {"name": "execute", "args": {"command": "uv run pytest"}, "id": "c1", "type": "tool_call"}])
+        {"name": "execute", "args": {"command": "uv run pytest"}, "id": "c1",
+         "type": "tool_call"}])
     app, _, out, _ = make_app(tmp_path, [step], "테스트 돌려", KeyboardInterrupt(), "/exit")
     app.run()
     assert "중단했다" in out.getvalue()
@@ -153,7 +159,10 @@ def test_parse_args_defaults() -> None:
 
 
 def test_fixes_buggy_repo_with_approvals(tmp_path: Path) -> None:
-    """MVP 완료 조건의 배선 확인: 실패 확인 → 읽기 → 수정 승인 → pytest 승인 → 통과. 실제 모델 E2E 는 수동으로 한다."""
+    """MVP 완료 조건의 배선 확인: 실패 확인 → 읽기 → 수정 승인 → pytest 승인 → 통과.
+
+    실제 모델 E2E 는 수동으로 한다.
+    """
     workspace = tmp_path / "repo"
     shutil.copytree(FIXTURE, workspace)
     pytest_cmd = f"'{Path(sys.executable).as_posix()}' -m pytest -q -p no:cacheprovider"
@@ -168,7 +177,8 @@ def test_fixes_buggy_repo_with_approvals(tmp_path: Path) -> None:
     app, model, _out, script = make_app(tmp_path, steps, "실패하는 테스트를 고쳐줘", "y", "y", "y",
                                        workspace=workspace)
     app.run()
-    results = [m.text for m in model.calls[-1] if isinstance(m, ToolMessage) and m.name == "execute"]
+    results = [m.text for m in model.calls[-1]
+               if isinstance(m, ToolMessage) and m.name == "execute"]
     assert "1 failed, 3 passed" in results[0]
     assert "4 passed" in results[-1]
     assert "ordered[mid - 1]" in (workspace / "stats.py").read_text(encoding="utf-8")
@@ -176,7 +186,8 @@ def test_fixes_buggy_repo_with_approvals(tmp_path: Path) -> None:
     assert not (workspace / ".code-agent-artifacts").exists()
 
 
-ENV_A = "\n# 이 PC 의 도구 (세션 시작 때 확인했다)\n- 있음: python 3.13.18, uv 0.13.7\n- 없음: node\n"
+ENV_A = ("\n# 이 PC 의 도구 (세션 시작 때 확인했다)\n- 있음: python 3.13.18, uv 0.13.7\n"
+         "- 없음: node\n")
 
 
 def run_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], *answers: str,
@@ -194,7 +205,8 @@ def run_main(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str], *
     monkeypatch.setattr(cli, "detect_environment", detect)
     monkeypatch.setattr(cli, "make_tracer", lambda settings: None)
     monkeypatch.setattr(cli, "_line_reader", lambda history: Script(*answers))
-    monkeypatch.setattr(cli, "build_agent", lambda *args, **kwargs: build_agent(*args, model=model, **kwargs))
+    monkeypatch.setattr(cli, "build_agent",
+                        lambda *args, **kwargs: build_agent(*args, model=model, **kwargs))
     return cli.main(argv)
 
 
@@ -205,28 +217,36 @@ def only_thread(tmp_path: Path) -> str:
 
 
 def test_resume_reuses_stored_env_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """그사이 node 를 설치해 탐지 결과가 바뀌어도 --resume 의 system 은 첫 세션과 바이트 단위로 같다."""
+    """그사이 node 를 설치해 탐지 결과가 바뀌어도
+    --resume 의 system 은 첫 세션과 바이트 단위로 같다.
+    """
     (tmp_path / "ws").mkdir()
     first = ScriptedChatModel(steps=[AIMessage(content="a")])
     assert run_main(tmp_path, monkeypatch, ["--workspace", str(tmp_path / "ws")], "하이", "/exit",
                     detected=ENV_A, model=first) == 0
     thread_id = only_thread(tmp_path)
-    resumed = ScriptedChatModel(steps=[AIMessage(content="b")])  # 다시 탐지하면 detect 가 단언으로 실패한다
-    assert run_main(tmp_path, monkeypatch, ["--resume", thread_id], "또", "/exit", detected=None, model=resumed) == 0
+    # 다시 탐지하면 detect 가 단언으로 실패한다
+    resumed = ScriptedChatModel(steps=[AIMessage(content="b")])
+    assert run_main(tmp_path, monkeypatch, ["--resume", thread_id], "또", "/exit", detected=None,
+                    model=resumed) == 0
     assert ENV_A in first.calls[0][0].text  # deepagents 가 우리 프롬프트 뒤에 자기 절을 덧붙인다
     assert resumed.calls[0][0].text == first.calls[0][0].text
 
 
 def test_old_thread_without_env_text(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """env 절이 생기기 전의 thread 를 이어 가면 절 없이(옛 system 과 같게) 쓰고 다시 탐지하지 않는다."""
+    """env 절이 생기기 전의 thread 를 이어 가면 절 없이(옛 system 과 같게)
+    쓰고 다시 탐지하지 않는다.
+    """
     (tmp_path / "ws").mkdir()
     (tmp_path / "data").mkdir()
     with sqlite3.connect(tmp_path / "data" / "sessions.db") as conn:  # 옛 버전이 만든 표와 행
-        conn.execute("CREATE TABLE code_agent_threads (thread_id TEXT PRIMARY KEY, workspace TEXT NOT NULL, "
-                     "created_at TEXT NOT NULL)")
-        conn.execute("INSERT INTO code_agent_threads VALUES ('old1', ?, 'then')", (str(tmp_path / "ws"),))
+        conn.execute("CREATE TABLE code_agent_threads (thread_id TEXT PRIMARY KEY, "
+                     "workspace TEXT NOT NULL, created_at TEXT NOT NULL)")
+        conn.execute("INSERT INTO code_agent_threads VALUES ('old1', ?, 'then')",
+                     (str(tmp_path / "ws"),))
     model = ScriptedChatModel(steps=[AIMessage(content="b")])
-    assert run_main(tmp_path, monkeypatch, ["--resume", "old1"], "또", "/exit", detected=None, model=model) == 0
+    assert run_main(tmp_path, monkeypatch, ["--resume", "old1"], "또", "/exit", detected=None,
+                    model=model) == 0
     assert "이 PC 의 도구" not in model.calls[0][0].text
 
 
@@ -239,21 +259,27 @@ def test_new_command_reuses_env_text(tmp_path: Path) -> None:
 
 
 def test_new_after_old_thread_redetects(tmp_path: Path) -> None:
-    """절이 없던 옛 thread 를 이어 온 뒤 /new 하면, 다시 탐지한 절로 새 agent 를 만들어 새 thread 를 시작한다."""
+    """절이 없던 옛 thread 를 이어 온 뒤 /new 하면,
+    다시 탐지한 절로 새 agent 를 만들어 새 thread 를 시작한다.
+    """
     app, _, _, _ = make_app(tmp_path, [], "/new", "새 질문", "/exit")
     model = ScriptedChatModel(steps=[AIMessage(content="b")])
-    fresh = build_agent(app.settings, app.workspace, SqliteSaver(app.sessions.conn), model=model, env_text=ENV_A)
+    fresh = build_agent(app.settings, app.workspace, SqliteSaver(app.sessions.conn), model=model,
+                        env_text=ENV_A)
     app.fresh_agent = lambda: (ENV_A, fresh)
     app.run()
     assert app.sessions.env_text_of(app.thread_id) == ENV_A
     assert ENV_A in model.calls[0][0].text
 
 
-@pytest.mark.parametrize("error", [RuntimeError("Git Bash(bash.exe)를 찾지 못했습니다."), ValueError("모델 이름 오류"),
-                                   KeyboardInterrupt()])
+@pytest.mark.parametrize("error", [RuntimeError("Git Bash(bash.exe)를 찾지 못했습니다."),
+                                   ValueError("모델 이름 오류"), KeyboardInterrupt()])
 def test_new_keeps_session_when_redetect_fails(tmp_path: Path, error: BaseException) -> None:
-    """/new 의 재탐지·agent 생성이 실패해도 REPL 이 끝나지 않고, 지금 세션(thread·agent)으로 이어 간다(PR #8 리뷰 6)."""
-    app, model, out, _ = make_app(tmp_path, [AIMessage(content="이어서 답")], "/new", "계속", "/exit")
+    """/new 의 재탐지·agent 생성이 실패해도 REPL 이 끝나지 않고,
+    지금 세션(thread·agent)으로 이어 간다(PR #8 리뷰 6).
+    """
+    app, model, out, _ = make_app(tmp_path, [AIMessage(content="이어서 답")], "/new", "계속",
+                                  "/exit")
     first, agent = app.thread_id, app.agent
 
     def fail() -> tuple[str, Any]:
@@ -263,13 +289,18 @@ def test_new_keeps_session_when_redetect_fails(tmp_path: Path, error: BaseExcept
     assert app.run() == 0
     assert (app.thread_id, app.agent, app.env_text) == (first, agent, "")
     assert f"새 세션을 시작하지 못했다: {type(error).__name__}" in out.getvalue()
-    assert [m.text for m in model.calls[0] if isinstance(m, HumanMessage)] == ["계속"]  # 다음 입력은 지금 세션에서 돈다
+    # 다음 입력은 지금 세션에서 돈다
+    assert [m.text for m in model.calls[0] if isinstance(m, HumanMessage)] == ["계속"]
     assert app.sessions.conn.execute("SELECT COUNT(*) FROM code_agent_threads").fetchone() == (1,)
 
 
 def test_old_process_can_still_insert_threads(tmp_path: Path) -> None:
-    """env 는 표를 따로 둬서 code_agent_threads 열이 그대로다. 아직 돌고 있는 옛 프로세스의 INSERT 가 깨지지 않는다."""
+    """env 는 표를 따로 둬서 code_agent_threads 열이 그대로다.
+
+    아직 돌고 있는 옛 프로세스의 INSERT 가 깨지지 않는다.
+    """
     conn = sqlite3.connect(tmp_path / "s.db")
     Sessions(conn).create(tmp_path, ENV_A)
-    conn.execute("INSERT INTO code_agent_threads VALUES (?, ?, ?)", ("old2", str(tmp_path), "now"))  # 옛 코드의 문장
+    # 옛 코드의 문장
+    conn.execute("INSERT INTO code_agent_threads VALUES (?, ?, ?)", ("old2", str(tmp_path), "now"))
     assert Sessions(conn).env_text_of("old2") == ""

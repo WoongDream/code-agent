@@ -2,10 +2,13 @@
 
 - 루트 아래에 LangChain CallbackHandler 가 그래프 노드·미들웨어·모델 호출·도구 실행을 기록한다.
   승인 대기 후 재개(Command(resume=...))도 같은 핸들러를 쓰므로 같은 턴 아래에 이어진다.
-- 승인 결정은 이 모듈이 event 로 남긴다(도구, 호출 요약, approve/reject, 사람이 정했는지, 거부 사유).
-- 턴이 끝나면 루트 출력에 작업 기록(최종 답변, 도구 실행과 결과 요약, 승인, 바뀐 파일, diff)을 남긴다(worklog.py).
+- 승인 결정은 이 모듈이 event 로 남긴다
+  (도구, 호출 요약, approve/reject, 사람이 정했는지, 거부 사유).
+- 턴이 끝나면 루트 출력에 작업 기록(최종 답변, 도구 실행과 결과 요약, 승인, 바뀐 파일, diff)을
+  남긴다(worklog.py).
   LLM-as-a-Judge 평가기는 turn 하나만 읽으므로 판단 근거가 여기 있어야 한다.
-- 출력 한도로 잘린 응답이나 예산 상한 도달(stops.py)은 turn 을 WARNING 수준으로 표시하고 작업 기록에 경고 절을 둔다.
+- 출력 한도로 잘린 응답이나 예산 상한 도달(stops.py)은 turn 을 WARNING 수준으로 표시하고
+  작업 기록에 경고 절을 둔다.
 - UsageCallback 합계(OpenRouter 실제 비용 포함)는 루트 metadata 에 남긴다. 핸들러는 토큰만 넘기고
   비용은 Langfuse 가 모델 정의로 계산하므로, OpenRouter 모델 이름에는 가격 정의를 등록해야 한다.
 
@@ -31,23 +34,34 @@ TIMEOUT_S = 5  # 내보내기 요청 제한 시간. 종료 시 flush 가 이보�
 
 
 class TurnTrace(Protocol):
+    """한 턴의 트레이스. cli.App.turn 이 스트림 조각·승인 결정·턴 끝을 알린다."""
+
     callbacks: list
 
-    def on_part(self, part: tuple) -> None: ...
+    def on_part(self, part: tuple) -> None:
+        """스트림 조각 하나를 받는다(작업 기록용)."""
 
-    def decision(self, action: dict, decision: dict, auto: bool) -> None: ...
+    def decision(self, action: dict, decision: dict, auto: bool) -> None:
+        """승인 결정 하나를 남긴다. auto 는 사람에게 묻지 않고 정했는지다."""
 
-    def end(self, *, output: str, usage: Usage, error: str | None = None, warnings: Sequence[str] = ()) -> None: ...
+    def end(self, *, output: str, usage: Usage, error: str | None = None,
+            warnings: Sequence[str] = ()) -> None:
+        """턴을 끝내고 최종 답변·사용량·오류·경고를 남긴다."""
 
 
 class Tracer(Protocol):
-    def turn(self, text: str, *, session_id: str, tags: list[str],
-             workspace: Path | None = None, context: str = "") -> Any: ...  # ContextManager[TurnTrace]
+    """트레이서. 턴마다 트레이스를 열고, REPL 이 끝날 때 남은 것을 보낸다."""
 
-    def shutdown(self) -> None: ...
+    def turn(self, text: str, *, session_id: str, tags: list[str],
+             workspace: Path | None = None, context: str = "") -> Any:
+        """턴 하나의 트레이스를 연다. ContextManager[TurnTrace] 를 돌려준다."""
+
+    def shutdown(self) -> None:
+        """남은 트레이스를 보내고 끝낸다."""
 
 
 def langfuse_installed() -> bool:
+    """langfuse extra 가 설치돼 있는지."""
     return importlib.util.find_spec("langfuse") is not None
 
 
@@ -57,12 +71,15 @@ def make_tracer(settings: Settings) -> LangfuseTracer | None:
         return None
     from langfuse import Langfuse
 
-    client = Langfuse(public_key=settings.langfuse_public_key, secret_key=settings.langfuse_secret_key,
+    client = Langfuse(public_key=settings.langfuse_public_key,
+                      secret_key=settings.langfuse_secret_key,
                       base_url=settings.langfuse_base_url, timeout=TIMEOUT_S)
     return LangfuseTracer(client, public_key=settings.langfuse_public_key)
 
 
 class LangfuseTracer:
+    """Langfuse 클라이언트로 턴마다 루트 observation "turn" 을 만든다."""
+
     def __init__(self, client: Any, *, public_key: str) -> None:
         self.client = client
         self.public_key = public_key
@@ -70,16 +87,22 @@ class LangfuseTracer:
     @contextmanager
     def turn(self, text: str, *, session_id: str, tags: list[str],
              workspace: Path | None = None, context: str = "") -> Iterator[LangfuseTurn]:
+        """루트 observation "turn" 을 열고 그 안에서 LangfuseTurn 을 내준다.
+
+        session_id·trace_name·tags 는 턴 안의 모든 observation 에 붙는다.
+        """
         from langfuse import propagate_attributes
         from langfuse.langchain import CallbackHandler
 
-        # session_id·trace_name 은 US-ASCII 200자 이하, tag 는 200자 이하여야 한다(넘으면 버려진다).
+        # session_id·trace_name 은 US-ASCII 200자 이하, tag 는 200자 이하여야 한다
+        # (넘으면 버려진다).
         # propagate_attributes 는 루트가 현재 span 이 된 뒤에 들어가야 루트에도 붙는다.
-        with (self.client.start_as_current_observation(name="turn", as_type="agent", input=text) as root,
+        with (self.client.start_as_current_observation(name="turn", as_type="agent",
+                                                       input=text) as root,
               propagate_attributes(session_id=session_id, trace_name="code-agent turn",
                                    tags=[tag[:200] for tag in tags])):
-            yield LangfuseTurn(root, CallbackHandler(public_key=self.public_key), workspace=workspace,
-                               context=context)
+            yield LangfuseTurn(root, CallbackHandler(public_key=self.public_key),
+                               workspace=workspace, context=context)
 
     def shutdown(self) -> None:
         """남은 span 을 보내고 백그라운드 스레드를 끝낸다. REPL 이 끝날 때 부른다."""
@@ -87,22 +110,30 @@ class LangfuseTracer:
 
 
 class LangfuseTurn:
-    def __init__(self, root: Any, handler: Any, *, workspace: Path | None = None, context: str = "") -> None:
+    """한 턴의 Langfuse 기록. 작업 기록(WorkLog)을 모아 턴 끝에 루트 출력으로 남긴다."""
+
+    def __init__(self, root: Any, handler: Any, *, workspace: Path | None = None,
+                 context: str = "") -> None:
         self.root = root
         self.callbacks = [handler]  # 턴 안의 모든 stream 호출(재개 포함)에 같은 인스턴스를 쓴다
         self.workspace = workspace
         self.before = snapshot(workspace) if workspace is not None else None
-        self.context = context  # 작업 폴더와 이전 턴 요약. 평가기는 시스템 프롬프트와 이전 턴을 보지 못한다
+        # 작업 폴더와 이전 턴 요약. 평가기는 시스템 프롬프트와 이전 턴을 보지 못한다
+        self.context = context
         self.worklog = WorkLog()
-        self.prompt_migrated = False  # resume 때 프롬프트가 바뀌어 옛 생각을 요청에서 뺐는지(resume_compat)
+        # resume 때 프롬프트가 바뀌어 옛 생각을 요청에서 뺐는지(resume_compat)
+        self.prompt_migrated = False
 
     def on_part(self, part: tuple) -> None:
+        """스트림 조각을 작업 기록에 넣고, resume 이전(prompt_migrated) 알림을 기억한다."""
         self.worklog.on_part(part)
         _ns, mode, data = part
         if mode == "custom" and isinstance(data, dict) and data.get("type") == "prompt_migrated":
-            self.prompt_migrated = self.prompt_migrated or data.get("reason") == "prompt"  # 모델만 바뀐 것은 빼지 않는다
+            # 모델만 바뀐 것은 빼지 않는다
+            self.prompt_migrated = self.prompt_migrated or data.get("reason") == "prompt"
 
     def decision(self, action: dict, decision: dict, auto: bool) -> None:
+        """승인 결정을 작업 기록과 루트의 event(approval:<도구>)로 남긴다."""
         self.worklog.decision(action, decision, auto)
         approved = decision.get("type") == "approve"
         self.root.create_event(
@@ -113,10 +144,12 @@ class LangfuseTurn:
             level="DEFAULT" if approved else "WARNING",
         )
 
-    def end(self, *, output: str, usage: Usage, error: str | None = None, warnings: Sequence[str] = ()) -> None:
+    def end(self, *, output: str, usage: Usage, error: str | None = None,
+            warnings: Sequence[str] = ()) -> None:
         """output 은 최종 답변이다. 루트 출력에는 판단 근거가 되는 작업 기록 전체를 남긴다.
 
-        warnings(잘린 응답, 예산 상한 도달)가 있으면 오류가 없을 때 WARNING 수준과 status_message 로 표시한다.
+        warnings(잘린 응답, 예산 상한 도달)가 있으면 오류가 없을 때
+        WARNING 수준과 status_message 로 표시한다.
         """
         changes: list[str] | None
         if self.workspace is None:
@@ -128,9 +161,10 @@ class LangfuseTurn:
         metadata: dict[str, Any] = {"usage": asdict(usage)}
         if self.prompt_migrated:
             metadata["prompt_migrated"] = True
-        fields: dict[str, Any] = {"output": self.worklog.render(answer=output, changes=changes, diff=diff,
-                                                             context=self.context, warnings=warnings),
-                                  "metadata": metadata}
+        fields: dict[str, Any] = {
+            "output": self.worklog.render(answer=output, changes=changes, diff=diff,
+                                          context=self.context, warnings=warnings),
+            "metadata": metadata}
         if error:
             fields.update(level="ERROR", status_message=error)
         elif warnings:

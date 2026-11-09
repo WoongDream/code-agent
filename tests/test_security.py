@@ -1,4 +1,5 @@
-"""보안 1차(security-review.md S1~S5, S12, S13): .env 가드와 셸 자동 승인의 우회 사례. 비밀값은 가짜(DUMMY)다.
+"""보안 1차(security-review.md S1~S5, S12, S13): .env 가드와 셸 자동 승인의 우회 사례.
+비밀값은 가짜(DUMMY)다.
 
 모듈 수준에서는 main 에도 있던 이름만 가져온다. 수정 전 코드로 돌리면 사례마다 실패해야 한다.
 """
@@ -28,8 +29,9 @@ CWD_SEARCH = "NoDefaultCurrentDirectoryInExePath"
 def clear_cwd_search(monkeypatch: pytest.MonkeyPatch) -> None:
     """변수를 지워 which 가 현재 폴더를 먼저 찾게 한다. 시험이 끝나면 원래 상태로 되돌린다.
 
-    delenv(raising=False) 만 쓰면 변수가 원래 없던 환경(CI)에서는 아무것도 기록하지 않아, cli.main 이 setdefault 로 넣은
-    "1" 이 뒤 시험까지 남는다. 그래서 setenv 로 원래 상태를 먼저 기록한다.
+    delenv(raising=False) 만 쓰면 변수가 원래 없던 환경(CI)에서는 아무것도 기록하지 않아,
+    cli.main 이 setdefault 로 넣은 "1" 이 뒤 시험까지 남는다.
+    그래서 setenv 로 원래 상태를 먼저 기록한다.
     """
     monkeypatch.setenv(CWD_SEARCH, "")
     monkeypatch.delenv(CWD_SEARCH)
@@ -39,7 +41,8 @@ def clear_cwd_search(monkeypatch: pytest.MonkeyPatch) -> None:
 def close_connections(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """이 파일의 시험이 연 sqlite 연결(cli.main·make_app 의 sessions.db)을 시험이 끝나면 닫는다.
 
-    닫지 않으면 임시 폴더의 sessions.db 가 프로세스가 끝날 때까지 잠겨 있고, Python 3.13 은 ResourceWarning 을 낸다.
+    닫지 않으면 임시 폴더의 sessions.db 가 프로세스가 끝날 때까지 잠겨 있고,
+    Python 3.13 은 ResourceWarning 을 낸다.
     """
     opened: list[sqlite3.Connection] = []
     connect = sqlite3.connect
@@ -57,8 +60,8 @@ def close_connections(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 # --- S1: 파일 도구 가드의 이름 변형 ---
 
-@pytest.mark.parametrize("name", [".ENV", ".Env.local", ".env ", ".env::$DATA", ".env:x", ".env.", "/sub/.ENV",
-                                  "\\sub\\.eNv.production"])
+@pytest.mark.parametrize("name", [".ENV", ".Env.local", ".env ", ".env::$DATA", ".env:x", ".env.",
+                                  "/sub/.ENV", "\\sub\\.eNv.production"])
 def test_env_guard_variants(name: str) -> None:
     assert is_env_path(name)
 
@@ -70,7 +73,10 @@ def test_env_templates_and_others_still_allowed(name: str) -> None:
 
 @pytest.mark.parametrize("path", ["/.ENV", "/.env ", "/.env::$DATA", "/.env."])
 def test_file_tools_cannot_read_env_variants(tmp_path: Path, path: str) -> None:
-    """Windows 는 이 이름들을 모두 .env 로 연다. 수정 전에는 가짜 비밀값이 모델 입력으로 들어갔다."""
+    """Windows 는 이 이름들을 모두 .env 로 연다.
+
+    수정 전에는 가짜 비밀값이 모델 입력으로 들어갔다.
+    """
     h = Harness(tmp_path, [tool_call("read_file", {"file_path": path}), AIMessage(content="끝")])
     (h.workspace / ".env").write_text(f"API_KEY={SECRET}\n", encoding="utf-8")
     h.run()
@@ -81,7 +87,8 @@ def test_file_tools_cannot_read_env_variants(tmp_path: Path, path: str) -> None:
 
 @pytest.mark.parametrize("path", ["/.ENV", "/.env "])
 def test_file_tools_cannot_overwrite_env_variants(tmp_path: Path, path: str) -> None:
-    h = Harness(tmp_path, [tool_call("edit_file", {"file_path": path, "old_string": SECRET, "new_string": "x"}),
+    h = Harness(tmp_path, [tool_call("edit_file", {"file_path": path, "old_string": SECRET,
+                                                   "new_string": "x"}),
                            AIMessage(content="끝")], [APPROVE])
     (h.workspace / ".env").write_text(f"API_KEY={SECRET}\n", encoding="utf-8")
     h.run()
@@ -121,14 +128,15 @@ def test_env_guard_short_name(tmp_path: Path) -> None:
     # S2 대소문자와 8.3
     "cat .ENV", "cat sub/.Env.local", "head .eNv", "cat ENV~1", "cat SUBDIR~1/x.txt",
     # S3 옵션 값으로 경로 검사 우회
-    "wc --files0-from=/c/Users/x/victim.txt", "wc --files0-from=C:/x", "wc --files0-from victim.txt",
+    "wc --files0-from=/c/Users/x/victim.txt", "wc --files0-from=C:/x",
+    "wc --files0-from victim.txt",
     "cat --foo=/etc/passwd", "head --lines=5 --x=../secret README.md",
     # S4·S13 PowerShell 공급자 경로와 드라이브
-    "cat FileSystem::C:\\x\\victim.txt", "cat Microsoft.PowerShell.Core\\FileSystem::C:\\x", "ls HKCU:\\Software",
-    "cat env:PATH", "ls Cert:", "cat Variable:x", "ls Env:",
+    "cat FileSystem::C:\\x\\victim.txt", "cat Microsoft.PowerShell.Core\\FileSystem::C:\\x",
+    "ls HKCU:\\Software", "cat env:PATH", "ls Cert:", "cat Variable:x", "ls Env:",
     # S5 둥근 따옴표·긴 대시·숨은 문자
-    "cat \u2018.env\u2019", "cat \u201c.env\u201d", "wc \u2014files0-from=x", "cat a.txt\u00a0.env",
-    "cat \u202e.env", "cat a\u200b.txt",
+    "cat \u2018.env\u2019", "cat \u201c.env\u201d", "wc \u2014files0-from=x",
+    "cat a.txt\u00a0.env", "cat \u202e.env", "cat a\u200b.txt",
     # S12 tail 이 끝나지 않음
     "tail -f log.txt", "tail -F log.txt", "tail --follow=name log.txt", "tail -fn5 log.txt",
     # PR #8 리뷰: GNU 긴 옵션 약어(getopt_long 은 앞부분만 써도 받는다), PowerShell 매개변수 약어
@@ -145,8 +153,9 @@ def test_shell_bypasses_require_approval(command: str) -> None:
 
 @pytest.mark.parametrize("command", [
     "git diff --stat HEAD~1", "git log HEAD~3..HEAD", "git show HEAD:README.md", "cat id_rsa.pub",
-    "tail -n 5 log.txt", "wc -l a.py", "head --lines=5 README.md", "cat 'docs/한글 문서.md'", "ls -la src",
-    "git log --format=%h -n 3", "tail --lines=5 log.txt", "wc --lines --words a.py", "cat -Tail 5 log.txt",
+    "tail -n 5 log.txt", "wc -l a.py", "head --lines=5 README.md", "cat 'docs/한글 문서.md'",
+    "ls -la src", "git log --format=%h -n 3", "tail --lines=5 log.txt", "wc --lines --words a.py",
+    "cat -Tail 5 log.txt",
 ])
 def test_ordinary_reads_stay_auto_approved(command: str) -> None:
     """고친 뒤에도 평범한 읽기는 묻지 않는다(git 리비전의 ~·: 는 경로 규칙을 적용하지 않는다)."""
@@ -158,7 +167,8 @@ def test_ordinary_reads_stay_auto_approved(command: str) -> None:
 def read_key_app(tmp_path: Path, *answers: str, mode: str = "manual"):
     steps = [tool_call("read_file", {"file_path": "/id_rsa"}), AIMessage(content="끝")]
     app, model, out, script = make_app(tmp_path, steps, "키 읽어", *answers, "/exit", mode=mode)
-    (app.workspace / "id_rsa").write_text(f"-----BEGIN OPENSSH PRIVATE KEY-----\n{SECRET}\n", encoding="utf-8")
+    (app.workspace / "id_rsa").write_text(f"-----BEGIN OPENSSH PRIVATE KEY-----\n{SECRET}\n",
+                                          encoding="utf-8")
     app.run()
     return model, out, script
 
@@ -184,14 +194,16 @@ def test_private_key_read_by_mode(tmp_path: Path, mode: str, asked: int) -> None
 
 
 def test_ordinary_read_not_asked(tmp_path: Path) -> None:
-    h = Harness(tmp_path, [tool_call("read_file", {"file_path": "/id_rsa.pub"}), AIMessage(content="끝")])
+    h = Harness(tmp_path, [tool_call("read_file", {"file_path": "/id_rsa.pub"}),
+                           AIMessage(content="끝")])
     (h.workspace / "id_rsa.pub").write_text("ssh-ed25519 AAAA public", encoding="utf-8")
     h.run()
     assert h.requests == [] and "AAAA public" in h.tool_messages()[0].text
 
 
 def test_reject_reason_reaches_model(tmp_path: Path) -> None:
-    h = Harness(tmp_path, [tool_call("read_file", {"file_path": "/server.pem"}), AIMessage(content="끝")],
+    h = Harness(tmp_path, [tool_call("read_file", {"file_path": "/server.pem"}),
+                           AIMessage(content="끝")],
                 [reject("키는 안 돼")])
     (h.workspace / "server.pem").write_text(SECRET, encoding="utf-8")
     h.run()
@@ -202,14 +214,17 @@ def test_reject_reason_reaches_model(tmp_path: Path) -> None:
 
 # --- 현재 폴더의 실행 파일 가로채기(PR #8 리뷰에서 발견, main 에도 있는 경로) ---
 
-windows_only = pytest.mark.skipif(sys.platform != "win32", reason="현재 폴더 실행 파일 탐색은 Windows 동작")
+windows_only = pytest.mark.skipif(sys.platform != "win32",
+                                  reason="현재 폴더 실행 파일 탐색은 Windows 동작")
 
 
 @pytest.fixture
 def planted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """악성 저장소처럼 현재 폴더에 git.cmd 와 bin/bash.exe 를 둔다. 빈 파일이고 실행하지 않는다(존재만 본다).
+    """악성 저장소처럼 현재 폴더에 git.cmd 와 bin/bash.exe 를 둔다.
+    빈 파일이고 실행하지 않는다(존재만 본다).
 
-    NoDefaultCurrentDirectoryInExePath 를 지우지 않으면 which 가 현재 폴더를 보지 않아 이 시험들은 무의미하다.
+    NoDefaultCurrentDirectoryInExePath 를 지우지 않으면 which 가 현재 폴더를 보지 않아
+    이 시험들은 무의미하다.
     """
     clear_cwd_search(monkeypatch)
     monkeypatch.chdir(tmp_path)
@@ -247,11 +262,13 @@ def test_powershell_and_taskkill_are_absolute() -> None:
 
     powershell = resolve_shell("powershell")[1][0]
     assert Path(powershell).is_absolute() and Path(powershell).is_file()
-    assert Path(system32("taskkill.exe")).is_absolute() and Path(system32("taskkill.exe")).is_file()
+    assert (Path(system32("taskkill.exe")).is_absolute()
+            and Path(system32("taskkill.exe")).is_file())
 
 
 @windows_only
-def test_diff_command_does_not_run_planted_git(planted: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_diff_command_does_not_run_planted_git(planted: Path,
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
     from code_agent import cli
 
     calls: list[list[str]] = []
@@ -267,7 +284,8 @@ def test_diff_command_does_not_run_planted_git(planted: Path, monkeypatch: pytes
 
 
 @windows_only
-def test_cli_main_disables_current_folder_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_main_disables_current_folder_search(tmp_path: Path,
+                                                 monkeypatch: pytest.MonkeyPatch) -> None:
     from code_agent import cli
     from code_agent.settings import Settings
 
@@ -283,8 +301,8 @@ def test_cli_main_disables_current_folder_search(tmp_path: Path, monkeypatch: py
 def fake_repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """REPO_ROOT 를 가짜 .env 가 든 임시 폴더로 바꾸고, 키 없는 설정으로 main 을 돌릴 수 있게 한다.
 
-    main 이 setdefault 로 넣는 변수는 시험 뒤 원래 상태로 되돌리고, 이 PC 의 도구를 실제로 탐지하지 않는다(--version 실행과
-    프로세스 전체의 셸 환경 캐시를 시험 안에서 만들지 않는다).
+    main 이 setdefault 로 넣는 변수는 시험 뒤 원래 상태로 되돌리고, 이 PC 의 도구를 실제로 탐지하지
+    않는다(--version 실행과 프로세스 전체의 셸 환경 캐시를 시험 안에서 만들지 않는다).
     """
     from code_agent import cli
     from code_agent.settings import Settings
@@ -314,8 +332,9 @@ def test_repo_folder_warns_and_asks(fake_repo: Path, monkeypatch: pytest.MonkeyP
     assert "code-agent 저장소를 품은 폴더다" in capsys.readouterr().out and len(asked) == 2
 
 
-def test_repo_folder_explicit_workspace_warns_without_asking(fake_repo: Path, monkeypatch: pytest.MonkeyPatch,
-                                                             capsys: pytest.CaptureFixture[str]) -> None:
+def test_repo_folder_explicit_workspace_warns_without_asking(
+        fake_repo: Path, monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str]) -> None:
     from code_agent import cli
 
     monkeypatch.setattr(cli, "_confirm", lambda prompt: pytest.fail("-w 를 명시했는데 물었다"))
@@ -323,7 +342,8 @@ def test_repo_folder_explicit_workspace_warns_without_asking(fake_repo: Path, mo
     assert "작업 폴더가 code-agent 저장소다" in capsys.readouterr().out
 
 
-def test_other_folder_no_repo_warning(fake_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+def test_other_folder_no_repo_warning(fake_repo: Path, tmp_path: Path,
+                                      monkeypatch: pytest.MonkeyPatch,
                                       capsys: pytest.CaptureFixture[str]) -> None:
     from code_agent import cli
 
@@ -342,23 +362,30 @@ def fake_home(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
 
 @windows_only
 @pytest.mark.parametrize("where", ["home", "home-parent"])
-def test_home_exemption_still_rejects_current_folder_hits(planted: Path, monkeypatch: pytest.MonkeyPatch,
+def test_home_exemption_still_rejects_current_folder_hits(planted: Path,
+                                                          monkeypatch: pytest.MonkeyPatch,
                                                           where: str) -> None:
-    """현재 폴더(작업 폴더)가 홈이거나 홈을 품은 폴더면 trusted_tool 은 그 폴더를 기준에서 뺀다(~/.local/bin 의 uv 를
-    살리려고). 그래도 which 가 현재 폴더에서 찾은 결과는 상대 경로(.\\git.CMD)라 버린다.
+    """현재 폴더(작업 폴더)가 홈이거나 홈을 품은 폴더면 trusted_tool 은 그 폴더를 기준에서
+    뺀다(~/.local/bin 의 uv 를 살리려고).
+    그래도 which 가 현재 폴더에서 찾은 결과는 상대 경로(.\\git.CMD)라 버린다.
 
-    리뷰의 변이 시험: 상대 경로 검사를 지워도 기존 시험은 모두 통과했다. 그 사본에서는 이 시험이 심은 git·bash 를 고른다.
+    리뷰의 변이 시험: 상대 경로 검사를 지워도 기존 시험은 모두 통과했다.
+    그 사본에서는 이 시험이 심은 git·bash 를 고른다.
     """
     from code_agent.backend import find_git_bash
     from code_agent.environment import trusted_tool
 
     fake_home(monkeypatch, planted if where == "home" else planted / "user")
-    assert trusted_tool(shutil.which("git"), planted) is None and trusted_tool(shutil.which("git")) is None
+    assert (trusted_tool(shutil.which("git"), planted) is None
+            and trusted_tool(shutil.which("git")) is None)
     assert outside(find_git_bash(planted), planted) and outside(find_git_bash(), planted)
 
 
-def test_home_and_root_workspace_keep_outside_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """작업 폴더·현재 폴더가 홈, 홈을 품은 폴더, 드라이브 루트면 그 안의 절대 경로 도구도 버리지 않는다. 상대 경로는 버린다."""
+def test_home_and_root_workspace_keep_outside_tools(tmp_path: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """작업 폴더·현재 폴더가 홈, 홈을 품은 폴더, 드라이브 루트면
+    그 안의 절대 경로 도구도 버리지 않는다. 상대 경로는 버린다.
+    """
     from code_agent.environment import trusted_tool
 
     home = tmp_path / "home"
@@ -380,8 +407,9 @@ def test_broad_workspace_warns_but_starts(tmp_path: Path, monkeypatch: pytest.Mo
                                           capsys: pytest.CaptureFixture[str], where: str) -> None:
     """작업 폴더가 홈이나 드라이브 루트면 파일 도구가 그 전체에 닿는다고 경고하되, 막지는 않는다.
 
-    home-unresolved 는 Path.home() 이 resolve 전 모양(정션·8.3 이름 등)일 때다. 작업 폴더는 resolve 해서 비교하므로
-    홈도 resolve 해야 경고가 빠지지 않는다. 드라이브 루트는 읽기만 한다(세션·오프로드는 임시 폴더의 data 로 간다).
+    home-unresolved 는 Path.home() 이 resolve 전 모양(정션·8.3 이름 등)일 때다.
+    작업 폴더는 resolve 해서 비교하므로 홈도 resolve 해야 경고가 빠지지 않는다.
+    드라이브 루트는 읽기만 한다(세션·오프로드는 임시 폴더의 data 로 간다).
     """
     from code_agent import cli
 
@@ -398,8 +426,10 @@ def test_broad_workspace_warns_but_starts(tmp_path: Path, monkeypatch: pytest.Mo
     assert warned == (where != "project")
 
 
-def test_shell_env_does_not_run_workspace_uv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """-w 로 다른 폴더에서 저장소를 열고 저장소 안 폴더가 PATH 에 있어도, 셸 환경을 만들며 그 안의 uv 를 실행하지 않는다.
+def test_shell_env_does_not_run_workspace_uv(tmp_path: Path,
+                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    """-w 로 다른 폴더에서 저장소를 열고 저장소 안 폴더가 PATH 에 있어도,
+    셸 환경을 만들며 그 안의 uv 를 실행하지 않는다.
 
     심은 uv.exe 는 빈 파일이고 실행하지 않는다(subprocess.run 은 기록만 한다).
     """
@@ -417,9 +447,11 @@ def test_shell_env_does_not_run_workspace_uv(tmp_path: Path, monkeypatch: pytest
     assert ran == []
 
 
-@pytest.mark.skipif(sys.platform == "win32" and shutil.which("git") is None, reason="Git Bash 없음")
+@pytest.mark.skipif(sys.platform == "win32" and shutil.which("git") is None,
+                    reason="Git Bash 없음")
 def test_relative_path_entry_cannot_run_planted_command(tmp_path: Path) -> None:
-    """PATH 에 상대 경로 항목(bin)이 있으면 셸은 그것을 작업 폴더 기준으로 풀어 저장소에 심은 명령을 실행했다.
+    """PATH 에 상대 경로 항목(bin)이 있으면
+    셸은 그것을 작업 폴더 기준으로 풀어 저장소에 심은 명령을 실행했다.
 
     심은 명령은 문자열만 출력하는 sh 스크립트다.
     """

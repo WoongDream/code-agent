@@ -1,4 +1,7 @@
-"""에이전트 조립과 한 턴 실행. deepagents·langgraph API 와 결합되는 곳은 여기와 guards.py 뿐이다."""
+"""에이전트 조립과 한 턴 실행.
+
+deepagents·langgraph API 와 결합되는 곳은 여기와 guards.py 뿐이다.
+"""
 
 from __future__ import annotations
 
@@ -43,39 +46,48 @@ TOOL_CALLS = 300
 RECURSION_LIMIT = 1000  # 그래프 단계 수. 예산 미들웨어가 먼저 끊도록 넉넉히 둔다
 
 StreamPart = tuple[tuple[str, ...], str, Any]
-# 미들웨어마다 state 타입이 다르다(PlanningState 등). AgentMiddleware 는 state 에 불변이라 한 목록에 담으려면 Any 로 묶는다.
+# 미들웨어마다 state 타입이 다르다(PlanningState 등).
+# AgentMiddleware 는 state 에 불변이라 한 목록에 담으려면 Any 로 묶는다.
 Middleware = AgentMiddleware[Any, Any, Any]
 
 
-def budget_middleware(model_calls: int = MODEL_CALLS, tool_calls: int = TOOL_CALLS) -> list[Middleware]:
-    """exit_behavior="end" 라 초과하면 오류 대신 안내 메시지로 턴을 끝낸다(pjt Day08 guardlab/budget.py)."""
+def budget_middleware(model_calls: int = MODEL_CALLS,
+                      tool_calls: int = TOOL_CALLS) -> list[Middleware]:
+    """exit_behavior="end" 라 초과하면 오류 대신 안내 메시지로 턴을 끝낸다
+    (pjt Day08 guardlab/budget.py).
+    """
     return [
         ModelCallLimitMiddleware(run_limit=model_calls, exit_behavior="end"),
         ToolCallLimitMiddleware(run_limit=tool_calls, exit_behavior="end"),
     ]
 
 
-def summarization_middleware(model: BaseChatModel, backend: CompositeBackend, context_tokens: int) -> Middleware:
+def summarization_middleware(model: BaseChatModel, backend: CompositeBackend,
+                             context_tokens: int) -> Middleware:
     """deepagents 의 기본 요약을 같은 이름(SummarizationMiddleware)으로 core 자리에서 바꾼다.
 
-    - 도구 인자 잘림을 끈다(truncate_args_settings=None). 잘림은 중간 메시지를 바꿔 프롬프트 캐시를 깨고
-      Opus 5.5 의 보존된 thinking 을 무효로 만든다(서명이 앞쪽 기록 전체에 묶인다).
-    - 프로필의 max_input_tokens(models.with_context_limit)의 85% 에서 요약하고 10% 를 남긴다. 프로필이 없는
-      모델(대본 모델 등)은 context_tokens 를 쓴다. fraction 은 프로필이 없으면 생성자가 ValueError 를 내서 tokens 로 준다.
-    - trim_tokens_to_summarize=None: 생성자 기본값(4,000)이면 요약기가 버릴 기록의 마지막 4K 만 본다.
-      deepagents 팩토리(create_summarization_middleware)도 None 을 넘긴다.
+    - 도구 인자 잘림을 끈다(truncate_args_settings=None).
+      잘림은 중간 메시지를 바꿔 프롬프트 캐시를 깨고 Opus 5.5 의 보존된 thinking 을 무효로
+      만든다(서명이 앞쪽 기록 전체에 묶인다).
+    - 프로필의 max_input_tokens(models.with_context_limit)의 85% 에서 요약하고 10% 를 남긴다.
+      프로필이 없는 모델(대본 모델 등)은 context_tokens 를 쓴다.
+      fraction 은 프로필이 없으면 생성자가 ValueError 를 내서 tokens 로 준다.
+    - trim_tokens_to_summarize=None: 생성자 기본값(4,000)이면 요약기가 버릴 기록의
+      마지막 4K 만 본다. deepagents 팩토리(create_summarization_middleware)도 None 을 넘긴다.
     """
     limit = (model.profile or {}).get("max_input_tokens") or context_tokens
-    return SummarizationMiddleware(model=model, backend=backend, trigger=("tokens", int(limit * 0.85)),
-                                   keep=("tokens", int(limit * 0.10)), trim_tokens_to_summarize=None,
-                                   truncate_args_settings=None)
+    return SummarizationMiddleware(model=model, backend=backend,
+                                   trigger=("tokens", int(limit * 0.85)),
+                                   keep=("tokens", int(limit * 0.10)),
+                                   trim_tokens_to_summarize=None, truncate_args_settings=None)
 
 
 def _register_harness_profile(model: BaseChatModel) -> None:
     """프로필은 공급자 단위로 등록되고 내장 프로필과 병합된다.
 
     - MVP 는 서브에이전트를 쓰지 않는다.
-    - 기본 도구 설명 중 우리 환경과 다른 것(execute 의 'sandbox'·절대 경로·&& 연결, ls 의 'ALWAYS' 등)을 고친다(tool_text).
+    - 기본 도구 설명 중 우리 환경과 다른 것(execute 의 'sandbox'·절대 경로·&& 연결,
+      ls 의 'ALWAYS' 등)을 고친다(tool_text).
       등록은 프로세스 전역이고 같은 키에 병합된다(deepagents _merge_profiles).
     """
     provider = get_model_provider(model)
@@ -86,41 +98,75 @@ def _register_harness_profile(model: BaseChatModel) -> None:
 
 
 def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpointSaver | None, *,
-                model: BaseChatModel | None = None, backend: CompositeBackend | None = None, env_text: str = "",
-                prompt_store: PromptStore | None = None):
-    """env_text 는 시스템 프롬프트 끝의 '이 PC 의 도구' 절이다(prompts.coding_prompt).
+                model: BaseChatModel | None = None, backend: CompositeBackend | None = None,
+                env_text: str = "", prompt_store: PromptStore | None = None):
+    """코딩 에이전트 그래프를 조립한다. 승인 대상 도구(INTERRUPT_TOOLS)는 항상 interrupt 한다.
 
-    prompt_store 는 thread 별 프롬프트 지문 저장소다(resume_compat). 없으면 이 agent 안에서만 기억한다.
+    Args:
+        settings: 모델·셸·데이터 폴더·컨텍스트 상한 설정(settings.load_settings).
+        workspace: 작업 폴더. 파일 도구의 루트이자 셸의 현재 폴더다.
+        checkpointer: 대화 상태 저장소. None 이면 상태를 남기지 않는다.
+        model: 쓸 모델. None 이면 settings 로 만든다(models.make_model). 시험은 대본 모델을 넣는다.
+        backend: 파일·셸 백엔드. None 이면 make_backend 로 만든다.
+        env_text: 시스템 프롬프트 끝의 '이 PC 의 도구' 절이다(prompts.coding_prompt).
+        prompt_store: thread 별 프롬프트 지문 저장소다(resume_compat).
+            없으면 이 agent 안에서만 기억한다.
+
+    Returns:
+        컴파일된 deepagents 그래프. run_turn 으로 돌리고 get_state 로 상태를 읽는다.
     """
     model = model if model is not None else make_model(settings)
     _register_harness_profile(model)
     if backend is None:
-        backend = make_backend(workspace, artifacts_dir=settings.data_dir / "artifacts", shell=settings.shell)
-    # 잘림 복구는 맨 앞이어야 after_model 이 예산 미들웨어의 호출 집계 뒤에 돈다(after_model 은 역순).
-    # 요약은 이름이 같아 core 자리를 대신하므로 목록 위치와 상관없다. .env 가드는 작업 폴더로 실제 파일 이름도 본다.
-    # 지문은 TodoList 와 도구 인자 고치기 뒤라야(wrap_model_call 은 앞이 바깥) 모델이 받는 system·도구를 본다.
+        backend = make_backend(workspace, artifacts_dir=settings.data_dir / "artifacts",
+                               shell=settings.shell)
+    # 잘림 복구는 맨 앞이어야 after_model 이 예산 미들웨어의 호출 집계 뒤에 돈다
+    # (after_model 은 역순).
+    # 요약은 이름이 같아 core 자리를 대신하므로 목록 위치와 상관없다.
+    # .env 가드는 작업 폴더로 실제 파일 이름도 본다.
+    # 지문은 TodoList 와 도구 인자 고치기 뒤라야(wrap_model_call 은 앞이 바깥)
+    # 모델이 받는 system·도구를 본다.
     store = prompt_store if prompt_store is not None else MemoryPromptStore()
-    middleware: list[Middleware] = [TruncationRecoveryMiddleware(), TodoListMiddleware(system_prompt=TODO_PROMPT),
-                                    ToolArgsMiddleware(), PromptFingerprintMiddleware(store),
-                                    DotenvGuardMiddleware(workspace), OpenRouterCacheMiddleware(),
-                                    *budget_middleware(), summarization_middleware(model, backend, settings.context_tokens)]
-    shell = cast(WindowsShellBackend, backend.default).shell  # default 는 make_backend 의 셸 백엔드다
+    middleware: list[Middleware] = [
+        TruncationRecoveryMiddleware(), TodoListMiddleware(system_prompt=TODO_PROMPT),
+        ToolArgsMiddleware(), PromptFingerprintMiddleware(store),
+        DotenvGuardMiddleware(workspace), OpenRouterCacheMiddleware(),
+        *budget_middleware(), summarization_middleware(model, backend, settings.context_tokens)]
+    # default 는 make_backend 의 셸 백엔드다
+    shell = cast(WindowsShellBackend, backend.default).shell
     return create_deep_agent(
         name="code-agent", model=model, backend=backend,
         system_prompt=coding_prompt(workspace=workspace, shell=shell, env_text=env_text),
         middleware=middleware,
         # 결정은 approve/reject 만 받는다. edit 은 고친 인자가 재검증 없이 실행된다.
-        interrupt_on={tool: {"allowed_decisions": ["approve", "reject"]} for tool in INTERRUPT_TOOLS},
+        interrupt_on={tool: {"allowed_decisions": ["approve", "reject"]}
+                      for tool in INTERRUPT_TOOLS},
         checkpointer=checkpointer,
     )
 
 
 def run_turn(agent, inp: dict | Command, config: dict, *,
-             decide: Callable[[list[dict]], list[dict]], on_part: Callable[[StreamPart], None]) -> None:
-    """interrupt 가 없어질 때까지 스트림 → 결정 → 재개를 반복한다(pjt Day08 guardlab/runner.py:107).
+             decide: Callable[[list[dict]], list[dict]],
+             on_part: Callable[[StreamPart], None]) -> None:
+    """interrupt 가 없어질 때까지 스트림 → 결정 → 재개를 반복한다
+    (pjt Day08 guardlab/runner.py:107).
 
-    서브에이전트의 interrupt 는 ns 가 다른 두 이벤트로 같은 id 를 달고 오므로 id 로 중복을 없앤다(0단계 d).
-    custom 모드는 미들웨어가 get_stream_writer 로 보내는 알림이다(resume_compat 의 prompt_migrated 등).
+    서브에이전트의 interrupt 는 ns 가 다른 두 이벤트로 같은 id 를 달고 오므로
+    id 로 중복을 없앤다(0단계 d).
+    custom 모드는 미들웨어가 get_stream_writer 로 보내는 알림이다
+    (resume_compat 의 prompt_migrated 등).
+
+    Args:
+        agent: build_agent 가 만든 그래프.
+        inp: 새 입력({"messages": [...]}) 또는 재개 Command.
+        config: langgraph 실행 설정(configurable.thread_id 등).
+            recursion_limit 이 없으면 RECURSION_LIMIT 을 쓴다.
+        decide: 승인 요청(action_requests) 목록을 받아 같은 순서의 결정
+            ({"type": "approve"} 또는 reject) 목록을 돌려준다(approval.decide_all).
+        on_part: interrupt 가 아닌 스트림 조각 (ns, mode, data) 마다 불린다.
+
+    Returns:
+        None. 출력은 on_part 로 흘려보내고, 대화 상태는 agent 의 checkpointer 에 남는다.
     """
     config = {"recursion_limit": RECURSION_LIMIT, **config}
     while True:
@@ -135,5 +181,6 @@ def run_turn(agent, inp: dict | Command, config: dict, *,
                 on_part(part)
         if not pending:
             return
-        answers = {iid: {"decisions": decide(i.value["action_requests"])} for iid, i in pending.items()}
+        answers = {iid: {"decisions": decide(i.value["action_requests"])}
+                   for iid, i in pending.items()}
         inp = Command(resume=next(iter(answers.values())) if len(answers) == 1 else answers)

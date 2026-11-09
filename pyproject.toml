@@ -39,8 +39,17 @@ testpaths = ["tests"]
 norecursedirs = ["fixtures"]  # buggy_repo 는 일부러 실패하는 시험을 가진다
 
 [tool.ruff]
-line-length = 100
+# PEP8 은 팀이 합의하면 99자까지 허용한다. ruff 는 한글을 폭 2로 세므로 글자 수로는 PEP8 보다 엄격하다
+line-length = 99
 target-version = "py313"
+extend-exclude = ["outputs", "tests/fixtures"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "N", "D1"]
+ignore = ["D105", "D107"]  # 매직 메서드와 __init__ 은 클래스 docstring 으로 설명한다
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D1"]  # 시험 이름이 설명이다
 
 [tool.pyright]
 # 1단계: src 와 scripts 만 게이트로 둔다. tests 는 2단계(남은 오류를 고친 뒤 include 에 넣는다)

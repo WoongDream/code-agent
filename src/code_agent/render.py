@@ -1,14 +1,19 @@
-"""스트림 조각을 터미널에 그린다. AI 텍스트는 토큰 단위로, 도구 호출은 이름과 핵심 인자만, 도구 결과는 앞 몇 줄만 보인다.
+"""스트림 조각을 터미널에 그린다. AI 텍스트는 토큰 단위로, 도구 호출은 이름과 핵심 인자만,
+도구 결과는 앞 몇 줄만 보인다.
 
-messages 모드에서는 model 노드의 AI 메시지만, updates 모드에서는 도구 호출·결과·todo 와 예산 미들웨어의 종료 메시지,
-잘림 자동 복구 안내만 쓴다(중복 출력 방지). HITL 이 승인 뒤 다시 내보내는 응답과 PatchToolCalls 가 다시 내보내는
-기록 전체는 그리지 않는다.
+messages 모드에서는 model 노드의 AI 메시지만,
+updates 모드에서는 도구 호출·결과·todo 와 예산 미들웨어의 종료 메시지, 잘림 자동 복구 안내만 쓴다
+(중복 출력 방지).
+HITL 이 승인 뒤 다시 내보내는 응답과 PatchToolCalls 가 다시 내보내는 기록 전체는 그리지 않는다.
 
-생각(reasoning)은 흐리게 줄 단위로 찍는다. 기본은 줄(문단)마다 앞 MEMO_CHARS 자만 보이는 메모이고 /thinking 으로 원문을 켠다.
-OpenRouter 는 생각을 청크의 additional_kwargs 에 담는다. reasoning_content 는 content_blocks 의 reasoning 블록이 되지만
+생각(reasoning)은 흐리게 줄 단위로 찍는다.
+기본은 줄(문단)마다 앞 MEMO_CHARS 자만 보이는 메모이고 /thinking 으로 원문을 켠다.
+OpenRouter 는 생각을 청크의 additional_kwargs 에 담는다.
+reasoning_content 는 content_blocks 의 reasoning 블록이 되지만
 reasoning_details 에만 담긴 청크는 블록이 없어 그 text·summary 를 쓴다.
-모델과 도구를 기다리는 동안에는 상태 줄(StatusLine)에 단계·진행량·경과 시간을 보인다. 생각이 오래 걸리거나 큰 도구 인자를
-쓰는 동안에도 멈춘 것처럼 보이지 않게 하려는 것이다(az-quiz 첫 호출 658초(약 11분, Langfuse 실측), quizzes.js 인자 작성 99초).
+모델과 도구를 기다리는 동안에는 상태 줄(StatusLine)에 단계·진행량·경과 시간을 보인다.
+생각이 오래 걸리거나 큰 도구 인자를 쓰는 동안에도 멈춘 것처럼 보이지 않게 하려는 것이다
+(az-quiz 첫 호출 658초(약 11분, Langfuse 실측), quizzes.js 인자 작성 99초).
 """
 
 from __future__ import annotations
@@ -41,15 +46,18 @@ RESULT_LINES = 6
 MEMO_CHARS = 100  # 메모 모드에서 생각 한 줄(문단)에 보이는 글자 수
 STATUS_CALL_CHARS = 60  # 상태 줄에 보이는 도구 호출 설명 길이
 _TODO_MARK = {"completed": "[green]✔[/]", "in_progress": "[yellow]▶[/]", "pending": "[dim]○[/]"}
-_FILE_PATH = re.compile(r'"file_path"\s*:\s*"([^"]*)"')  # 작성 중인 도구 인자(JSON 조각)에서 경로만 꺼낸다
+# 작성 중인 도구 인자(JSON 조각)에서 경로만 꺼낸다
+_FILE_PATH = re.compile(r'"file_path"\s*:\s*"([^"]*)"')
 
 
 class StatusLine:
     """기다리는 동안 보이는 한 줄: 스피너, 단계(생각 중·작성 중·실행 중), 진행량, 경과 시간.
 
-    rich Status(Spinner + transient Live)로 그리고, 새로 그릴 때마다 __rich__ 로 경과 시간을 다시 센다.
-    Live 가 켜져 있어도 console.print 한 줄은 그 위에 찍히지만, 줄바꿈 없는 토큰 출력과 입력 프롬프트는 상태 줄과
-    섞이므로 그 전에 hide() 한다. enabled 가 아니면(터미널이 아니면) 상태만 기록하고 그리지 않는다.
+    rich Status(Spinner + transient Live)로 그리고,
+    새로 그릴 때마다 __rich__ 로 경과 시간을 다시 센다.
+    Live 가 켜져 있어도 console.print 한 줄은 그 위에 찍히지만,
+    줄바꿈 없는 토큰 출력과 입력 프롬프트는 상태 줄과 섞이므로 그 전에 hide() 한다.
+    enabled 가 아니면(터미널이 아니면) 상태만 기록하고 그리지 않는다.
     """
 
     def __init__(self, console: Console, *, enabled: bool) -> None:
@@ -65,6 +73,7 @@ class StatusLine:
         self.update(label, detail)
 
     def update(self, label: str, detail: str = "") -> None:
+        """단계 글과 진행량만 바꾼다. 경과 시간은 이어 센다. 숨겨져 있으면 다시 보인다."""
         self.label, self.detail = label, detail
         if not self.visible:
             self.visible = True
@@ -72,12 +81,14 @@ class StatusLine:
                 self._status.start()
 
     def hide(self) -> None:
+        """상태 줄을 지운다. 토큰 출력이나 입력 프롬프트 전에 부른다."""
         if self.visible:
             self.visible = False
             if self._status is not None:
                 self._status.stop()
 
     def text(self) -> str:
+        """지금 보일 글: 단계, 진행량, 경과 시간."""
         seconds = int(time.monotonic() - self._started)
         elapsed = f"{seconds // 60}분 {seconds % 60}초" if seconds >= 60 else f"{seconds}초"
         return f"{self.label}{' ' + self.detail if self.detail else ''}… {elapsed}"
@@ -87,18 +98,27 @@ class StatusLine:
 
 
 class Renderer:
-    def __init__(self, console: Console, *, status: bool | None = None, full_reasoning: bool = False) -> None:
-        """status 는 상태 줄을 그릴지다(기본: 콘솔이 터미널일 때). full_reasoning 이면 생각 원문을 다 보인다."""
+    """한 턴의 스트림 조각(on_part)을 터미널에 그린다. 턴마다 새로 만든다."""
+
+    def __init__(self, console: Console, *, status: bool | None = None,
+                 full_reasoning: bool = False) -> None:
+        """status 는 상태 줄을 그릴지다(기본: 콘솔이 터미널일 때).
+
+        full_reasoning 이면 생각 원문을 다 보인다.
+        """
         self.console = console
-        self.status = StatusLine(console, enabled=console.is_terminal if status is None else status)
+        self.status = StatusLine(console,
+                                 enabled=console.is_terminal if status is None else status)
         self.full_reasoning = full_reasoning
         self._streamed: set[str] = set()  # 토큰으로 이미 그린 AI 메시지 id
         self._mid_line = False  # 줄바꿈 없는 토큰 출력 뒤다. 이때 상태 줄은 꺼져 있다
-        self.last_text = ""  # 메인 에이전트의 마지막 AI 텍스트. 턴의 최종 답변으로 트레이스에 남긴다
+        # 메인 에이전트의 마지막 AI 텍스트. 턴의 최종 답변으로 트레이스에 남긴다
+        self.last_text = ""
         self._reasoning = ""  # 아직 찍지 않은 생각의 현재 줄
         self._memo_shown = False  # 현재 줄의 메모를 이미 찍었다(줄이 끝날 때까지 나머지는 버린다)
         self._reasoning_chars = 0  # 이번 모델 호출의 생각 글자 수
-        self._writing: dict[int, list[str]] = {}  # 이번 모델 호출에서 작성 중인 도구 호출: index → [이름, 인자 조각]
+        # 이번 모델 호출에서 작성 중인 도구 호출: index → [이름, 인자 조각]
+        self._writing: dict[int, list[str]] = {}
         self._pending: dict[str, str] = {}  # 결과를 기다리는 도구 호출 id → 설명
 
     def start(self) -> None:
@@ -116,9 +136,11 @@ class Renderer:
         self._wait()
 
     def end_turn(self) -> None:
+        """턴 끝. 남은 생각을 찍고 상태 줄을 지운다."""
         self.pause()
 
     def on_part(self, part: tuple[tuple[str, ...], str, Any]) -> None:
+        """스트림 조각 (ns, mode, data) 하나를 그린다. ns 가 있으면 서브에이전트의 것이다."""
         ns, mode, data = part
         prefix = "[magenta][sub][/] " if ns else ""
         if mode == "messages":
@@ -129,11 +151,15 @@ class Renderer:
             for node, update in data.items():
                 if isinstance(update, dict):
                     self._update(node, update, prefix)
-        elif mode == "custom" and isinstance(data, dict) and data.get("type") == "prompt_migrated":
+        elif (mode == "custom" and isinstance(data, dict)
+              and data.get("type") == "prompt_migrated"):
             self._line(f"{prefix}[yellow]{escape(migration_notice(data))}[/]")
-        elif mode == "custom" and isinstance(data, dict) and data.get("type") == "prompt_store_error":
-            self._line(f"{prefix}[yellow]세션 기록(sessions.db)을 읽거나 쓰지 못해 프롬프트 지문 기록을 건너뛰고 이어 간다"
-                       f"(다른 프로세스가 잠갔을 수 있다): {escape(str(data.get('error', '')))}[/]")
+        elif (mode == "custom" and isinstance(data, dict)
+              and data.get("type") == "prompt_store_error"):
+            self._line(f"{prefix}[yellow]세션 기록(sessions.db)을 읽거나 쓰지 못해 "
+                       "프롬프트 지문 기록을 건너뛰고 이어 간다"
+                       "(다른 프로세스가 잠갔을 수 있다): "
+                       f"{escape(str(data.get('error', '')))}[/]")
 
     def _ai_text(self, message: BaseMessage) -> None:
         """스트리밍 모델은 청크로, 스트리밍하지 않는 모델(대본 모델 등)은 완성된 메시지로 온다."""
@@ -141,7 +167,8 @@ class Renderer:
             if message.id:
                 self._streamed.add(message.id)
             blocks = message.content_blocks
-            reasoning = "".join(str(b.get("reasoning") or "") for b in blocks if b["type"] == "reasoning")
+            reasoning = "".join(str(b.get("reasoning") or "") for b in blocks
+                                if b["type"] == "reasoning")
             if reasoning := reasoning or reasoning_details_text(message):
                 self._think(reasoning)
             for block in blocks:
@@ -173,7 +200,8 @@ class Renderer:
                 if message.tool_calls:
                     self._wait()
             elif recovery_notice(node, message):
-                why = "공급자 오류로 중단됐다" if message.text == RECOVERY_PROMPT_ERROR else "출력 한도에 걸려 잘렸다"
+                why = ("공급자 오류로 중단됐다" if message.text == RECOVERY_PROMPT_ERROR
+                       else "출력 한도에 걸려 잘렸다")
                 self._line(f"{prefix}[yellow]응답이 {why}. 안내를 덧붙여 한 번 다시 요청한다.[/]")
                 self._wait()
             elif budget_stop(node, message):
@@ -189,7 +217,10 @@ class Renderer:
             self._line(todos_markup(update["todos"]))
 
     def _think(self, text: str) -> None:
-        """생각을 줄 단위로 찍는다. 메모 모드는 줄마다 앞 MEMO_CHARS 자만, 그만큼 모이면 줄이 끝나기 전에 찍는다."""
+        """생각을 줄 단위로 찍는다.
+
+        메모 모드는 줄마다 앞 MEMO_CHARS 자만, 그만큼 모이면 줄이 끝나기 전에 찍는다.
+        """
         self._reasoning_chars += len(text)
         self._show("생각 중", f"{self._reasoning_chars:,}자")
         *lines, self._reasoning = (self._reasoning + text).split("\n")
@@ -200,7 +231,8 @@ class Renderer:
 
     def _reasoning_line(self, line: str, *, done: bool = True) -> None:
         if line.strip() and not self._memo_shown:
-            shown = line if self.full_reasoning or len(line) <= MEMO_CHARS else line[:MEMO_CHARS] + "…"
+            shown = (line if self.full_reasoning or len(line) <= MEMO_CHARS
+                     else line[:MEMO_CHARS] + "…")
             self._newline()
             self.console.print(Text(shown.strip(), style="dim italic"), soft_wrap=True)
         self._memo_shown = not done
@@ -221,7 +253,8 @@ class Renderer:
         path = _FILE_PATH.search(args)
         label = " ".join([name or "도구", *([path[1]] if path else []), "작성 중"])
         size = len(args.encode("utf-8"))
-        (self._phase if new else self._show)(label, f"{size / 1024:.1f}KB" if size >= 1024 else f"{size}B")
+        (self._phase if new else self._show)(
+            label, f"{size / 1024:.1f}KB" if size >= 1024 else f"{size}B")
 
     def _wait(self, *, new_phase: bool = True) -> None:
         """도구 결과를 기다리면 '실행 중', 다 받았으면 다음 모델 응답을 기다리는 '생각 중'."""
@@ -270,12 +303,17 @@ class Renderer:
 def migration_notice(event: dict) -> str:
     """resume_compat 의 prompt_migrated 이벤트 안내. 이전은 thread 마다 한 번만 일어난다."""
     if event.get("reason") == "model":
-        return "이 세션은 다른 모델로 시작됐다. 이전 생각 기록은 공급자가 버리고, 캐시를 한 번 새로 쓴다."
-    return "이 세션은 이전 버전의 프롬프트로 시작돼, 이전 대화의 생각 기록을 빼고 이어 간다(캐시를 한 번 새로 쓴다)."
+        return ("이 세션은 다른 모델로 시작됐다. "
+                "이전 생각 기록은 공급자가 버리고, 캐시를 한 번 새로 쓴다.")
+    return ("이 세션은 이전 버전의 프롬프트로 시작돼, "
+            "이전 대화의 생각 기록을 빼고 이어 간다(캐시를 한 번 새로 쓴다).")
 
 
 def reasoning_details_text(message: BaseMessage) -> str:
-    """OpenRouter 청크의 reasoning_details 에 담긴 생각 글. 암호화된 항목(reasoning.encrypted)에는 글이 없다."""
+    """OpenRouter 청크의 reasoning_details 에 담긴 생각 글.
+
+    암호화된 항목(reasoning.encrypted)에는 글이 없다.
+    """
     details = message.additional_kwargs.get("reasoning_details")
     items = details if isinstance(details, list) else []
     texts = [item.get("text") or item.get("summary") for item in items if isinstance(item, dict)]
@@ -283,12 +321,15 @@ def reasoning_details_text(message: BaseMessage) -> str:
 
 
 def rewrites_history(messages: list) -> bool:
-    """[RemoveMessage(REMOVE_ALL), *기록] 형태인지. PatchToolCallsMiddleware 는 승인 중 끊긴 턴 다음 턴 시작에 이렇게
-    기록 전체를 다시 내보낸다. 그대로 그리면 옛 도구 결과와 답변이 다시 찍힌다."""
-    return bool(messages) and isinstance(messages[0], RemoveMessage) and messages[0].id == REMOVE_ALL_MESSAGES
+    """[RemoveMessage(REMOVE_ALL), *기록] 형태인지.
+    PatchToolCallsMiddleware 는 승인 중 끊긴 턴 다음 턴 시작에 이렇게 기록 전체를 다시 내보낸다.
+    그대로 그리면 옛 도구 결과와 답변이 다시 찍힌다."""
+    return (bool(messages) and isinstance(messages[0], RemoveMessage)
+            and messages[0].id == REMOVE_ALL_MESSAGES)
 
 
 def describe_call(call: Mapping[str, Any]) -> str:
+    """도구 호출 한 줄 설명. execute 는 명령, 파일 도구는 경로, 그 밖은 인자 JSON 앞 100자."""
     name, args = call["name"], call.get("args") or {}
     if name == "execute":
         return f"$ {args.get('command', '')}"
@@ -303,12 +344,17 @@ def describe_call(call: Mapping[str, Any]) -> str:
 
 
 def todos_markup(todos: list[dict]) -> str:
-    rows = [f"  {_TODO_MARK.get(t.get('status', ''), '○')} {escape(str(t.get('content', '')))}" for t in todos]
+    """할 일 목록의 rich 마크업. 상태마다 표시(완료·진행·대기)를 붙인다."""
+    rows = [f"  {_TODO_MARK.get(t.get('status', ''), '○')} {escape(str(t.get('content', '')))}"
+            for t in todos]
     return "[bold]할 일[/]\n" + "\n".join(rows) if rows else "[dim]할 일 없음[/]"
 
 
 def describe_action(action: dict) -> RenderableType:
-    """승인 프롬프트에 보일 내용. execute 는 명령, edit_file 은 diff, write_file 은 경로·크기·앞부분."""
+    """승인 프롬프트에 보일 내용.
+
+    execute 는 명령, edit_file 은 diff, write_file 은 경로·크기·앞부분.
+    """
     name, args = action["name"], action.get("args") or {}
     title = Text(f"승인 요청: {name}", style="bold yellow")
     if name == "execute":
@@ -316,13 +362,16 @@ def describe_action(action: dict) -> RenderableType:
     if name == "edit_file":
         diff = difflib.unified_diff(str(args.get("old_string", "")).splitlines(),
                                     str(args.get("new_string", "")).splitlines(),
-                                    fromfile=args.get("file_path", ""), tofile=args.get("file_path", ""), lineterm="")
+                                    fromfile=args.get("file_path", ""),
+                                    tofile=args.get("file_path", ""), lineterm="")
         scope = " (모든 일치 항목)" if args.get("replace_all") else ""
-        return Group(title, Text(f"{args.get('file_path', '')}{scope}"), Syntax("\n".join(diff), "diff"))
+        return Group(title, Text(f"{args.get('file_path', '')}{scope}"),
+                     Syntax("\n".join(diff), "diff"))
     if name == "write_file":
         content = str(args.get("content", ""))
         head = "\n".join(content.splitlines()[:20])
-        return Group(title, Text(f"{args.get('file_path', '')} ({len(content.encode('utf-8'))} bytes)"),
+        return Group(title,
+                     Text(f"{args.get('file_path', '')} ({len(content.encode('utf-8'))} bytes)"),
                      Text(head, style="dim"))
     if name == "delete":
         return Group(title, Text(str(args.get("file_path", "")), style="red"))

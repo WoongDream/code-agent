@@ -95,23 +95,66 @@ def content_sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def project_skill_files(workspace: Path) -> list[Path]:
+    """프로젝트 스킬 파일(.agents/skills/<이름>/SKILL.md). 이름순."""
+    root = workspace / PROJECT_SKILLS.strip("/")
+    try:
+        return sorted(p for p in root.glob("*/SKILL.md") if p.is_file())
+    except OSError:
+        return []
+
+
+def skills_sha256(workspace: Path) -> str | None:
+    """프로젝트 스킬 파일들(상대 경로와 내용)의 sha256. 스킬이 없거나 읽지 못하면 None."""
+    files = project_skill_files(workspace)
+    if not files:
+        return None
+    digest = hashlib.sha256()
+    for path in files:
+        try:
+            body = path.read_bytes()
+        except OSError:
+            return None  # 읽지 못하는 스킬이 있으면 신뢰할 내용을 확정할 수 없다
+        digest.update(path.relative_to(workspace).as_posix().encode("utf-8") + b"\0")
+        digest.update(content_sha256(body).encode("ascii") + b"\0")
+    return digest.hexdigest()
+
+
+def trust_key(agents: bytes | None, skills: str | None) -> str | None:
+    """신뢰 결정을 남기는 키. 프로젝트 AGENTS.md 와 프로젝트 스킬이 하나라도 바뀌면 달라진다.
+
+    스킬이 없으면 AGENTS.md 내용의 sha256 그대로다. 둘 다 없으면 None.
+    """
+    agents_sha = None if agents is None else content_sha256(agents)
+    if skills is None:
+        return agents_sha
+    return hashlib.sha256(f"{agents_sha or ''}\n{skills}".encode("ascii")).hexdigest()
+
+
 @dataclass
 class MemoryTrust:
-    """프로젝트 /AGENTS.md 를 메모리로 읽어도 되는 내용.
+    """프로젝트 /AGENTS.md 와 프로젝트 스킬을 읽어도 되는 내용.
 
     App 이 새 thread 를 시작할 때(시작, /new) 사람에게 묻고 정한다(cli.App.start_memory).
     agent 와 같은 객체를 나눠 쓰고, AgentMemoryMiddleware 가 thread 의 첫 요청 때 본다.
     파일이 그사이 바뀌면 해시가 달라 읽지 않는다.
 
     Attributes:
-        sha256: 신뢰한 내용의 해시(content_sha256). None 이면 프로젝트 AGENTS.md 를 읽지 않는다.
+        sha256: 신뢰한 AGENTS.md 내용의 해시(content_sha256). None 이면 읽지 않는다.
+        skills_sha256: 신뢰한 프로젝트 스킬들의 해시(memory.skills_sha256). None 이면 프로젝트
+            스킬 폴더를 읽지 않는다. 스킬 설명도 system 에 들어가므로 AGENTS.md 와 같이 정한다.
     """
 
     sha256: str | None = None
+    skills_sha256: str | None = None
 
     def allows(self, data: bytes) -> bool:
         """이 내용을 읽어도 되는지."""
         return self.sha256 is not None and self.sha256 == content_sha256(data)
+
+    def allows_skills(self, workspace: Path) -> bool:
+        """지금 디스크의 프로젝트 스킬이 신뢰한 내용 그대로인지."""
+        return self.skills_sha256 is not None and self.skills_sha256 == skills_sha256(workspace)
 
 
 def _emit(event: dict[str, Any]) -> None:
@@ -226,13 +269,37 @@ def _without_missing(update: SkillsStateUpdate | None) -> SkillsStateUpdate | No
     return SkillsStateUpdate(skills_metadata=update["skills_metadata"], skills_load_errors=errors)
 
 
+def _source_path(source: Any) -> str:
+    """deepagents 의 소스(경로 문자열 또는 (경로, 이름))의 경로."""
+    return source if isinstance(source, str) else source[0]
+
+
 class QuietSkillsMiddleware(SkillsMiddleware):
     """스킬 폴더가 없는 것을 오류로 보지 않는 SkillsMiddleware.
 
     기본 구현은 없는 폴더마다 'Cannot load skills from ...' 를 system 의 경고 절에 넣는다.
     스킬 폴더는 대부분 없으므로 그 경고는 매번 system 을 늘리는 잡음이다. 다른 오류는 그대로 둔다.
     이름이 SkillsMiddleware 라 create_deep_agent(skills=...) 의 기본 것을 그 자리에서 바꾼다.
+
+    프로젝트 스킬(PROJECT_SKILLS)은 저장소가 심을 수 있어 AGENTS.md 와 같이 신뢰(trust)한 내용일
+    때만 읽는다(S11). 스킬 설명은 system 에 그대로 들어가기 때문이다. trust 가 없으면 프로젝트
+    스킬은 읽지 않는다.
+
+    Args:
+        trust: 프로젝트 스킬을 읽어도 되는 내용(MemoryTrust).
+        workspace: 작업 폴더. trust 와 디스크의 스킬 해시를 비교하는 데 쓴다.
     """
+
+    def __init__(self, *, backend: BackendProtocol, sources: Sequence[tuple[str, str]],
+                 trust: MemoryTrust | None = None, workspace: Path | None = None) -> None:
+        super().__init__(backend=backend, sources=list(sources))
+        self.trust = trust if trust is not None else MemoryTrust()
+        self.workspace = workspace
+
+    def _allowed_sources(self) -> list:
+        """이번 로드에서 읽을 소스. 신뢰하지 않은 프로젝트 스킬은 뺀다."""
+        trusted = self.workspace is not None and self.trust.allows_skills(self.workspace)
+        return [s for s in self.sources if trusted or _source_path(s) != PROJECT_SKILLS]
 
     @property
     def name(self) -> str:
@@ -242,12 +309,24 @@ class QuietSkillsMiddleware(SkillsMiddleware):
     def before_agent(self, state: SkillsState, runtime: Runtime,
                      config: RunnableConfig) -> SkillsStateUpdate | None:
         """thread 의 첫 요청이면 스킬 목록을 읽는다. 없는 폴더의 오류는 뺀다."""
-        return _without_missing(super().before_agent(state, runtime, config))
+        if state.get("skills_metadata") is not None:
+            return None
+        full, self.sources = self.sources, self._allowed_sources()
+        try:
+            return _without_missing(super().before_agent(state, runtime, config))
+        finally:
+            self.sources = full
 
     async def abefore_agent(self, state: SkillsState, runtime: Runtime,
                             config: RunnableConfig) -> SkillsStateUpdate | None:
         """before_agent 의 비동기판."""
-        return _without_missing(await super().abefore_agent(state, runtime, config))
+        if state.get("skills_metadata") is not None:
+            return None
+        full, self.sources = self.sources, self._allowed_sources()
+        try:
+            return _without_missing(await super().abefore_agent(state, runtime, config))
+        finally:
+            self.sources = full
 
 
 @contextmanager

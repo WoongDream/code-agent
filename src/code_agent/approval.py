@@ -206,12 +206,17 @@ def normalize_path(path: str) -> str:
     역슬래시를 / 로 바꾸고, 앞에 / 를 붙이고, 빈 조각과 '.' 을 빼고, 대소문자를 접는다(Windows 는
     대소문자를 가리지 않는다). 폴더 표시인 끝의 / 는 남긴다. 예: 'Src/./A.py' → '/src/a.py'.
     """
+    return _clean_path(path).casefold()
+
+
+def _clean_path(path: str) -> str:
+    """normalize_path 에서 대소문자를 접기 전의 것(정확한 이름을 가릴 때 쓴다)."""
     text = path.strip().replace("\\", "/")
     parts = [part for part in text.split("/") if part not in ("", ".")]
     normal = "/" + "/".join(parts)
     if parts and text.endswith("/"):
         normal += "/"
-    return normal.casefold()
+    return normal
 
 
 @lru_cache(maxsize=256)
@@ -259,8 +264,16 @@ def is_user_memory(path: str) -> bool:
 
 
 def is_memory_file(path: str) -> bool:
-    """메모리 파일(사용자 공통 메모리 폴더 또는 프로젝트 /AGENTS.md)인지."""
-    return is_user_memory(path) or normalize_path(path) == PROJECT_MEMORY.casefold()
+    """계획 승인 전 차단과 범위 재승인에서 빼는 메모리 파일인지.
+
+    백엔드가 실제로 메모리로 라우팅하는 이름만 맞춘다. 경로를 정리한 뒤(역슬래시·'.') 대소문자까지
+    정확히 /.code-agent-user/ 아래이거나 /AGENTS.md 여야 한다.
+    대소문자만 다른 /.CODE-AGENT-USER/x.py 는 백엔드에서 작업 폴더의 일반 파일이라 면제하면
+    계획 규칙을 우회한다. 묻는 쪽(is_user_memory)은
+    넓게 잡아 한 번 더 묻는 것뿐이라 안전하다.
+    """
+    normal = _clean_path(path)
+    return normal.startswith(USER_MEMORY_ROUTE) or normal == PROJECT_MEMORY
 
 
 def _memory_write(name: str, args: Mapping) -> bool:

@@ -161,10 +161,10 @@ def build_agent(settings: Settings, workspace: Path, checkpointer: BaseCheckpoin
                          "make_backend(memory_dir=...) 로 만든다.")
     # 메모리·스킬은 deepagents 의 기본 것과 이름이 같아 그 자리(system 의 맨 끝)를 대신한다.
     # 지문은 그 두 절도 본다(system_parts).
-    memory = AgentMemoryMiddleware(backend=backend, sources=MEMORY_SOURCES,
-                                   trust=memory_trust if memory_trust is not None
-                                   else MemoryTrust())
-    skills = QuietSkillsMiddleware(backend=backend,
+    trust = memory_trust if memory_trust is not None else MemoryTrust()
+    memory = AgentMemoryMiddleware(backend=backend, sources=MEMORY_SOURCES, trust=trust)
+    # 프로젝트 스킬도 AGENTS.md 와 같은 신뢰 결정을 따른다
+    skills = QuietSkillsMiddleware(backend=backend, trust=trust, workspace=workspace,
                                    sources=[(path, SKILL_LABELS[path]) for path in SKILL_SOURCES])
     # 잘림 복구는 맨 앞이어야 after_model 이 예산 미들웨어의 호출 집계 뒤에 돈다
     # (after_model 은 역순).

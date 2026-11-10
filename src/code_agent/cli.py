@@ -42,17 +42,20 @@ from code_agent.environment import probe, render
 from code_agent.localtrace import LocalTracer, run_dir, trace_view
 from code_agent.memory import (
     MEMORY_FILE,
+    PROJECT_MEMORY,
     REMEMBER_DONE,
     WARN_CHARS,
     MemoryTrust,
-    content_sha256,
     decode_memory,
     library_logs,
     loaded_chars,
     memory_report,
     pending_chars,
+    project_skill_files,
     read_memory,
     remember_prompt,
+    skills_sha256,
+    trust_key,
 )
 from code_agent.planning import (
     PLAN_PREFIX,
@@ -101,6 +104,8 @@ YOLO_WARNING = ("[bold red]yolo 모드: 파일 쓰기와 셸 명령을 묻지 �
                 "셸은 샌드박스가 아니다.[/]")
 
 MEMORY_PREVIEW_LINES = 15  # 신뢰를 물을 때 보일 AGENTS.md 앞부분
+MEMORY_PREVIEW_WIDTH = 120  # 그 한 줄의 최대 글자 수
+NOT_REMEMBERED = "메모리에 쓴 것이 없다."
 
 ReadLine = Callable[[str], str]
 _USAGE_COLUMNS = [(f.name, "REAL" if f.type == "float" else "INTEGER") for f in fields(Usage)]
@@ -177,23 +182,29 @@ class Sessions:
             total += Usage(**dict(zip((name for name, _ in _USAGE_COLUMNS), row, strict=True)))
         return total, len(rows)
 
+    @staticmethod
+    def _workspace_key(workspace: Path) -> str:
+        """결정을 묶는 작업 폴더 이름. 같은 폴더를 다른 철자(대소문자·상대 경로)로 열어도 같다."""
+        return os.path.normcase(str(Path(workspace).resolve()))
+
     def memory_decision(self, workspace: Path, sha256: str) -> bool | None:
         """이 작업 폴더의 이 내용(sha256)인 AGENTS.md 를 신뢰했는지. 정한 적이 없으면 None."""
         row = self.conn.execute("SELECT trusted FROM code_agent_trusted_memory "
                                 "WHERE workspace = ? AND sha256 = ?",
-                                (str(workspace), sha256)).fetchone()
+                                (self._workspace_key(workspace), sha256)).fetchone()
         return bool(row[0]) if row else None
 
     def trusted_before(self, workspace: Path) -> bool:
         """이 작업 폴더의 AGENTS.md 를 (다른 내용일 때라도) 신뢰한 적이 있는지."""
         return self.conn.execute("SELECT 1 FROM code_agent_trusted_memory "
                                  "WHERE workspace = ? AND trusted = 1",
-                                 (str(workspace),)).fetchone() is not None
+                                 (self._workspace_key(workspace),)).fetchone() is not None
 
     def decide_memory(self, workspace: Path, sha256: str, trusted: bool) -> None:
         """프로젝트 AGENTS.md 를 메모리로 읽을지 정한 결정을 남긴다."""
         self.conn.execute("INSERT OR REPLACE INTO code_agent_trusted_memory VALUES (?, ?, ?, ?)",
-                          (str(workspace), sha256, int(trusted), datetime.now(UTC).isoformat()))
+                          (self._workspace_key(workspace), sha256, int(trusted),
+                           datetime.now(UTC).isoformat()))
         self.conn.commit()
 
 
@@ -242,7 +253,10 @@ class App:
         # 파이프·테스트(StringIO)에서는 상태 줄을 그리지 않는다
         self.status_line = console.is_terminal and _interactive()
         self.full_thinking = False  # /thinking
-        self._refused_memory: set[str] = set()  # 이 프로세스에서 거절한 AGENTS.md 내용(sha256)
+        self._refused_memory: set[str] = set()  # 이 프로세스에서 거절한 AGENTS.md·스킬(trust_key)
+        self._memory_written = False  # 이번 턴에 메모리 파일 쓰기가 실행됐는지
+        self._project_written = False  # 그중 프로젝트 /AGENTS.md 쓰기가 있었는지
+        self._own_write_ok = False  # 이 thread 의 프로젝트 메모리가 신뢰했거나 없던 것인지
 
     @property
     def config(self) -> RunnableConfig:
@@ -344,7 +358,8 @@ class App:
             self.show_trace(arg)
         elif name == "/remember":
             self.turn(remember_prompt(arg))
-            self.console.print(f"[dim]{REMEMBER_DONE}[/]")
+            done = REMEMBER_DONE if self._memory_written else NOT_REMEMBERED
+            self.console.print(f"[dim]{done}[/]")
         elif name == "/memory":
             self.show_memory()
         elif name == "/thinking":
@@ -376,6 +391,7 @@ class App:
                             full_reasoning=self.full_thinking)
         stops = TurnStops()
         meter = UsageCallback()
+        self._memory_written = self._project_written = False
         tags = [self.workspace.name, f"mode:{self.mode}", f"model:{self.settings.model}"]
         trace_context: Any = nullcontext()
         if self.tracer is not None:
@@ -399,6 +415,7 @@ class App:
                 return decisions
 
             def on_part(part: tuple) -> None:
+                self._note_memory_write(part)
                 renderer.on_part(part)
                 stops.on_part(part)
                 if trace is not None:
@@ -428,11 +445,20 @@ class App:
             if trace is not None:
                 trace.end(output=renderer.last_text, usage=meter.usage, error=error,
                           warnings=warnings, retries=stops.recoveries, interrupted=interrupted)
+        if self._project_written:
+            self.trust_own_write()
         for notice in tracer_notices(self.tracer):  # 로컬 트레이스 기록 실패 등(한 번만)
             self.console.print(f"[dim]{escape(notice)}[/]", soft_wrap=True)
         if meter.usage.calls:  # 중단·오류로 끝난 턴도 쓴 만큼은 남긴다
             self.sessions.add_usage(self.thread_id, meter.usage)
             self.console.print(f"[dim]{escape(meter.usage.summary())}[/]")
+
+    def _note_memory_write(self, part: tuple) -> None:
+        """스트림 조각이 memory_write 사건이면 이번 턴의 쓰기 기록에 남긴다."""
+        if (len(part) == 3 and part[1] == "custom" and isinstance(part[2], dict)
+                and part[2].get("type") == "memory_write"):
+            self._memory_written = True
+            self._project_written |= part[2].get("scope") == "project"
 
     def _trace_context(self) -> str:
         """Langfuse 평가기에 줄 이전 턴 요약(worklog.session_context).
@@ -522,58 +548,109 @@ class App:
         """thread 를 시작할 때(시작, /new) 메모리를 준비한다.
 
         이미 메모리를 읽은 thread(--resume)는 그대로 쓴다(state 의 memory_contents). 아직 읽지 않은
-        thread 는 프로젝트 AGENTS.md 신뢰를 정한다(trust_project_memory).
+        thread 는 프로젝트 AGENTS.md·스킬 신뢰를 정한다(trust_project_memory).
         첫 요청 때 읽힐 합계가 WARN_CHARS 를 넘으면 노란 줄로 알린다.
         매 요청 system 에 들어가 캐시 읽기 비용이 늘기 때문이다.
         """
         values = self.agent.get_state(self.config).values
         total = loaded_chars(values)
+        absent = read_memory(self.workspace / MEMORY_FILE) is None
         if total is None:
-            self.memory_trust.sha256 = self.trust_project_memory()
+            self.trust_project_memory()
             total = pending_chars(workspace=self.workspace, data_dir=self.settings.data_dir,
                                   trust=self.memory_trust)
+            self._own_write_ok = self.memory_trust.sha256 is not None or absent
+        else:
+            contents = values.get("memory_contents")
+            self._own_write_ok = absent or (isinstance(contents, dict)
+                                            and PROJECT_MEMORY in contents)
         if total > WARN_CHARS:
             self.console.print(f"[yellow]메모리(AGENTS.md)가 합쳐 {total:,}자다"
                                f"({WARN_CHARS:,}자 초과). 매 요청 시스템 프롬프트에 들어가 "
                                "비용이 는다. 줄이려면 /memory 로 위치를 확인하라.[/]")
 
-    def trust_project_memory(self) -> str | None:
-        """프로젝트 AGENTS.md 를 메모리로 읽을지 정해 읽어도 되는 내용의 sha256 을 돌려준다.
+    def trust_project_memory(self) -> None:
+        """프로젝트 AGENTS.md 와 프로젝트 스킬을 읽을지 정해 memory_trust 에 담는다.
 
         저장소가 심은 지시가 system 에 들어가지 않게, 처음 보는(또는 바뀐) 내용이면 y/N 을 묻는다
-        (S11). 신뢰한 결정은 sessions.db 에 남아 같은 내용이면 다시 묻지 않는다. 거절은 이 프로세스
-        동안만 기억하고 다음 실행 때 다시 묻는다. 대화형이 아니면 묻지 않고 읽지 않는다.
+        (S11). AGENTS.md 와 스킬 설명은 둘 다 system 에 들어가므로 한 번에 묻고, 하나라도 바뀌면
+        다시 묻는다. 신뢰한 결정은 sessions.db 에 남아 같은 내용이면 다시 묻지 않는다. 거절은 이
+        프로세스 동안만 기억하고 다음 실행 때 다시 묻는다. 대화형이 아니면 묻지 않고 읽지 않는다.
+        내용이 빈 AGENTS.md 는 스킬이 없으면 묻지 않는다.
+        """
+        trust = self.memory_trust
+        trust.sha256 = trust.skills_sha256 = None
+        data = read_memory(self.workspace / MEMORY_FILE)
+        skills = skills_sha256(self.workspace)
+        if data is not None and not decode_memory(data).strip() and skills is None:
+            trust.sha256 = trust_key(data, None)  # 읽어도 system 에 넣을 것이 없다
+            return
+        key = trust_key(data, skills)
+        if key is None:
+            return
+        if self.sessions.memory_decision(self.workspace, key) or self._ask_trust(
+                key, data, skills):
+            trust.skills_sha256 = skills
+            trust.sha256 = None if data is None else trust_key(data, None)
 
-        Returns:
-            읽어도 되는 AGENTS.md 내용의 sha256. 파일이 없거나 신뢰하지 않으면 None.
+    def _ask_trust(self, key: str, data: bytes | None, skills: str | None) -> bool:
+        """프로젝트 AGENTS.md·스킬을 신뢰할지 사람에게 묻는다. 물을 수 없으면 거짓."""
+        text = "" if data is None else decode_memory(data)
+        count = len(project_skill_files(self.workspace)) if skills is not None else 0
+        extra = f", 스킬 {count}개 포함" if count else ""
+        what = f"프로젝트 AGENTS.md({'없음' if data is None else f'{len(text):,}자'}{extra})"
+        if key in self._refused_memory:
+            self.console.print(f"[dim]{what}는 이번 실행에서 거절해 메모리로 읽지 않는다.[/]")
+            return False
+        if not self.interactive:
+            self.console.print(f"[dim]{what}는 신뢰를 확인하지 않아 메모리로 읽지 않는다"
+                               "(대화형으로 실행하면 묻는다).[/]")
+            return False
+        changed = ("내용이 바뀌었다. " if self.sessions.trusted_before(self.workspace) else "")
+        self.console.print(f"[bold yellow]{changed}이 프로젝트에 AGENTS.md 나 스킬이 있다.[/] "
+                           "메모리로 읽으면 매 요청 시스템 프롬프트에 들어가 에이전트가 지시로 "
+                           "참고한다.")
+        self.console.print(Text(self._trust_preview(text, skills is not None), style="dim"))
+        trusted = self._yes_no(f"이 {what}를 메모리로 읽을까? [y/N] › ")
+        self.sessions.decide_memory(self.workspace, key, trusted)
+        if not trusted:
+            self._refused_memory.add(key)
+            self.console.print("[dim]읽지 않는다. 이 세션 메모리에서 뺐다.[/]")
+        return trusted
+
+    def _trust_preview(self, text: str, has_skills: bool) -> str:
+        """신뢰를 물을 때 보일 앞부분. 제어 문자를 빼고 긴 줄과 긴 파일을 줄인다.
+
+        저장소가 심은 파일이라 터미널 제어 문자로 질문 화면을 지우거나 가리지 못하게 한다.
+        """
+        def clip(line: str) -> str:
+            return (line if len(line) <= MEMORY_PREVIEW_WIDTH
+                    else line[:MEMORY_PREVIEW_WIDTH] + "…")
+
+        lines = strip_controls(text).splitlines()
+        shown = [clip(line) for line in lines[:MEMORY_PREVIEW_LINES]]
+        if len(lines) > MEMORY_PREVIEW_LINES:
+            shown.append(f"… 나머지 {len(lines) - MEMORY_PREVIEW_LINES}줄 생략")
+        if has_skills:
+            for path in project_skill_files(self.workspace):
+                name = strip_controls(path.relative_to(self.workspace).as_posix())
+                shown.append(clip(f"스킬 {name}{_description(path)}"))
+        return "\n".join(shown)
+
+    def trust_own_write(self) -> None:
+        """에이전트가 프로젝트 /AGENTS.md 를 쓴 뒤의 내용을 이 작업 폴더에서 신뢰한 것으로 남긴다.
+
+        실행된 쓰기(승인 모드를 거친 것)라 다음 /new 가 방금 쓴 내용을 다시 묻지 않게 한다.
+        thread 를 시작할 때 신뢰했거나 없던 파일일 때만 남긴다. 거절한 파일에 덧붙인 것을 신뢰하면
+        거절한 내용까지 읽게 된다. 스킬은 신뢰한 그대로일 때만 함께 남긴다.
         """
         data = read_memory(self.workspace / MEMORY_FILE)
-        if data is None:
-            return None
-        sha = content_sha256(data)
-        if self.sessions.memory_decision(self.workspace, sha):
-            return sha
-        chars = len(decode_memory(data))
-        if sha in self._refused_memory:
-            self.console.print(f"[dim]프로젝트 AGENTS.md({chars:,}자)는 이번 실행에서 거절해 "
-                               "메모리로 읽지 않는다.[/]")
-            return None
-        if not self.interactive:
-            self.console.print(f"[dim]프로젝트 AGENTS.md({chars:,}자)는 신뢰를 확인하지 않아 "
-                               "메모리로 읽지 않는다(대화형으로 실행하면 묻는다).[/]")
-            return None
-        changed = ("내용이 바뀌었다. " if self.sessions.trusted_before(self.workspace) else "")
-        preview = "\n".join(decode_memory(data).splitlines()[:MEMORY_PREVIEW_LINES])
-        self.console.print(f"[bold yellow]{changed}이 프로젝트에 AGENTS.md 가 있다.[/] 메모리로 "
-                           "읽으면 매 요청 시스템 프롬프트에 들어가 에이전트가 지시로 참고한다.")
-        self.console.print(Text(preview, style="dim"))
-        trusted = self._yes_no(f"이 프로젝트 AGENTS.md({chars:,}자)를 메모리로 읽을까? [y/N] › ")
-        self.sessions.decide_memory(self.workspace, sha, trusted)
-        if not trusted:
-            self._refused_memory.add(sha)
-            self.console.print("[dim]읽지 않는다. 이 세션 메모리에서 뺐다.[/]")
-            return None
-        return sha
+        skills = skills_sha256(self.workspace)
+        key = trust_key(data, skills)
+        if (key is None or data is None or not self._own_write_ok
+                or (skills is not None and not self.memory_trust.allows_skills(self.workspace))):
+            return
+        self.sessions.decide_memory(self.workspace, key, True)
 
     def _yes_no(self, prompt: str) -> bool:
         """y 면 참. 그냥 Enter 나 n 이면 거짓(기본 No). 다른 입력이면 다시 묻는다."""
@@ -643,6 +720,17 @@ class App:
             self.console.print("[dim]변경 없음[/]")
         else:
             self.console.print(Syntax(text, "diff"))
+
+
+def _description(path: Path) -> str:
+    """스킬 파일의 description 줄(없으면 빈 글). 신뢰를 물을 때 보인다."""
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines()[:20]:
+            if line.startswith("description:"):
+                return " — " + strip_controls(line.removeprefix("description:").strip())
+    except OSError:
+        pass
+    return ""
 
 
 def _interactive() -> bool:

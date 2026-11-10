@@ -865,11 +865,11 @@ def test_exempt_paths_are_exact_but_asking_is_broad() -> None:
 
 
 def test_own_project_memory_write_is_trusted_next_new(tmp_path: Path) -> None:
-    """에이전트가 쓴 프로젝트 AGENTS.md 는 다음 /new 에서 다시 묻지 않는다."""
+    """사람이 직접 승인한 프로젝트 AGENTS.md 쓰기는 다음 /new 에서 다시 묻지 않는다."""
     def remember(messages: list[BaseMessage]) -> AIMessage:
         return tool_call("write_file", {"file_path": "/AGENTS.md", "content": "- 규칙\n"})
 
-    app, _, _, script = memory_app(tmp_path, [remember, DONE], "/mode auto-edit", "/remember",
+    app, _, _, script = memory_app(tmp_path, [remember, DONE], "/remember", "y",
                                    "/new", "/exit", interactive=True)
     app.run()
     written = "- 규칙\n".encode()
@@ -877,6 +877,24 @@ def test_own_project_memory_write_is_trusted_next_new(tmp_path: Path) -> None:
     assert not [p for p in script.prompts if p.startswith(TRUST_PROMPT_HEAD)]
     assert app.sessions.memory_decision(app.workspace, content_sha256(written)) is True
     assert app.memory_trust.sha256 == content_sha256(written)
+
+
+@pytest.mark.parametrize("mode", ["auto-edit", "yolo"])
+def test_auto_approved_project_memory_write_is_not_trusted(tmp_path: Path, mode: str) -> None:
+    """자동 승인된 쓰기는 신뢰로 남기지 않는다.
+
+    작업 폴더의 지시로 에이전트가 AGENTS.md 를 만들면 다음 /new 에서 신뢰 확인(S11)을 받아야 한다.
+    """
+    def remember(messages: list[BaseMessage]) -> AIMessage:
+        return tool_call("write_file", {"file_path": "/AGENTS.md", "content": "- 심은 규칙\n"})
+
+    app, _, _, script = memory_app(tmp_path, [remember, DONE], f"/mode {mode}", "/remember",
+                                   "/new", "n", "/exit", interactive=True)
+    app.run()
+    written = "- 심은 규칙\n".encode()
+    assert (tmp_path / "ws" / "AGENTS.md").read_bytes() == written
+    assert len([p for p in script.prompts if p.startswith(TRUST_PROMPT_HEAD)]) == 1
+    assert app.sessions.memory_decision(app.workspace, content_sha256(written)) is not True
 
 
 def test_own_write_does_not_trust_refused_file(tmp_path: Path) -> None:

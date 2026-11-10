@@ -35,6 +35,8 @@ from code_agent.approval import (
     PlanContext,
     ask_reason,
     decide_all,
+    is_memory_file,
+    is_user_memory,
     reject,
 )
 from code_agent.backend import process_shell_env, resolve_shell, safe_which
@@ -256,6 +258,10 @@ class App:
         self._refused_memory: set[str] = set()  # 이 프로세스에서 거절한 AGENTS.md·스킬(trust_key)
         self._memory_written = False  # 이번 턴에 메모리 파일 쓰기가 실행됐는지
         self._project_written = False  # 그중 프로젝트 /AGENTS.md 쓰기가 있었는지
+        # 이번 턴에 사람이 직접 승인한 프로젝트 /AGENTS.md 쓰기가 있었는지.
+        # auto-edit·yolo 의 자동 승인은 세지 않는다. 작업 폴더의 지시로 에이전트가 쓴 내용이
+        # 신뢰 확인(S11) 없이 신뢰되면 안 된다
+        self._project_approved_by_user = False
         self._own_write_ok = False  # 이 thread 의 프로젝트 메모리가 신뢰했거나 없던 것인지
 
     @property
@@ -391,8 +397,8 @@ class App:
                             full_reasoning=self.full_thinking)
         stops = TurnStops()
         meter = UsageCallback()
-        self._memory_written = self._project_written = False
-        tags = [self.workspace.name, f"mode:{self.mode}", f"model:{self.settings.model}"]
+        self._memory_written = self._project_written = self._project_approved_by_user = False
+        tags =[self.workspace.name, f"mode:{self.mode}", f"model:{self.settings.model}"]
         trace_context: Any = nullcontext()
         if self.tracer is not None:
             trace_context = self.tracer.turn(text, session_id=self.thread_id, tags=tags,
@@ -408,9 +414,13 @@ class App:
                     renderer.pause()  # 상태 줄이 승인 프롬프트와 입력 화면을 깨지 않게 멈춘다
                     return self.ask(action, plan)
 
+                def on_decision(action: dict, decision: dict, auto: bool) -> None:
+                    self._note_memory_approval(action, decision, auto)
+                    if trace is not None:
+                        trace.decision(action, decision, auto)
+
                 decisions = decide_all(action_requests, self.mode, ask,
-                                       on_decision=trace.decision if trace is not None else None,
-                                       plan=plan)
+                                       on_decision=on_decision, plan=plan)
                 renderer.resume()
                 return decisions
 
@@ -445,13 +455,23 @@ class App:
             if trace is not None:
                 trace.end(output=renderer.last_text, usage=meter.usage, error=error,
                           warnings=warnings, retries=stops.recoveries, interrupted=interrupted)
-        if self._project_written:
+        if self._project_written and self._project_approved_by_user:
             self.trust_own_write()
         for notice in tracer_notices(self.tracer):  # 로컬 트레이스 기록 실패 등(한 번만)
             self.console.print(f"[dim]{escape(notice)}[/]", soft_wrap=True)
         if meter.usage.calls:  # 중단·오류로 끝난 턴도 쓴 만큼은 남긴다
             self.sessions.add_usage(self.thread_id, meter.usage)
             self.console.print(f"[dim]{escape(meter.usage.summary())}[/]")
+
+    def _note_memory_approval(self, action: dict, decision: dict, auto: bool) -> None:
+        """사람이 직접 승인한 프로젝트 /AGENTS.md 쓰기면 이번 턴 기록에 남긴다.
+
+        trust_own_write 를 부르는 조건이다.
+        """
+        path = str((action.get("args") or {}).get("file_path", ""))
+        if (not auto and decision.get("type") == "approve" and is_memory_file(path)
+                and not is_user_memory(path)):
+            self._project_approved_by_user = True
 
     def _note_memory_write(self, part: tuple) -> None:
         """스트림 조각이 memory_write 사건이면 이번 턴의 쓰기 기록에 남긴다."""
@@ -640,7 +660,8 @@ class App:
     def trust_own_write(self) -> None:
         """에이전트가 프로젝트 /AGENTS.md 를 쓴 뒤의 내용을 이 작업 폴더에서 신뢰한 것으로 남긴다.
 
-        실행된 쓰기(승인 모드를 거친 것)라 다음 /new 가 방금 쓴 내용을 다시 묻지 않게 한다.
+        사람이 직접 승인한 쓰기일 때만 불린다(_note_memory_approval). 다음 /new 가 방금 승인한
+        내용을 다시 묻지 않게 한다.
         thread 를 시작할 때 신뢰했거나 없던 파일일 때만 남긴다. 거절한 파일에 덧붙인 것을 신뢰하면
         거절한 내용까지 읽게 된다. 스킬은 신뢰한 그대로일 때만 함께 남긴다.
         """

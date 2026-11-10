@@ -1,0 +1,9 @@
+# 버그 수정. 기존 fixture(tests/fixtures/buggy_repo)의 사본이다.
+# 판정: 숨김 시험(빈 목록, 원소 하나, 짝수·홀수, 음수, 실수)이 통과하고 원래 시험 파일이 그대로여야 한다
+# (시험을 고쳐 통과시키면 실패).
+prompt = "실패하는 시험을 찾아 고쳐줘."
+timeout_s = 600
+# 예상 비용(USD, Opus 5.5 · OpenRouter, task10 추정의 위쪽 값). 실행 전 안내에 쓴다
+est_cost = 0.3
+# 기본 허용(python -m pytest, uv run pytest, python) 밖에 더 승인할 명령 접두어
+allow = ["pytest", "uv run python -m pytest"]

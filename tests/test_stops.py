@@ -1,4 +1,7 @@
-"""말없이 멈추지 않기: 잘린 응답의 자동 복구(턴당 1번), 턴 끝 경고, 예산 상한 도달 표시. 모델은 대본이다."""
+"""말없이 멈추지 않기: 잘린 응답의 자동 복구(턴당 1번), 턴 끝 경고, 예산 상한 도달 표시.
+
+모델은 대본이다.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -46,11 +49,16 @@ FULL = "응답이 출력 한도(64,000토큰)에 걸려 잘렸다."
 THINKING_ONLY = "생각만 하다 한도를 다 써서 답변도 도구 호출도 없다."
 
 
-def truncated(text: str = "", *, out: int = 64000, reason: tuple[str, str] = ("finish_reason", "length"),
+def truncated(text: str = "", *, out: int = 64000,
+              reason: tuple[str, str] = ("finish_reason", "length"),
               calls: list | None = None) -> AIMessage:
-    """az-quiz 세션의 첫 응답 모양: 출력 한도까지 생각만 하고 텍스트·도구 호출이 없다(OpenRouter)."""
-    return AIMessage(content=text, tool_calls=calls or [], additional_kwargs={"reasoning_content": "퀴즈 150개를…"},
-                     usage_metadata={"input_tokens": 100, "output_tokens": out, "total_tokens": 100 + out,
+    """az-quiz 세션의 첫 응답 모양:
+    출력 한도까지 생각만 하고 텍스트·도구 호출이 없다(OpenRouter).
+    """
+    return AIMessage(content=text, tool_calls=calls or [],
+                     additional_kwargs={"reasoning_content": "퀴즈 150개를…"},
+                     usage_metadata={"input_tokens": 100, "output_tokens": out,
+                                     "total_tokens": 100 + out,
                                      "output_token_details": {"reasoning": out}},
                      response_metadata=dict([reason]))
 
@@ -77,22 +85,28 @@ def test_thinking_only_truncation_is_retried_with_appended_notice(tmp_path: Path
     h = Harness(tmp_path, [step, AIMessage(content="quizzes.js 를 나눠 썼다")])
     h.run("퀴즈 150개 만들어")
     first, retry = h.model.calls
-    # 앞쪽 기록은 그대로다. 바뀌는 것은 방금 나온 잘린 응답(마지막 메시지)뿐이고 그 뒤에 안내가 붙는다
+    # 앞쪽 기록은 그대로다.
+    # 바뀌는 것은 방금 나온 잘린 응답(마지막 메시지)뿐이고 그 뒤에 안내가 붙는다
     assert retry[:len(first)] == first
     cut, notice = retry[len(first):]
     assert isinstance(cut, AIMessage) and cut.id == step.id  # 같은 id 로 제자리 교체
-    assert "reasoning_content" not in cut.additional_kwargs and "reasoning_details" not in cut.additional_kwargs
+    assert ("reasoning_content" not in cut.additional_kwargs
+            and "reasoning_details" not in cut.additional_kwargs)
     assert cut.text == PLACEHOLDER_LENGTH
     assert cut.response_metadata["finish_reason"] == "length"
-    assert cut.response_metadata["code_agent_stripped"] == {"reasoning_chars": len("퀴즈 150개를…"),
-                                                            "dropped_tool_calls": []}
-    assert isinstance(notice, HumanMessage) and notice.text == RECOVERY_PROMPT and is_recovery(notice)
+    assert cut.response_metadata["code_agent_stripped"] == {
+        "reasoning_chars": len("퀴즈 150개를…"), "dropped_tool_calls": []}
+    assert (isinstance(notice, HumanMessage) and notice.text == RECOVERY_PROMPT
+            and is_recovery(notice))
     final = h.agent.get_state({"configurable": {"thread_id": "t"}}).values["messages"][-1]
     assert final.text == "quizzes.js 를 나눠 썼다"
 
 
 def test_retry_is_once_per_turn(tmp_path: Path) -> None:
-    """두 번째도 잘리면 턴을 끝낸다(대본이 2단계라 세 번째 호출이 오면 ScriptExhausted). 다음 턴은 다시 1번 받는다."""
+    """두 번째도 잘리면 턴을 끝낸다(대본이 2단계라 세 번째 호출이 오면 ScriptExhaustedError).
+
+    다음 턴은 다시 1번 받는다.
+    """
     h = Harness(tmp_path, [truncated(), truncated()])
     h.run("만들어")
     assert len(h.model.calls) == 2
@@ -104,7 +118,8 @@ def test_retry_is_once_per_turn(tmp_path: Path) -> None:
 
 def test_cut_only_tool_call_is_held_then_retried(tmp_path: Path) -> None:
     """잘린 응답의 유일한 호출은 실행하지 않는다. 남는 유효 호출이 없으니 정리하고 다시 부른다."""
-    h = Harness(tmp_path, [truncated(calls=[{"name": "ls", "args": {"path": "/"}, "id": "c1", "type": "tool_call"}]),
+    h = Harness(tmp_path, [truncated(calls=[{"name": "ls", "args": {"path": "/"}, "id": "c1",
+                                             "type": "tool_call"}]),
                            AIMessage(content="끝")])
     h.run()
     request = h.model.calls[-1]
@@ -113,7 +128,8 @@ def test_cut_only_tool_call_is_held_then_retried(tmp_path: Path) -> None:
     assert "ls 호출 인자가 잘려 실행하지 않았다" in request[-2].text
 
 
-def test_retry_counts_against_model_call_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_retry_counts_against_model_call_budget(tmp_path: Path,
+                                                monkeypatch: pytest.MonkeyPatch) -> None:
     """복구는 모델 호출 상한이 이번 호출을 센 뒤에 돌고, 루프 입구로 돌아가 상한 검사를 거친다."""
     lower_budget(monkeypatch, model_calls=1)
     h = Harness(tmp_path, [truncated()])
@@ -125,11 +141,13 @@ def test_retry_counts_against_model_call_budget(tmp_path: Path, monkeypatch: pyt
 
 def test_cli_warns_when_retry_is_truncated_again(tmp_path: Path) -> None:
     tracer = FakeTracer()
-    app, _, out, _ = make_app(tmp_path, [truncated(), truncated()], "퀴즈 만들어", "/exit", tracer=tracer)
+    app, _, out, _ = make_app(tmp_path, [truncated(), truncated()], "퀴즈 만들어", "/exit",
+                              tracer=tracer)
     app.run()
     text = out.getvalue()
     assert "안내를 덧붙여 한 번 다시 요청한다" in text  # 다시 부르는 순간에도 알린다
-    warning = f"{FULL} 자동으로 한 번 다시 요청했지만 또 잘렸다. {THINKING_ONLY} '계속해줘'로 이어 갈 수 있다."
+    warning = (f"{FULL} 자동으로 한 번 다시 요청했지만 또 잘렸다. {THINKING_ONLY} "
+               "'계속해줘'로 이어 갈 수 있다.")
     assert warning in text
     assert text.index(warning) < text.index("모델 2회")  # 사용량 줄보다 먼저
     assert tracer.turns[0].ended["warnings"] == [warning]
@@ -137,11 +155,13 @@ def test_cli_warns_when_retry_is_truncated_again(tmp_path: Path) -> None:
 
 def test_cli_notes_recovered_truncation(tmp_path: Path) -> None:
     tracer = FakeTracer()
-    app, _, out, _ = make_app(tmp_path, [truncated(), AIMessage(content="다 썼다")], "만들어", "/exit", tracer=tracer)
+    app, _, out, _ = make_app(tmp_path, [truncated(), AIMessage(content="다 썼다")], "만들어",
+                              "/exit", tracer=tracer)
     app.run()
     text = out.getvalue()
     assert "다 썼다" in text
-    assert "응답 1개가 출력 한도(64,000토큰)에 걸려 잘렸다. 자동으로 한 번 다시 요청해 이어 갔다." in text
+    assert ("응답 1개가 출력 한도(64,000토큰)에 걸려 잘렸다. "
+            "자동으로 한 번 다시 요청해 이어 갔다.") in text
     assert tracer.turns[0].ended["output"] == "다 썼다"
 
 
@@ -150,13 +170,16 @@ def test_partial_answer_cut_by_anthropic_max_tokens(tmp_path: Path) -> None:
              truncated("또 앞부분", out=1234, reason=("stop_reason", "max_tokens"))]
     app, model, out, _ = make_app(tmp_path, steps, "설명해", "/exit")
     app.run()
-    assert "응답이 출력 한도(1,234토큰)에 걸려 잘렸다. 자동으로 한 번 다시 요청했지만 또 잘렸다. 답변이 중간에 끊겼다." in out.getvalue()
-    assert model.calls[1][-1].text == RECOVERY_PROMPT_CUT  # 답변이 끊긴 경우는 이어서 마무리하라는 안내
+    assert ("응답이 출력 한도(1,234토큰)에 걸려 잘렸다. "
+            "자동으로 한 번 다시 요청했지만 또 잘렸다. 답변이 중간에 끊겼다.") in out.getvalue()
+    # 답변이 끊긴 경우는 이어서 마무리하라는 안내
+    assert model.calls[1][-1].text == RECOVERY_PROMPT_CUT
 
 
 def test_normal_turn_has_no_warning(tmp_path: Path) -> None:
     tracer = FakeTracer()
-    app, _, out, _ = make_app(tmp_path, [AIMessage(content="안녕", response_metadata={"finish_reason": "stop"})],
+    app, _, out, _ = make_app(tmp_path, [AIMessage(content="안녕",
+                                                   response_metadata={"finish_reason": "stop"})],
                               "하이", "/exit", tracer=tracer)
     app.run()
     assert "출력 한도" not in out.getvalue()
@@ -169,9 +192,12 @@ def test_normal_turn_has_no_warning(tmp_path: Path) -> None:
     ({"tool_calls": 1}, [tool_calls(("ls", {"path": "/"}), ("ls", {"path": "/"}))],
      "Tool call limit reached: run limit exceeded (2/1 calls)."),
 ])
-def test_budget_stop_is_shown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limits: dict, steps: list,
-                              message: str) -> None:
-    """예산 미들웨어의 종료 메시지는 model 노드가 아니라 미들웨어 노드에서 나온다. 전에는 화면에 보이지 않았다."""
+def test_budget_stop_is_shown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limits: dict,
+                              steps: list, message: str) -> None:
+    """예산 미들웨어의 종료 메시지는 model 노드가 아니라 미들웨어 노드에서 나온다.
+
+    전에는 화면에 보이지 않았다.
+    """
     lower_budget(monkeypatch, **limits)
     tracer = FakeTracer()
     app, _, out, _ = make_app(tmp_path, steps, "go", "/exit", mode="yolo", tracer=tracer)
@@ -194,7 +220,8 @@ def test_turn_stops_ignores_subagents() -> None:
 def test_session_context_keeps_recovery_in_same_turn(tmp_path: Path) -> None:
     previous = [HumanMessage("퀴즈 만들어"), truncated(),
                 HumanMessage(RECOVERY_PROMPT, name="truncation-recovery"),
-                AIMessage(content="", tool_calls=[{"name": "write_file", "args": {"file_path": "/q.js", "content": "x"},
+                AIMessage(content="", tool_calls=[{"name": "write_file",
+                                                   "args": {"file_path": "/q.js", "content": "x"},
                                                    "id": "w", "type": "tool_call"}]),
                 ToolMessage(content="ok", tool_call_id="w"), AIMessage(content="됐다")]
     assert session_context(previous, None).splitlines() == [
@@ -203,7 +230,8 @@ def test_session_context_keeps_recovery_in_same_turn(tmp_path: Path) -> None:
 
 def test_worklog_warning_section_follows_answer() -> None:
     text = WorkLog().render(answer="", changes=[], diff="", warnings=[f"{FULL} {THINKING_ONLY}"])
-    assert text.startswith(f"## 최종 답변\n(없음)\n\n## 경고\n- {FULL} {THINKING_ONLY}\n\n## 실행한 도구")
+    assert text.startswith(f"## 최종 답변\n(없음)\n\n## 경고\n- {FULL} {THINKING_ONLY}\n\n"
+                           "## 실행한 도구")
 
 
 def test_real_sdk_marks_turn_as_warning(tmp_path: Path) -> None:
@@ -213,8 +241,8 @@ def test_real_sdk_marks_turn_as_warning(tmp_path: Path) -> None:
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
     exporter = InMemorySpanExporter()
-    client = Langfuse(public_key="pk-lf-test-stops", secret_key="sk-lf-test", base_url="http://127.0.0.1:9",
-                      span_exporter=exporter)
+    client = Langfuse(public_key="pk-lf-test-stops", secret_key="sk-lf-test",
+                      base_url="http://127.0.0.1:9", span_exporter=exporter)
     app, _, _, _ = make_app(tmp_path, [truncated(), truncated()], "만들어", "/exit",
                             tracer=LangfuseTracer(client, public_key="pk-lf-test-stops"))
     app.run()
@@ -225,8 +253,12 @@ def test_real_sdk_marks_turn_as_warning(tmp_path: Path) -> None:
     assert f"## 경고\n- {FULL}" in attrs[A.OBSERVATION_OUTPUT]
 
 
-def test_recovery_runs_after_budget_count_and_reenters_through_budget_check(tmp_path: Path) -> None:
-    """실제 그래프 간선으로 순서를 고정한다. deepagents 가 사용자 미들웨어를 끼우는 자리가 바뀌면 여기서 잡힌다."""
+def test_recovery_runs_after_budget_count_and_reenters_through_budget_check(
+        tmp_path: Path) -> None:
+    """실제 그래프 간선으로 순서를 고정한다.
+
+    deepagents 가 사용자 미들웨어를 끼우는 자리가 바뀌면 여기서 잡힌다.
+    """
     h = Harness(tmp_path, [])
     builder = h.agent.builder
 
@@ -238,10 +270,12 @@ def test_recovery_runs_after_budget_count_and_reenters_through_budget_check(tmp_
     chain, node = [], "model"
     while (node := next_after_model(node)) is not None:
         chain.append(node)
-    # after_model 은 역순으로 돈다. 복구가 루프 출구(마지막)이고 모델 호출 상한의 집계가 그보다 먼저다
+    # after_model 은 역순으로 돈다.
+    # 복구가 루프 출구(마지막)이고 모델 호출 상한의 집계가 그보다 먼저다
     assert chain[-1] == "TruncationRecoveryMiddleware.after_model"
     assert "ModelCallLimitMiddleware.after_model" in chain[:-1]
-    # 출구에서 jump_to "model" 은 루프 입구로 간다. 그 입구가 모델 호출 상한 검사다(도구 뒤에 돌아가는 곳과 같다)
+    # 출구에서 jump_to "model" 은 루프 입구로 간다.
+    # 그 입구가 모델 호출 상한 검사다(도구 뒤에 돌아가는 곳과 같다)
     [exit_branch] = builder.branches["TruncationRecoveryMiddleware.after_model"].values()
     [tools_branch] = builder.branches["tools"].values()
     assert set(tools_branch.ends) == {"ModelCallLimitMiddleware.before_model"}
@@ -249,23 +283,33 @@ def test_recovery_runs_after_budget_count_and_reenters_through_budget_check(tmp_
 
 
 def test_approved_text_with_tool_call_is_shown_once(tmp_path: Path) -> None:
-    """HITL after_model 은 승인 뒤 같은 응답을 다시 내보낸다. 예산 메시지로 오인해 노랗게 다시 찍으면 안 된다."""
+    """HITL after_model 은 승인 뒤 같은 응답을 다시 내보낸다.
+
+    예산 메시지로 오인해 노랗게 다시 찍으면 안 된다.
+    """
     step = AIMessage(content="파일을 만든다", tool_calls=[
-        {"name": "write_file", "args": {"file_path": "/a.txt", "content": "A"}, "id": "w1", "type": "tool_call"}])
+        {"name": "write_file", "args": {"file_path": "/a.txt", "content": "A"}, "id": "w1",
+         "type": "tool_call"}])
     tracer = FakeTracer()
-    app, _, out, _ = make_app(tmp_path, [step, AIMessage(content="끝")], "만들어", "y", "/exit", tracer=tracer)
+    app, _, out, _ = make_app(tmp_path, [step, AIMessage(content="끝")], "만들어", "y", "/exit",
+                              tracer=tracer)
     app.run()
     assert out.getvalue().count("파일을 만든다") == 1
     assert tracer.turns[0].ended["output"] == "끝"
 
 
 def interrupted_then_next_turn(tmp_path: Path, first: list) -> tuple[str, list, FakeTracer]:
-    """first 단계 뒤 execute 승인 프롬프트에서 Ctrl+C 로 끊고, 다음 턴을 돌린다. (두 번째 턴 화면, 두 번째 턴 모델 입력)."""
+    """first 단계 뒤 execute 승인 프롬프트에서 Ctrl+C 로 끊고, 다음 턴을 돌린다.
+
+    (두 번째 턴 화면, 두 번째 턴 모델 입력).
+    """
     execute = AIMessage(content="명령을 돌린다", tool_calls=[
-        {"name": "execute", "args": {"command": "uv run pytest"}, "id": "x1", "type": "tool_call"}])
+        {"name": "execute", "args": {"command": "uv run pytest"}, "id": "x1",
+         "type": "tool_call"}])
     tracer = FakeTracer()
     app, model, out, _ = make_app(tmp_path, [*first, execute, AIMessage(content="새 답")],
-                                  "먼저", "다음", KeyboardInterrupt(), "또", "/exit", tracer=tracer)
+                                  "먼저", "다음", KeyboardInterrupt(), "또", "/exit",
+                                  tracer=tracer)
     (app.workspace / "a.txt").write_text("UNIQUE-CONTENT", encoding="utf-8")
     app.run()
     text = out.getvalue()
@@ -273,7 +317,9 @@ def interrupted_then_next_turn(tmp_path: Path, first: list) -> tuple[str, list, 
 
 
 def test_history_rewrite_after_interrupted_approval_is_not_redrawn(tmp_path: Path) -> None:
-    """승인 중 끊긴 턴 다음 턴에 PatchToolCalls 가 기록 전체를 다시 내보내도 옛 답변·도구 결과를 다시 찍지 않는다."""
+    """승인 중 끊긴 턴 다음 턴에 PatchToolCalls 가 기록 전체를 다시 내보내도
+    옛 답변·도구 결과를 다시 찍지 않는다.
+    """
     first = [tool_call("read_file", {"file_path": "/a.txt"}), AIMessage(content="옛 답변")]
     after, history, tracer = interrupted_then_next_turn(tmp_path, first)
     # 시나리오 확인: 끊긴 호출에 PatchToolCalls 가 결과를 채워 기록을 다시 썼다
@@ -285,41 +331,46 @@ def test_history_rewrite_after_interrupted_approval_is_not_redrawn(tmp_path: Pat
 
 
 def test_old_recovery_notice_is_not_redrawn_or_recounted(tmp_path: Path) -> None:
-    after, history, tracer = interrupted_then_next_turn(tmp_path, [AIMessage(content="옛 답변"), truncated()])
+    after, history, tracer = interrupted_then_next_turn(
+        tmp_path, [AIMessage(content="옛 답변"), truncated()])
     assert sum(is_recovery(m) for m in history) == 1  # 옛 안내가 기록에 있다
     assert "안내를 덧붙여 한 번 다시 요청한다" not in after
     stops = TurnStops()
-    stops.on_part(((), "updates", {"PatchToolCallsMiddleware.before_agent": {"messages": history}}))
+    stops.on_part(((), "updates",
+                   {"PatchToolCallsMiddleware.before_agent": {"messages": history}}))
     assert stops.recoveries == 0
     assert tracer.turns[-1].ended["warnings"] == []
 
 
 # --- 멈춘 응답 정리(K1·K2·K3)와 정지 사유 3분류 ---
 
-def stopped(text: str = "", reason: tuple[str, str] = ("finish_reason", "length"), *, calls: list | None = None,
-            invalid: list | None = None) -> AIMessage:
+def stopped(text: str = "", reason: tuple[str, str] = ("finish_reason", "length"), *,
+            calls: list | None = None, invalid: list | None = None) -> AIMessage:
     """OpenRouter 모양의 멈춘 응답. reasoning_content 와 reasoning_details 에 같은 생각이 있다."""
     message = truncated(text, reason=reason, calls=calls)
-    message.additional_kwargs["reasoning_details"] = [{"type": "reasoning.text", "text": "퀴즈 150개를…",
+    message.additional_kwargs["reasoning_details"] = [{"type": "reasoning.text",
+                                                       "text": "퀴즈 150개를…",
                                                        "signature": "sig", "index": 0}]
     message.invalid_tool_calls = invalid or []
     return message
 
 
 def half_written(call_id: str = "w1") -> dict:
-    return {"name": "write_file", "args": '{"file_path": "/quizzes.js", "content": "const q = [', "id": call_id,
-            "error": None, "type": "invalid_tool_call"}
+    return {"name": "write_file", "args": '{"file_path": "/quizzes.js", "content": "const q = [',
+            "id": call_id, "error": None, "type": "invalid_tool_call"}
 
 
 @pytest.mark.parametrize(("meta", "expected"), [
     ({"finish_reason": "length"}, "length"), ({"stop_reason": "max_tokens"}, "max_tokens"),
     ({"finish_reason": "error"}, "error"), ({"stop_reason": "model_context_window_exceeded"},
                                             "model_context_window_exceeded"),
-    ({"finish_reason": "stop"}, None), ({"stop_reason": "refusal"}, None), ({"finish_reason": "content_filter"}, None),
+    ({"finish_reason": "stop"}, None), ({"stop_reason": "refusal"}, None),
+    ({"finish_reason": "content_filter"}, None),
 ])
 def test_stop_sets(meta: dict, expected: str | None) -> None:
     assert stop_reason(AIMessage(content="", response_metadata=meta)) == expected
-    assert sum(expected in s for s in (STOP_LENGTH, STOP_ERROR, STOP_CONTEXT)) == (expected is not None)
+    assert (sum(expected in s for s in (STOP_LENGTH, STOP_ERROR, STOP_CONTEXT))
+            == (expected is not None))
 
 
 def test_partial_text_kept_with_marker(tmp_path: Path) -> None:
@@ -331,7 +382,10 @@ def test_partial_text_kept_with_marker(tmp_path: Path) -> None:
 
 
 def test_anthropic_thinking_blocks_removed() -> None:
-    """서명이 있는 thinking 도, 잘려 서명이 빈 thinking(K1)도, redacted_thinking 도 뺀다. 텍스트 블록만 남긴다."""
+    """서명이 있는 thinking 도, 잘려 서명이 빈 thinking(K1)도, redacted_thinking 도 뺀다.
+
+    텍스트 블록만 남긴다.
+    """
     blocks = [{"type": "thinking", "thinking": "생각 A", "signature": "sig"},
               {"type": "thinking", "thinking": "생각 B", "signature": ""},
               {"type": "redacted_thinking", "data": "xx"}, {"type": "text", "text": "부분"}]
@@ -339,20 +393,26 @@ def test_anthropic_thinking_blocks_removed() -> None:
     cut = strip_stopped(AIMessage(content=blocks, response_metadata=meta, id="a1"))
     assert cut is not None and cut.id == "a1"
     assert cut.content == "부분\n\n[출력 한도로 여기서 잘림]"
-    assert cut.response_metadata["code_agent_stripped"]["reasoning_chars"] == len("생각 A") + len("생각 B")
+    assert (cut.response_metadata["code_agent_stripped"]["reasoning_chars"]
+            == len("생각 A") + len("생각 B"))
     thinking_only = strip_stopped(AIMessage(content=blocks[:2], response_metadata=meta))
     assert thinking_only is not None and thinking_only.content == PLACEHOLDER_LENGTH
 
 
 def test_second_truncation_stripped_without_retry(tmp_path: Path) -> None:
-    """복구 뒤에도 잘리면 다시 부르지 않고 정리만 한다. 다음 턴 요청에는 잘린 생각이 하나도 실리지 않는다."""
+    """복구 뒤에도 잘리면 다시 부르지 않고 정리만 한다.
+
+    다음 턴 요청에는 잘린 생각이 하나도 실리지 않는다.
+    """
     h = Harness(tmp_path, [stopped(), stopped(), AIMessage(content="이어서 했다")])
     h.run("만들어")
     assert len(h.model.calls) == 2
     h.run("계속해줘")
     request = h.model.calls[-1]
-    assert not any(key in m.additional_kwargs for m in request for key in ("reasoning_content", "reasoning_details"))
-    assert [m.text for m in request if isinstance(m, AIMessage)] == [PLACEHOLDER_LENGTH, PLACEHOLDER_LENGTH]
+    assert not any(key in m.additional_kwargs for m in request
+                   for key in ("reasoning_content", "reasoning_details"))
+    assert ([m.text for m in request if isinstance(m, AIMessage)]
+            == [PLACEHOLDER_LENGTH, PLACEHOLDER_LENGTH])
 
 
 @pytest.mark.parametrize("finish", ["tool_calls", "stop"])
@@ -360,8 +420,8 @@ def test_normal_finish_tool_calls_untouched(tmp_path: Path, finish: str) -> None
     """멈추지 않은(정상) 응답의 도구 호출은 그대로 실행하고 메시지도 바꾸지 않는다(회귀 방지)."""
     step = AIMessage(content="", response_metadata={"finish_reason": finish},
                      additional_kwargs={"reasoning_content": "생각"}, tool_calls=[
-                         {"name": "write_file", "args": {"file_path": "/a.txt", "content": "A"}, "id": "w",
-                          "type": "tool_call"}])
+                         {"name": "write_file", "args": {"file_path": "/a.txt", "content": "A"},
+                          "id": "w", "type": "tool_call"}])
     h = Harness(tmp_path, [step, AIMessage(content="끝")], [APPROVE])
     h.run()
     assert (h.workspace / "a.txt").read_text(encoding="utf-8") == "A"
@@ -371,7 +431,8 @@ def test_normal_finish_tool_calls_untouched(tmp_path: Path, finish: str) -> None
 
 def test_stripped_message_not_rendered(tmp_path: Path) -> None:
     tracer = FakeTracer()
-    app, _, out, _ = make_app(tmp_path, [stopped(), AIMessage(content="끝")], "만들어", "/exit", tracer=tracer)
+    app, _, out, _ = make_app(tmp_path, [stopped(), AIMessage(content="끝")], "만들어", "/exit",
+                              tracer=tracer)
     app.run()
     assert "기록에서 뺐다" not in out.getvalue()
     assert tracer.turns[0].ended["output"] == "끝"
@@ -396,8 +457,10 @@ def test_request_dicts_both_providers() -> None:
 
     cut = strip_stopped(stopped(invalid=[half_written()]))
     assert cut is not None
-    retry = [HumanMessage("만들어"), cut, HumanMessage(RECOVERY_PROMPT, name="truncation-recovery")]
-    dicts, _ = ChatOpenRouter(model="anthropic/claude-opus-5.5", api_key="k")._create_message_dicts(retry, None)
+    retry = [HumanMessage("만들어"), cut,
+             HumanMessage(RECOVERY_PROMPT, name="truncation-recovery")]
+    dicts, _ = ChatOpenRouter(model="anthropic/claude-opus-5.5",
+                              api_key="k")._create_message_dicts(retry, None)
     [assistant] = [d for d in dicts if d["role"] == "assistant"]
     assert not {"reasoning", "reasoning_details", "tool_calls"} & assistant.keys()
     assert "write_file 호출 인자가 잘려 실행하지 않았다" in assistant["content"]
@@ -409,7 +472,10 @@ def test_request_dicts_both_providers() -> None:
 
 
 def test_invalid_only_call_dropped(tmp_path: Path) -> None:
-    """도구 인자를 쓰다 잘리고 유효한 호출이 없으면 잘린 호출을 뺀다. 가짜 결과도 붙지 않는다(K2)."""
+    """도구 인자를 쓰다 잘리고 유효한 호출이 없으면 잘린 호출을 뺀다.
+
+    가짜 결과도 붙지 않는다(K2).
+    """
     h = Harness(tmp_path, [stopped(invalid=[half_written()]), AIMessage(content="끝")])
     h.run()
     request = h.model.calls[1]
@@ -421,12 +487,14 @@ def test_invalid_only_call_dropped(tmp_path: Path) -> None:
 
 
 def test_mixed_calls_sanitized(tmp_path: Path) -> None:
-    """유효한 호출이 남으면 메시지는 두고 잘린 호출의 인자만 "{}" 로. langchain 이 '인자가 잘렸다' 결과를 붙인다.
+    """유효한 호출이 남으면 메시지는 두고 잘린 호출의 인자만 "{}" 로.
+    langchain 이 '인자가 잘렸다' 결과를 붙인다.
 
     잘린 호출(w2)이 이미 invalid 로 왔으므로 그 앞의 완결된 호출(c1, c3)은 둘 다 실행한다.
     """
     step = stopped(calls=[{"name": "ls", "args": {"path": "/"}, "id": "c1", "type": "tool_call"},
-                          {"name": "ls", "args": {"path": "/sub"}, "id": "c3", "type": "tool_call"}],
+                          {"name": "ls", "args": {"path": "/sub"}, "id": "c3",
+                           "type": "tool_call"}],
                    invalid=[half_written("w2")])
     h = Harness(tmp_path, [step, AIMessage(content="끝")])
     h.run()
@@ -441,24 +509,31 @@ def test_mixed_calls_sanitized(tmp_path: Path) -> None:
 
 def test_hold_cut_call() -> None:
     calls = [{"name": "read_file", "args": {"file_path": "/a"}, "id": "r", "type": "tool_call"},
-             {"name": "write_file", "args": {"file_path": "/b", "content": "1\n2"}, "id": "w", "type": "tool_call"}]
+             {"name": "write_file", "args": {"file_path": "/b", "content": "1\n2"}, "id": "w",
+              "type": "tool_call"}]
     held = hold_cut_call(stopped(calls=calls))
     assert held is not None and [c["id"] for c in held.tool_calls] == ["r"]
     assert [(c["id"], c["args"]) for c in held.invalid_tool_calls] == [("w", "{}")]
     assert held.response_metadata["code_agent_held_call"] == "write_file"
-    normal = AIMessage(content="", tool_calls=calls, response_metadata={"finish_reason": "tool_calls"})
+    normal = AIMessage(content="", tool_calls=calls,
+                       response_metadata={"finish_reason": "tool_calls"})
     assert hold_cut_call(normal) is None and hold_cut_call(stopped()) is None
 
 
 def cut_call(name: str, args: dict, *, before: list | None = None) -> AIMessage:
-    """출력 한도로 멈췄지만 langchain 이 잘린 인자를 고쳐 유효한 호출이 된 응답(실측 모양). before 는 그 앞의 완결된 호출."""
-    return stopped(calls=[*(before or []), {"name": name, "args": args, "id": "cut", "type": "tool_call"}])
+    """출력 한도로 멈췄지만 langchain 이 잘린 인자를 고쳐 유효한 호출이 된 응답(실측 모양).
+
+    before 는 그 앞의 완결된 호출.
+    """
+    return stopped(calls=[*(before or []),
+                          {"name": name, "args": args, "id": "cut", "type": "tool_call"}])
 
 
 def test_cut_write_file_is_not_asked_in_manual_mode(tmp_path: Path) -> None:
     """잘린 write_file 은 승인을 묻지도 실행하지도 않는다. 모델이 다시 쓴 호출만 묻는다."""
     steps = [cut_call("write_file", {"file_path": "/numbers.txt", "content": "1\n2\n3\n4"}),
-             tool_call("write_file", {"file_path": "/numbers.txt", "content": "1\n2\n3\n4\n5\n"}), AIMessage(content="끝")]
+             tool_call("write_file", {"file_path": "/numbers.txt", "content": "1\n2\n3\n4\n5\n"}),
+             AIMessage(content="끝")]
     app, _, out, script = make_app(tmp_path, steps, "만들어", "y", "/exit")
     app.run()
     assert script.prompts.count("[y] 승인 / [n] 거부 › ") == 1
@@ -472,8 +547,8 @@ def test_cut_write_file_is_not_asked_in_manual_mode(tmp_path: Path) -> None:
     ("edit_file", {"file_path": "/app.py", "old_string": "x = 1", "new_string": "x = 2 if"}),
 ])
 def test_cut_file_call_changes_nothing_in_auto_edit(tmp_path: Path, name: str, args: dict) -> None:
-    app, _, _, _ = make_app(tmp_path, [cut_call(name, args), AIMessage(content="끝")], "고쳐", "/exit",
-                            mode="auto-edit")
+    app, _, _, _ = make_app(tmp_path, [cut_call(name, args), AIMessage(content="끝")], "고쳐",
+                            "/exit", mode="auto-edit")
     (app.workspace / "app.py").write_text("x = 1\n", encoding="utf-8")
     app.run()
     assert not (app.workspace / "new.txt").exists()
@@ -482,7 +557,8 @@ def test_cut_file_call_changes_nothing_in_auto_edit(tmp_path: Path, name: str, a
 
 def test_parallel_complete_call_runs_and_cut_call_is_blocked(tmp_path: Path) -> None:
     read = {"name": "read_file", "args": {"file_path": "/a.txt"}, "id": "r1", "type": "tool_call"}
-    h = Harness(tmp_path, [cut_call("write_file", {"file_path": "/b.txt", "content": "절"}, before=[read]),
+    h = Harness(tmp_path, [cut_call("write_file", {"file_path": "/b.txt", "content": "절"},
+                                    before=[read]),
                            AIMessage(content="끝")])
     (h.workspace / "a.txt").write_text("A-CONTENT", encoding="utf-8")
     h.run()
@@ -504,14 +580,18 @@ def test_cut_execute_never_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
         return real(self, command, *args, **kwargs)
 
     monkeypatch.setattr(WindowsShellBackend, "execute", counting)
-    app, _, _, _ = make_app(tmp_path, [cut_call("execute", {"command": "rm -rf build && echo x > made.txt"}),
-                                       AIMessage(content="끝")], "정리해", "/exit", mode="yolo")
+    app, _, _, _ = make_app(tmp_path,
+                            [cut_call("execute", {"command": "rm -rf build && echo x > made.txt"}),
+                             AIMessage(content="끝")], "정리해", "/exit", mode="yolo")
     app.run()
     assert ran == [] and not (app.workspace / "made.txt").exists()
 
 
 def test_openrouter_error_chunk_finishes_silently() -> None:
-    """choices 가 있는 오류 청크는 예외 없이 finish_reason="error" 로 끝난다. 그래서 STOP_ERROR 로 다룬다."""
+    """choices 가 있는 오류 청크는 예외 없이 finish_reason="error" 로 끝난다.
+
+    그래서 STOP_ERROR 로 다룬다.
+    """
     pytest.importorskip("langchain_openrouter")
     from langchain_openrouter import ChatOpenRouter
 
@@ -525,9 +605,11 @@ def test_openrouter_error_chunk_finishes_silently() -> None:
     class Chat:
         def send(self, **params):
             yield Chunk({"id": "gen-1", "model": "anthropic/claude-opus-5.5",
-                         "choices": [{"index": 0, "delta": {"role": "assistant", "content": "하던 "}}]})
+                         "choices": [{"index": 0,
+                                      "delta": {"role": "assistant", "content": "하던 "}}]})
             yield Chunk({"id": "gen-1", "error": {"message": "upstream", "code": 502},
-                         "choices": [{"index": 0, "delta": {"content": "중"}, "finish_reason": "error"}]})
+                         "choices": [{"index": 0, "delta": {"content": "중"},
+                                      "finish_reason": "error"}]})
 
     class Client:
         chat = Chat()
@@ -543,25 +625,28 @@ def test_error_finish_recovered_once(tmp_path: Path) -> None:
     h = Harness(tmp_path, [stopped("하던 중", reason=error), AIMessage(content="끝")])
     h.run()
     cut, notice = h.model.calls[1][-2:]
-    assert cut.text == "하던 중\n\n[공급자 오류로 여기서 끊김]" and notice.text == RECOVERY_PROMPT_ERROR
+    assert (cut.text == "하던 중\n\n[공급자 오류로 여기서 끊김]"
+            and notice.text == RECOVERY_PROMPT_ERROR)
     # 출력 한도와 복구 1회를 함께 쓴다: 잘린 뒤 오류가 나면 더 부르지 않는다
     (tmp_path / "b").mkdir()
     h = Harness(tmp_path / "b", [stopped(), stopped(reason=error)])
     h.run()
     assert len(h.model.calls) == 2
     (tmp_path / "c").mkdir()
-    app, _, out, _ = make_app(tmp_path / "c", [stopped(reason=error), stopped(reason=error)], "해줘", "/exit")
+    app, _, out, _ = make_app(tmp_path / "c", [stopped(reason=error), stopped(reason=error)],
+                              "해줘", "/exit")
     app.run()
     text = out.getvalue()
     assert "응답이 공급자 오류로 중단됐다. 안내를 덧붙여 한 번 다시 요청한다." in text
-    assert ("응답이 공급자 오류로 중단됐다. 자동으로 한 번 다시 요청했지만 또 멈췄다. 답변도 도구 호출도 없다. "
-            "'계속해줘'로 이어 갈 수 있다.") in text
+    assert ("응답이 공급자 오류로 중단됐다. 자동으로 한 번 다시 요청했지만 또 멈췄다. "
+            "답변도 도구 호출도 없다. '계속해줘'로 이어 갈 수 있다.") in text
 
 
 def test_context_window_not_retried(tmp_path: Path) -> None:
     context = ("stop_reason", "model_context_window_exceeded")
     tracer = FakeTracer()
-    app, model, out, _ = make_app(tmp_path, [stopped(reason=context)], "해줘", "/exit", tracer=tracer)
+    app, model, out, _ = make_app(tmp_path, [stopped(reason=context)], "해줘", "/exit",
+                                  tracer=tracer)
     app.run()
     assert len(model.calls) == 1
     final = app.agent.get_state(app.config).values["messages"][-1]
@@ -583,8 +668,8 @@ def test_hold_skips_when_cut_call_already_invalid(tmp_path: Path) -> None:
 
 
 def cut_response() -> AIMessage:
-    return stopped(calls=[{"name": "write_file", "args": {"file_path": "/x", "content": "1\n2"}, "id": "w",
-                           "type": "tool_call"}])
+    return stopped(calls=[{"name": "write_file", "args": {"file_path": "/x", "content": "1\n2"},
+                           "id": "w", "type": "tool_call"}])
 
 
 def held_of(result) -> AIMessage:
@@ -595,8 +680,9 @@ def held_of(result) -> AIMessage:
 
 @pytest.mark.parametrize("shape", ["response", "message", "extended"])
 def test_hold_handles_every_model_call_result_shape(shape: str) -> None:
-    """안쪽 미들웨어는 ModelResponse·AIMessage·ExtendedModelResponse 중 무엇이든 돌려줄 수 있다(SkillsMiddleware 는
-    항상 Extended). 동기·비동기 모두 같은 모양으로 돌려주고 잘린 호출은 막는다."""
+    """안쪽 미들웨어는 ModelResponse·AIMessage·ExtendedModelResponse 중 무엇이든 돌려줄 수
+    있다(SkillsMiddleware 는 항상 Extended).
+    동기·비동기 모두 같은 모양으로 돌려주고 잘린 호출은 막는다."""
     def result():
         response = ModelResponse(result=[cut_response()])
         return {"response": response, "message": response.result[0],
@@ -616,16 +702,20 @@ def test_hold_handles_every_model_call_result_shape(shape: str) -> None:
 
 @pytest.mark.parametrize("inner", ["extended", "message"])
 def test_hold_with_inner_middleware_in_real_agent(inner: str) -> None:
-    """실제 create_agent 에서 우리보다 안쪽 미들웨어가 Extended·AIMessage 를 돌려줘도 실패하지 않고 막는다."""
+    """실제 create_agent 에서 우리보다 안쪽 미들웨어가 Extended·AIMessage 를 돌려줘도
+    실패하지 않고 막는다.
+    """
     from langchain.agents import create_agent
 
     class Inner(AgentMiddleware):
         def wrap_model_call(self, request, handler):
             response = handler(request)
-            return ExtendedModelResponse(model_response=response) if inner == "extended" else response.result[0]
+            return (ExtendedModelResponse(model_response=response) if inner == "extended"
+                    else response.result[0])
 
     model = ScriptedChatModel(steps=[cut_response(), AIMessage(content="끝")])
-    agent = create_agent(model=model, tools=[], middleware=[TruncationRecoveryMiddleware(), Inner()])
+    agent = create_agent(model=model, tools=[],
+                         middleware=[TruncationRecoveryMiddleware(), Inner()])
     state = agent.invoke({"messages": [HumanMessage("써줘")]})
     first = next(m for m in state["messages"] if isinstance(m, AIMessage))
     assert first.tool_calls == [] and "write_file 호출 인자가 잘려 실행하지 않았다" in first.text

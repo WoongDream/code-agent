@@ -1,4 +1,7 @@
-"""Langfuse 트레이스: 켜는 조건, 턴·승인·사용량 기록, 재개 때 같은 핸들러 재사용, 실제 SDK 배선. 네트워크는 쓰지 않는다."""
+"""Langfuse 트레이스: 켜는 조건, 턴·승인·사용량 기록, 재개 때 같은 핸들러 재사용, 실제 SDK 배선.
+
+네트워크는 쓰지 않는다.
+"""
 from __future__ import annotations
 
 import time
@@ -42,10 +45,12 @@ class FakeTurn:
         self.parts += 1
 
     def decision(self, action: dict, decision: dict, auto: bool) -> None:
-        self.decisions.append((action["args"].get("command", ""), decision["type"], auto, reject_reason(decision)))
+        self.decisions.append((action["args"].get("command", ""), decision["type"], auto,
+                               reject_reason(decision)))
 
-    def end(self, *, output, usage, error=None, warnings=()) -> None:
-        self.ended = {"output": output, "usage": usage, "error": error, "warnings": list(warnings)}
+    def end(self, *, output, usage, error=None, warnings=(), retries=0, interrupted=False) -> None:
+        self.ended = {"output": output, "usage": usage, "error": error, "warnings": list(warnings),
+                      "retries": retries, "interrupted": interrupted}
 
 
 class FakeTracer:
@@ -66,19 +71,22 @@ class FakeTracer:
 
 def execute(command: str, *, inp: int = 100) -> AIMessage:
     return ai(inp=inp, out=5, cost=0.001, tool_calls=[
-        {"name": "execute", "args": {"command": command}, "id": f"c-{abs(hash(command))}", "type": "tool_call"}])
+        {"name": "execute", "args": {"command": command}, "id": f"c-{abs(hash(command))}",
+         "type": "tool_call"}])
 
 
 def test_turn_records_input_output_decisions_and_usage(tmp_path: Path) -> None:
     tracer = FakeTracer()
     steps = [execute("git status"), execute("uv run pytest"), ai("끝", inp=300, out=7, cost=0.002)]
-    app, _, out, _ = make_app(tmp_path, steps, "테스트 돌려", "n", "위험해", "/exit", tracer=tracer)
+    app, _, out, _ = make_app(tmp_path, steps, "테스트 돌려", "n", "위험해", "/exit",
+                              tracer=tracer)
     app.run()
     [turn] = tracer.turns
     assert (turn.text, turn.session_id) == ("테스트 돌려", app.thread_id)
     assert turn.tags == [app.workspace.name, "mode:manual", f"model:{app.settings.model}"]
     # git status 는 자동 승인, pytest 는 사람이 거부했다
-    assert turn.decisions == [("git status", "approve", True, ""), ("uv run pytest", "reject", False, "위험해")]
+    assert turn.decisions == [("git status", "approve", True, ""),
+                              ("uv run pytest", "reject", False, "위험해")]
     assert turn.ended["output"] == "끝"
     assert turn.ended["error"] is None
     assert (turn.ended["usage"].calls, round(turn.ended["usage"].cost, 6)) == (3, 0.004)
@@ -90,33 +98,38 @@ def test_turn_records_input_output_decisions_and_usage(tmp_path: Path) -> None:
 
 
 def test_second_turn_context_has_workspace_and_previous_turn(tmp_path: Path) -> None:
-    """평가기는 이전 턴을 못 보므로, 두 번째 턴의 맥락에 첫 턴의 요청과 바꾼 파일이 들어가야 한다."""
+    """평가기는 이전 턴을 못 보므로,
+    두 번째 턴의 맥락에 첫 턴의 요청과 바꾼 파일이 들어가야 한다.
+    """
     tracer = FakeTracer()
-    steps = [tool_call("write_file", {"file_path": "/game.js", "content": "x"}), ai("만들었다", inp=10, out=1),
-             ai("index.html 을 여세요", inp=20, out=2)]
-    app, _, _, _ = make_app(tmp_path, steps, "게임 만들어", "y", "실행법 알려줘", "/exit", tracer=tracer)
+    steps = [tool_call("write_file", {"file_path": "/game.js", "content": "x"}),
+             ai("만들었다", inp=10, out=1), ai("index.html 을 여세요", inp=20, out=2)]
+    app, _, _, _ = make_app(tmp_path, steps, "게임 만들어", "y", "실행법 알려줘", "/exit",
+                            tracer=tracer)
     app.run()
     first, second = tracer.turns
     assert first.context == f"- 작업 폴더(시스템 프롬프트로 알고 있다): {app.workspace}"
-    assert second.context.splitlines()[1:] == ["- 같은 세션의 이전 턴 1개:",
-                                               "  1. 요청: 게임 만들어 · 도구 1개 · 바꾼 파일: /game.js"]
+    assert second.context.splitlines()[1:] == [
+        "- 같은 세션의 이전 턴 1개:", "  1. 요청: 게임 만들어 · 도구 1개 · 바꾼 파일: /game.js"]
 
 
 def test_interrupted_turn_is_marked(tmp_path: Path) -> None:
     tracer = FakeTracer()
-    app, _, _, _ = make_app(tmp_path, [execute("uv run pytest")], "돌려", KeyboardInterrupt(), "/exit",
-                            tracer=tracer)
+    app, _, _, _ = make_app(tmp_path, [execute("uv run pytest")], "돌려", KeyboardInterrupt(),
+                            "/exit", tracer=tracer)
     app.run()
     assert tracer.turns[0].ended["error"] == "사용자가 중단"
+    assert tracer.turns[0].ended["interrupted"] is True
     assert tracer.turns[0].ended["usage"].calls == 1
 
 
 def test_failed_turn_is_marked(tmp_path: Path) -> None:
     tracer = FakeTracer()
-    app, _, out, _ = make_app(tmp_path, [], "아무거나", "/exit", tracer=tracer)  # 대본이 비어 첫 호출에서 실패
+    # 대본이 비어 첫 호출에서 실패
+    app, _, out, _ = make_app(tmp_path, [], "아무거나", "/exit", tracer=tracer)
     app.run()
-    assert tracer.turns[0].ended["error"].startswith("ScriptExhausted")
-    assert "오류: ScriptExhausted" in out.getvalue()
+    assert tracer.turns[0].ended["error"].startswith("ScriptExhaustedError")
+    assert "오류: ScriptExhaustedError" in out.getvalue()
 
 
 def test_banner_without_tracer(tmp_path: Path) -> None:
@@ -129,7 +142,8 @@ def test_make_tracer_needs_both_keys_and_package(monkeypatch: pytest.MonkeyPatch
     assert make_tracer(Settings()) is None
     assert make_tracer(Settings(langfuse_public_key="pk-lf-x")) is None
     monkeypatch.setattr(tracing, "langfuse_installed", lambda: False)
-    assert make_tracer(Settings(langfuse_public_key="pk-lf-x", langfuse_secret_key="sk-lf-x")) is None
+    assert make_tracer(Settings(langfuse_public_key="pk-lf-x",
+                                langfuse_secret_key="sk-lf-x")) is None
 
 
 def test_real_sdk_builds_one_trace_per_turn(tmp_path: Path) -> None:
@@ -143,7 +157,8 @@ def test_real_sdk_builds_one_trace_per_turn(tmp_path: Path) -> None:
     client = Langfuse(public_key="pk-lf-test-memory", secret_key="sk-lf-test", base_url="http://127.0.0.1:9",
                       span_exporter=exporter)
     tracer = LangfuseTracer(client, public_key="pk-lf-test-memory")
-    steps = [execute("ls"), tool_call("read_file", {"file_path": "/a.txt"}), ai("파일 하나", inp=200, out=3)]
+    steps = [execute("ls"), tool_call("read_file", {"file_path": "/a.txt"}),
+             ai("파일 하나", inp=200, out=3)]
     app, _, _, _ = make_app(tmp_path, steps, "파일 세어 줘", "/exit", tracer=tracer)
     (app.workspace / "a.txt").write_text("a", encoding="utf-8")
     app.run()  # 끝에서 shutdown 이 flush 한다
@@ -190,10 +205,12 @@ def test_root_output_has_changed_files_and_diff(tmp_path: Path) -> None:
     assert "+const mines = 10;" in output
     assert "write_file /game.js → 승인(사용자)" in output
     assert "SECRET" not in output
-    assert f"## 맥락 (이 턴 전에 에이전트가 알고 있던 것)\n- 작업 폴더(시스템 프롬프트로 알고 있다): {app.workspace}" in output
+    assert ("## 맥락 (이 턴 전에 에이전트가 알고 있던 것)\n"
+            f"- 작업 폴더(시스템 프롬프트로 알고 있다): {app.workspace}") in output
 
 
-def test_unreachable_server_does_not_break_turn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_unreachable_server_does_not_break_turn(tmp_path: Path,
+                                                monkeypatch: pytest.MonkeyPatch) -> None:
     """키가 틀리거나 서버에 닿지 않아도 턴은 끝나고, 종료 시 flush 가 오래 붙잡지 않는다."""
     pytest.importorskip("langfuse")
     monkeypatch.setattr(tracing, "TIMEOUT_S", 1)
@@ -201,7 +218,8 @@ def test_unreachable_server_does_not_break_turn(tmp_path: Path, monkeypatch: pyt
                         langfuse_base_url="http://127.0.0.1:9")
     tracer = make_tracer(settings)
     assert isinstance(tracer, LangfuseTracer)
-    app, model, out, _ = make_app(tmp_path, [ai("안녕", inp=10, out=1)], "인사", "/exit", tracer=tracer)
+    app, model, out, _ = make_app(tmp_path, [ai("안녕", inp=10, out=1)], "인사", "/exit",
+                                  tracer=tracer)
     started = time.perf_counter()
     assert app.run() == 0
     assert time.perf_counter() - started < 20

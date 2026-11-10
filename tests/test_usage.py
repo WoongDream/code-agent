@@ -13,12 +13,13 @@ from code_agent.settings import Settings
 from code_agent.usage import Usage, UsageCallback
 
 
-def ai(text: str = "", *, inp: int, out: int, cache_read: int = 0, cache_write: int = 0, reasoning: int = 0,
-       cost: float | None = None, tool_calls: list | None = None) -> AIMessage:
+def ai(text: str = "", *, inp: int, out: int, cache_read: int = 0, cache_write: int = 0,
+       reasoning: int = 0, cost: float | None = None, tool_calls: list | None = None) -> AIMessage:
     return AIMessage(
         content=text, tool_calls=tool_calls or [],
         usage_metadata={"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out,
-                        "input_token_details": {"cache_read": cache_read, "cache_creation": cache_write},
+                        "input_token_details": {"cache_read": cache_read,
+                                                "cache_creation": cache_write},
                         "output_token_details": {"reasoning": reasoning}},
         response_metadata={} if cost is None else {"cost": cost})
 
@@ -30,7 +31,8 @@ def test_add_message_sums_details() -> None:
     assert (usage.calls, usage.input_tokens, usage.output_tokens) == (2, 2200, 120)
     assert (usage.cache_read, usage.cache_write, usage.reasoning) == (900, 900, 10)
     assert round(usage.cost, 6) == 0.012
-    assert usage.summary() == "모델 2회 · 입력 2,200 (캐시 읽기 900 · 쓰기 900) · 출력 120 · $0.0120"
+    assert usage.summary() == ("모델 2회 · 입력 2,200 (캐시 읽기 900 · 쓰기 900) · "
+                               "출력 120 · $0.0120")
 
 
 def test_summary_without_cache_or_cost() -> None:
@@ -48,8 +50,10 @@ def test_partial_cost_is_marked() -> None:
 
 
 def test_usage_add() -> None:
-    total = Usage(calls=1, input_tokens=5, cost=0.1) + Usage(calls=2, input_tokens=7, cost=0.2, priced_calls=1)
-    assert (total.calls, total.input_tokens, round(total.cost, 6), total.priced_calls) == (3, 12, 0.3, 1)
+    total = Usage(calls=1, input_tokens=5, cost=0.1) + Usage(calls=2, input_tokens=7, cost=0.2,
+                                                             priced_calls=1)
+    assert ((total.calls, total.input_tokens, round(total.cost, 6), total.priced_calls)
+            == (3, 12, 0.3, 1))
 
 
 def test_callback_counts_every_model_call_in_a_turn(tmp_path: Path) -> None:
@@ -58,7 +62,8 @@ def test_callback_counts_every_model_call_in_a_turn(tmp_path: Path) -> None:
     call = {"name": "execute", "args": {"command": "echo hi"}, "id": "call-1", "type": "tool_call"}
     model = ScriptedChatModel(steps=[ai(inp=3000, out=40, cost=0.02, tool_calls=[call]),
                                      ai("끝", inp=3100, out=10, cache_read=2900, cost=0.003)])
-    agent = build_agent(Settings(data_dir=tmp_path / "data"), tmp_path / "ws", InMemorySaver(), model=model)
+    agent = build_agent(Settings(data_dir=tmp_path / "data"), tmp_path / "ws", InMemorySaver(),
+                        model=model)
     meter = UsageCallback()
     run_turn(agent, {"messages": [{"role": "user", "content": "go"}]},
              {"configurable": {"thread_id": "t"}, "callbacks": [meter]},

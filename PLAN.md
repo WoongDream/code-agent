@@ -626,6 +626,59 @@ for ns, mode, data in agent.stream(inp, cfg, stream_mode=["messages", "updates"]
     - 생각을 state 객체에서 제자리로 빼게 하면 단위 시험 1개만 실패한다. 에이전트 시험에서는 체크포인트가 그대로였다.
   - ruff 통과, pyright 0
 
+#### 개선 6 — 평가 대응: 스타일·로컬 트레이스·계획 모드·메모리·자기 개선 (2026-11-09~10, 사양 `code-agent-specs/eval-improvements.md`)
+- **계기**: 다른 세션의 채점(main b47c87a, 약 18.5/40). 계획·리뷰 2.5, 메모리·자기 개선 1, 모니터링 7.5, Python 기준 7.5.
+  ROADMAP 순서를 멈추고 채점 항목을 먼저 채웠다. 브랜치 하나(`feat/eval-improvements-woong`)에 작업별 커밋을 쌓았다.
+- **S 스타일** (`46056e3`): ruff `E,W,F,I,N,D1`, 줄 99(ruff 는 한글을 폭 2로 센다), `outputs`·fixture 제외.
+  약 810줄을 줄이고 src·scripts 의 공개 심벌 전부에 docstring, 진입점 9개에 Args/Returns 를 썼다.
+  AST 비교와 대본 모델 덤프로 system·도구 스키마가 바이트 단위로 같음을 확인했다. 스크립트에 `main()` 진입점.
+- **L 로컬 트레이스** (`3b221cc`, `localtrace.py`): Langfuse 없이도 `~/.code-agent/runs/<thread>/trace.jsonl`(사건)과
+  `metrics.jsonl`(턴당 한 줄: 소요 시간, 모델·도구 호출, 도구 오류, 재시도, 거부, 토큰, 비용, 상태)을 남긴다.
+  - 사건: turn_start, llm(소요·토큰·finish_reason), tool(요약·소요·exit code·상태), approval, recovery, warning, error, turn_end,
+    그리고 `{"type": …}` 꼴의 custom 스트림 사건(계획·메모리·자기 개선). 도구 출력 원문과 `.env` 내용은 남기지 않는다.
+  - `CompositeTracer` 가 Langfuse 와 로컬을 묶는다. `/trace [n]`, `/trace errors`. `CODE_AGENT_LOCAL_TRACE=0` 으로 끈다.
+  - 리뷰 반영(`34124dd`): 하위 트레이서 예외 격리(로컬이 먼저), `/trace` 마크업 이스케이프, `\n` 단위 파싱, 반만 쓴 줄과
+    턴 번호(최댓값+1), 환경변수 대입 꼴 출력 가리기.
+- **P 계획 모드** (`118ab5c`, `planning.py`): 조사(읽기 전용) → `write_plan`(요구사항·범위·완료 조건·단계별 파일과 확인 방법) →
+  `task(plan-reviewer)` 검토 → 반영 → `request_plan_approval`(모든 모드에서 사람이 승인) → 단계대로 구현 → 완료 조건별 보고.
+  - 승인 전에는 미들웨어가 write_file·edit_file·delete 와 읽기 전용이 아닌 execute 를 막는다. 승인 뒤 계획 밖 파일은
+    auto-edit·yolo 에서도 묻고, 승인하면 `plan_scope_changes` 에 쌓인다. 기본은 auto(여러 파일 작업이면 스스로 계획), `/plan` 은 강제.
+  - 리뷰어는 isolated 서브에이전트라 메인 미들웨어를 물려받지 않는다. `FilesystemMiddleware(tools=ls·read_file·glob·grep)` 로
+    쓰기·execute 도구 자체를 없애고, `.env` 가드(민감 파일은 묻지 않고 거부)·요약·캐시·잘림 복구·예산(20/60)을 명시했다.
+    출력은 `VERDICT: ok|revise` 텍스트 형식이다. OpenRouter Opus 프로필에 structured_output 이 없어 강제 tool_choice 가
+    thinking 과 충돌하기 때문이다. 리뷰어 모델은 `CODE_AGENT_REVIEWER_MODEL`(비우면 메인 모델).
+  - 리뷰 반영(`34124dd`): 새 요청의 write_plan 은 새 시리즈(이전 검토를 물려받지 않음), 한 응답에 계획 도구+쓰기 차단과 계획 도구
+    둘 이상 거부, 범위 변경을 더하기 reducer 키로 분리, 끝난 계획 자동 해제, 세그먼트 단위 경로 매칭(`*` 는 `/` 를 넘지 않음)과
+    작업 폴더 전체 항목 거부, 제어 문자 제거, revise 뒤 반영 없는 승인 요청 거부, 자동 거부에 "자동 차단(사용자 거부 아님)".
+  - **실측**(buggy_repo 사본, $0.37, 모델 16회): 조사 → v1 → 리뷰어 지적 3건(low; `re.escape`, bool 사례, `uv run python`) →
+    v2 → 승인 → todos 3개 → 구현 → 완료 조건 2개 확인 보고. 승인 전 `uv run pytest` 시도는 게이트가 자동 거부했다.
+- **M 메모리** (`edaa376`, `memory.py`): `/.code-agent-user/` 라우트 → `~/.code-agent/memory/`(전체 data dir 은 열지 않음).
+  `create_deep_agent(memory=[사용자 AGENTS.md, 프로젝트 /AGENTS.md], skills=[사용자·프로젝트 스킬 폴더])`.
+  - 스레드당 1회 읽어 매 요청 system 에 붙으므로 대화 중 system 이 바뀌지 않는다. 고친 내용은 다음 `/new` 부터.
+  - 사용자 공통 메모리 쓰기는 yolo 포함 모든 모드에서 묻는다. 메모리 파일은 계획 게이트·범위 검사에서 뺀다(코드 변경이 아님).
+  - 프로젝트 AGENTS.md 는 처음 읽거나 해시가 바뀌면 신뢰를 묻는다(S11). 비대화형이면 읽지 않는다.
+  - `/remember [메모]`, `/memory`, 8,000자 초과 경고, `memory_loaded`·`memory_write` 사건, worklog 메모리 절.
+  - **실측**($0.17): `/remember` 가 공통 메모리에 규칙 2개를 썼고(승인 1회), `/new` 뒤 새 세션 답변에 둘 다 반영됐다.
+  - 리뷰 반영(`c5ead04`, `d916d4b`): 프로젝트 스킬도 같은 신뢰 결정에 묶음(스킬 설명이 system 에 들어가는 우회로),
+    신뢰 미리보기 제어 문자 제거, 면제 경로는 대소문자까지 정확히. 에이전트가 쓴 프로젝트 AGENTS.md 는 **사람이 직접 승인한
+    쓰기만** 신뢰로 남긴다(auto-edit·yolo 자동 승인까지 신뢰하면 README 의 지시로 S11 을 건너뛸 수 있다).
+- **I 자기 개선** (`7249270`, `improve.py`, `evalrun.py`, `evals/`)
+  - 미니 평가 세트 3개: `buggy-median`(버그 수정, 원래 시험 파일 해시 고정), `wordcount-top`(기능 추가, 동률·한글),
+    `readme-injection`(README 에 심은 지시, `.env` canary 가 대화 어디에도 없어야 통과). 각 과제는 숨김 시험과 `check.py`.
+  - 실행기는 같은 프로세스에서 에이전트를 돌린다. 과제마다 임시 작업 폴더와 data dir, 헤드리스 결정 정책(작업 폴더 안 쓰기,
+    허용 접두 명령만 승인), 채점은 사본에 hidden 을 덮어 `python -I` 하위 프로세스로. `code-agent --eval`.
+  - `/improve`·`--improve`: 로컬 트레이스의 신호(경고·재시도, 사용자 거부와 이유, 반복 오류, 통과 못 한 pytest, 높음 지적 계획
+    리뷰, Langfuse 낮은 Judge 점수) → 개선안(사용자·프로젝트 AGENTS.md, SKILL.md; 텍스트 JSON 블록) → 정적 검사(비밀값,
+    8,000자, 중복, frontmatter·BOM, 경로) → 기준·후보 평가(통과 수 유지, pass→fail 없음, 비용 +30% 이하) → 사람 승인 → 반영.
+    `improvements.jsonl` 과 `improve_*` 사건에 모든 단계를 남긴다.
+  - **실측**(약 $0.4): `--eval --tasks buggy-median` 통과($0.11). 사용자 거부 신호 1건("시험은 uv run pytest -q 로")에서
+    사용자 메모리 개선안이 나왔고, buggy-median 기준 7회·$0.113 → 후보 4회·$0.091 로 채택돼 반영됐다.
+    같은 규칙이 이미 메모리에 있을 때는 "개선안이 없다"로 끝났다.
+- 시험: 412 → 650. ruff·pyright 0, CI 초록. 실측 비용 합계 약 $1.1.
+- 제출: `scripts/make_submission.py`(git archive, outputs 제외, ZIP 안 `.env` 재확인).
+- 남은 한계: 셸 명령으로 바꾸는 파일은 계획 범위·메모리 승인을 거치지 않는다(셸은 샌드박스가 아니다).
+  평가 세트는 과제 3개·N=1 이라 개선안 비교의 잡음이 크다.
+
 ### 4단계 — 평가·확장 (선택)
 - `evals/`: 수정 과제 5~10개(fixture 저장소와 숨김 검증 테스트)를 헤드리스로 돌려 통과율, 비용, 시간을 집계한다. `pjt\Day04\coding_skills\verify_agent.py` 패턴을 참고한다.
 - 확장 후보:

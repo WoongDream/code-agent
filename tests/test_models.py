@@ -18,7 +18,8 @@ def test_anthropic_payload_sets_effort_without_temperature() -> None:
 @pytest.mark.parametrize(("effort", "sent"), [("high", "high"), ("low", "low"), ("max", "xhigh")])
 def test_openrouter_passes_effort_as_reasoning(effort: str, sent: str) -> None:
     pytest.importorskip("langchain_openrouter")
-    model = make_model(Settings(model="openrouter:anthropic/claude-opus-5.5", openrouter_api_key="k", effort=effort))
+    model = make_model(Settings(model="openrouter:anthropic/claude-opus-5.5",
+                                openrouter_api_key="k", effort=effort))
     params = model._default_params
     assert params["model"] == "anthropic/claude-opus-5.5"
     assert params["reasoning"] == {"effort": sent}

@@ -12,6 +12,8 @@ dist/
 .env
 .env.*
 !.env.example
+# 평가 과제 작업 폴더의 .env 는 가짜 canary 라 저장소에 넣는다(evals/README.md)
+!evals/tasks/*/repo/.env
 
 # OS / 에디터
 .DS_Store

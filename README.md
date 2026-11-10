@@ -19,7 +19,7 @@ uv run code-agent --resume <세션 ID>
 - 파일 도구는 작업 폴더 안에 갇히지만 **셸은 샌드박스가 아니다**. 그래서 기본 `manual` 모드는 파일 쓰기와 셸 명령을 모두 묻는다.
 - `auto-edit`는 파일 쓰기를 자동 승인하고 셸은 묻는다(`.git/` 아래 쓰기는 묻는다). `yolo`는 전부 자동 승인한다.
 - 읽기 전용 명령(`git status`, `git diff`, `ls`, `cat` 등)은 모드와 관계없이 자동 승인한다. 단 작업 폴더 밖, `.env`, 명령 연결이 들어가면 묻는다.
-- 슬래시 커맨드: `/help`, `/new`, `/mode <모드>`, `/plan [<요청>|off]`, `/remember [메모]`, `/memory`, `/improve [--no-eval] [--tasks a,b]`, `/diff`, `/todos`, `/cost`, `/thinking [on|off]`, `/exit`. Ctrl+C 는 실행 중인 턴만 취소한다.
+- 슬래시 커맨드: `/help`, `/new`, `/mode <모드>`, `/plan [<요청>|off]`, `/remember [메모]`, `/memory`, `/improve [--no-eval] [--tasks a,b]`, `/trace [n|errors]`, `/diff`, `/todos`, `/cost`, `/thinking [on|off]`, `/exit`. Ctrl+C 는 실행 중인 턴만 취소한다.
 - **계획 모드**: 여러 파일을 바꾸거나 요구사항이 모호한 작업이면 에이전트가 스스로 계획을 세운다. `/plan <요청>` 은 항상 계획부터 세운다.
   - 순서: 읽기 전용 조사 → `write_plan`(목표, 요구사항, 범위, 단계별 파일·확인 방법, 완료 조건, 위험) → 리뷰어 서브에이전트 `plan-reviewer` 검토(읽기 전용 도구만, 계획 하나에 2회까지) → 반영 → 사용자 승인(`[y] 승인 / [n] 거부(의견)`, 모든 모드에서 묻는다) → 단계가 할 일이 되고 단계대로 구현 → 완료 조건마다 확인 결과 보고.
   - 계획이 승인되기 전에는 파일 쓰기·수정·삭제와 읽기 전용이 아닌 셸 명령이 막힌다. 검토를 받지 않은 승인 요청은 묻지 않고 돌려보낸다.
@@ -66,6 +66,17 @@ uv run code-agent --eval [--tasks a,b] [--yes]    # 평가 세트만 돌려 표�
 
 `CODE_AGENT_DATA_DIR` 환경변수로 `~/.code-agent` 대신 쓸 폴더를 정할 수 있다(평가·시험의 격리용).
 
+## 로컬 트레이스와 지표
+
+Langfuse 없이도 항상 남는다(`CODE_AGENT_LOCAL_TRACE=0` 으로 끈다). 세션마다 `~/.code-agent/runs/<세션 ID>/` 에 두 파일을 쓴다.
+
+- `trace.jsonl`: 한 줄에 사건 하나. `turn_start`, `llm`(소요 시간, 토큰, finish_reason), `tool`(호출 요약, 소요 시간, 상태, exit code, 오류 첫 줄), `approval`(결정, 자동/사람, 거부 이유), `recovery`, `warning`, `error`, `turn_end`, 그리고 기능별 사건(`plan_written`·`plan_reviewed`·`plan_approval`·`scope_change`, `memory_loaded`·`memory_write`). 서브에이전트 호출에는 `sub`·`agent` 가 붙는다.
+- `metrics.jsonl`: 턴당 한 줄. 소요 시간, 모델·도구 호출 수, 실패한 도구 수, 재시도(잘림 자동 복구) 수, 거부 수, 토큰, 비용, 상태(ok·warning·error·interrupted).
+- 도구 출력 원문은 남기지 않고 한 줄 요약만 남긴다. `.env` 내용과 환경변수 대입 꼴 출력은 가린다.
+- `/trace [n]` 은 마지막(또는 n번째) 턴의 타임라인(+초, 종류, 내용, 소요, 상태)을, `/trace errors` 는 이 세션의 실패한 도구·오류·경고만 보인다.
+- 트레이서 하나(로컬이나 Langfuse)가 실패해도 턴은 이어진다. 로컬 기록에 처음 실패하면 한 번 알린다.
+- 파일은 지우지 않으므로 오래된 세션 폴더는 직접 지운다.
+
 ## Langfuse 트레이스 (선택)
 
 ```
@@ -87,6 +98,16 @@ uv sync --extra openrouter --extra langfuse
 ```
 uv run ruff check . && uv run pyright && uv run pytest -q    # 모델 호출 없음. CI(windows-latest)도 같다
 ```
+
+- ruff 는 `E, W, F, I, N, D1`(공개 심벌 docstring)을 켜고 줄 길이 99 를 쓴다. PEP 8 은 팀이 합의하면 99자까지 허용하고, ruff 는 한글을 폭 2로 세어 실제로는 더 엄격하다.
+
+## 제출용 ZIP
+
+```
+uv run python scripts/make_submission.py [--out dist/code-agent.zip]
+```
+
+`git archive` 로 추적 파일만 담는다. `.env`·`.venv`·캐시는 애초에 들어가지 않고 `outputs/` 는 뺀다. 만든 ZIP 을 열어 실제 `.env` 가 없는지 한 번 더 확인한다.
 
 ## 보안 메모
 

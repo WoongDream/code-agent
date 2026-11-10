@@ -253,11 +253,14 @@ def grade(task: EvalTask, workspace: Path, run: dict[str, Any], scratch: Path) -
         shutil.copytree(task.path / "hidden", target, dirs_exist_ok=True)
     run_file = scratch / "run.json"
     run_file.write_text(json.dumps(run, ensure_ascii=False, default=str), encoding="utf-8")
+    # -I 는 PYTHONUTF8 같은 환경변수를 무시해, 그대로면 출력이 로케일 인코딩(CI 는 cp1252)이 되어
+    # 한글 결과를 쓰다 UnicodeEncodeError 가 난다. -X utf8 은 -I 와 함께 적용된다
+    command = [sys.executable, "-I", "-X", "utf8", "-c", _RUNNER, str(task.path / "check.py"),
+               str(target), str(run_file)]
     try:
-        proc = subprocess.run([sys.executable, "-I", "-c", _RUNNER, str(task.path / "check.py"),
-                               str(target), str(run_file)], cwd=scratch, capture_output=True,
-                              text=True, encoding="utf-8", errors="replace",
-                              timeout=CHECK_TIMEOUT_S, check=False)
+        proc = subprocess.run(command, cwd=scratch, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=CHECK_TIMEOUT_S,
+                              check=False)
     except subprocess.TimeoutExpired:
         return {"pass": False, "score": 0.0, "details": {"error": "check.py 시간 초과"}}
     lines = [line for line in proc.stdout.splitlines() if line.startswith(RESULT_MARK)]

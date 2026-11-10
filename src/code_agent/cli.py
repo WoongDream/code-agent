@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 from rich.console import Console
@@ -39,6 +40,8 @@ from code_agent.approval import (
 )
 from code_agent.backend import process_shell_env, resolve_shell, safe_which
 from code_agent.environment import probe, render
+from code_agent.evalrun import run_eval_command
+from code_agent.improve import improve, parse_improve_args
 from code_agent.localtrace import LocalTracer, run_dir, trace_view
 from code_agent.memory import (
     MEMORY_FILE,
@@ -93,6 +96,8 @@ HELP = """\
   /remember \\[메모]  이번 대화에서 확인된 규칙·사실을 메모리(AGENTS.md)에 적게 한다. \
 다음 /new 부터 반영된다
   /memory        이 세션이 읽은 메모리 파일(글자 수, 그 뒤 바뀌었는지)과 스킬
+  /improve \\[--no-eval] \\[--tasks a,b]  최근 세션의 문제로 메모리·스킬 개선안을 만들고 \
+평가 세트로 검증한 뒤, 승인하면 반영한다(평가는 과금)
   /thinking \\[on|off]  생각(reasoning) 원문 표시. 끄면(기본) 문단마다 앞부분만 짧은 메모로 보인다
   /exit          종료
 Ctrl+C 는 실행 중인 턴만 취소한다. \
@@ -220,6 +225,7 @@ class App:
             agent 는 이것을 보지 않는다).
         interactive: 사람에게 y/N 을 물을 수 있는지. None 이면 입출력이 터미널인지로 정한다.
             파이프 입력에서 물으면 첫 요청을 답으로 먹으므로 묻지 않는다.
+        improve_model: /improve 의 개선 모델. None 이면 settings 로 만든다(시험은 대본 모델).
     """
 
     def __init__(self, settings: Settings, workspace: Path, mode: str, sessions: Sessions,
@@ -227,7 +233,8 @@ class App:
                  tracer: Tracer | None = None, env_text: str = "",
                  fresh_agent: Callable[[], tuple[str, Any]] | None = None,
                  memory_trust: MemoryTrust | None = None,
-                 interactive: bool | None = None) -> None:
+                 interactive: bool | None = None,
+                 improve_model: BaseChatModel | None = None) -> None:
         self.settings, self.workspace, self.mode = settings, workspace, mode
         self.sessions, self.thread_id = sessions, thread_id
         self.console, self.read_line = console, read_line
@@ -242,6 +249,7 @@ class App:
         # 파이프·테스트(StringIO)에서는 상태 줄을 그리지 않는다
         self.status_line = console.is_terminal and _interactive()
         self.full_thinking = False  # /thinking
+        self.improve_model = improve_model
         self._refused_memory: set[str] = set()  # 이 프로세스에서 거절한 AGENTS.md 내용(sha256)
 
     @property
@@ -347,6 +355,8 @@ class App:
             self.console.print(f"[dim]{REMEMBER_DONE}[/]")
         elif name == "/memory":
             self.show_memory()
+        elif name == "/improve":
+            self.improve(arg)
         elif name == "/thinking":
             if arg not in ("", "on", "off"):
                 self.console.print(f"[red]{escape('/thinking [on|off]')}[/]")
@@ -584,6 +594,23 @@ class App:
             if answer in ("", "n", "no", "ㅜ"):
                 return False
 
+    def improve(self, arg: str) -> None:
+        """/improve: 신호 수집 → 개선안 → 검증 → 승인 → 반영(improve.improve)."""
+        no_eval, task_ids, error = parse_improve_args(arg)
+        if error:
+            self.console.print(f"[red]{escape(error)}[/]")
+            return
+        tracers = (self.tracer.tracers if isinstance(self.tracer, CompositeTracer)
+                   else [self.tracer])
+        # 로컬 트레이스는 improve 가 improve-<id> 폴더에 직접 쓴다. Langfuse 만 넘긴다
+        extra = [t for t in tracers if t is not None and not isinstance(t, LocalTracer)]
+        try:
+            improve(self.settings, self.workspace, self.console, ask=self._yes_no,
+                    model=self.improve_model, no_eval=no_eval, task_ids=task_ids,
+                    tracer=combine_tracers(extra))
+        except (Exception, KeyboardInterrupt) as e:  # noqa: BLE001 - 실패해도 REPL 은 이어 간다
+            self.console.print(f"[red]/improve 실패: {type(e).__name__}: {escape(str(e))}[/]")
+
     def show_memory(self) -> None:
         """/memory: 이 세션의 메모리 파일(위치, 읽은 글자 수, 그 뒤 바뀌었는지)과 스킬."""
         values = self.agent.get_state(self.config).values
@@ -702,6 +729,16 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         help="anthropic:<id> 또는 openrouter:<id> (기본: CODE_AGENT_MODEL)")
     parser.add_argument("--mode", choices=MODES, default="manual", help="승인 모드 (기본: manual)")
     parser.add_argument("--resume", metavar="ID", help="이전 세션을 이어 간다")
+    parser.add_argument("--eval", action="store_true",
+                        help="미니 평가 세트를 돌려 표를 찍는다(과금, 실행 전 예상 비용을 묻는다)")
+    parser.add_argument("--improve", action="store_true",
+                        help="자기 개선 루프를 한 번 돈다(/improve 의 헤드리스 판)")
+    parser.add_argument("--tasks", metavar="a,b", help="--eval·--improve 가 돌릴 평가 과제 id")
+    parser.add_argument("--yes", action="store_true",
+                        help="--eval 은 비용 확인을 건너뛰고, --improve 는 평가에서 채택된 "
+                             "개선안을 묻지 않고 반영한다")
+    parser.add_argument("--no-eval", action="store_true",
+                        help="--improve 에서 평가 없이 정적 검사만 한다(무과금)")
     return parser.parse_args(argv)
 
 
@@ -730,6 +767,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.model:
         settings = replace(settings, model=args.model)
     settings.data_dir.mkdir(parents=True, exist_ok=True)
+    task_ids = [t for t in (args.tasks or "").split(",") if t] or None
+    if args.eval:
+        return run_eval_command(settings, task_ids, yes=args.yes, console=console)
+    if args.improve:
+        return improve_command(settings, args, task_ids, console)
     sessions = Sessions(sqlite3.connect(settings.data_dir / "sessions.db",
                                         check_same_thread=False))
 
@@ -787,6 +829,37 @@ def main(argv: list[str] | None = None) -> int:
               _line_reader(settings.data_dir / "history"), agent=agent, tracer=tracer,
               env_text=env_text, fresh_agent=fresh_agent, memory_trust=trust)
     return app.run()
+
+
+def improve_command(settings: Settings, args: argparse.Namespace, task_ids: list[str] | None,
+                    console: Console) -> int:
+    """`code-agent --improve`. 작업 폴더(-w)의 프로젝트 메모리도 개선 대상에 든다.
+
+    Returns:
+        종료 코드. 끝까지 돌면 0, 작업 폴더·모델 준비에 실패하면 2.
+    """
+    workspace = Path(args.workspace or ".").resolve()
+    if not workspace.is_dir():
+        console.print(f"[red]작업 폴더가 없다: {escape(str(workspace))}[/]")
+        return 2
+
+    def ask(prompt: str) -> bool:
+        try:
+            return input(prompt).strip().lower() in ("y", "yes", "ㅛ")
+        except EOFError:
+            return False
+
+    langfuse = make_tracer(settings)
+    try:
+        improve(settings, workspace, console, ask=ask, no_eval=args.no_eval, task_ids=task_ids,
+                yes=args.yes, tracer=langfuse)
+    except (RuntimeError, ValueError) as e:  # API 키 미설정, 모델 이름 오류, 없는 과제 등
+        console.print(f"[red]{escape(str(e))}[/]")
+        return 2
+    finally:
+        if langfuse is not None:
+            langfuse.shutdown()
+    return 0
 
 
 def session_agent(settings: Settings, workspace: Path, sessions: Sessions, env_text: str, *,

@@ -54,11 +54,22 @@ class Settings:
         return bool(self.langfuse_public_key and self.langfuse_secret_key)
 
 
-def load_settings(data_dir: Path = DATA_DIR) -> Settings:
+def default_data_dir() -> Path:
+    """사용자 데이터 폴더. 셸 환경변수 CODE_AGENT_DATA_DIR 이 있으면 그것, 없으면 ~/.code-agent.
+
+    평가 실행과 시험이 사용자의 sessions.db·runs·memory 를 건드리지 않게 하는 격리용이다.
+    data_dir/.env 를 읽기 전에 정해야 하므로 셸 환경변수만 본다.
+    """
+    value = os.environ.get("CODE_AGENT_DATA_DIR", "").strip()
+    return Path(value).expanduser() if value else DATA_DIR
+
+
+def load_settings(data_dir: Path | None = None) -> Settings:
     """셸 환경변수 > 저장소 .env > data_dir/.env 순으로 설정을 읽는다.
 
     Args:
         data_dir: 사용자 데이터 폴더(sessions.db·입력 기록·artifacts). 이 폴더의 .env 도 읽는다.
+            None 이면 default_data_dir()(CODE_AGENT_DATA_DIR 또는 ~/.code-agent).
 
     Returns:
         Settings. 비어 있는 값은 기본값(DEFAULT_*)으로 채운다.
@@ -68,6 +79,7 @@ def load_settings(data_dir: Path = DATA_DIR) -> Settings:
         ValueError: CODE_AGENT_EFFORT·CODE_AGENT_SHELL·CODE_AGENT_CONTEXT_TOKENS 가
             허용 범위 밖일 때.
     """
+    data_dir = data_dir if data_dir is not None else default_data_dir()
     values = {**dotenv_values(data_dir / ".env"), **dotenv_values(REPO_ROOT / ".env"),
               **os.environ}
 
